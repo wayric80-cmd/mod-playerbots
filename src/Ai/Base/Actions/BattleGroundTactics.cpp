@@ -1966,12 +1966,6 @@ bool BGTactics::selectObjective(bool reset)
                         Position objPos = go->GetPosition();
                         float rx, ry, rz;
                         bot->GetRandomPoint(objPos, frand(5.0f, 15.0f), rx, ry, rz);
-                        if (Map* map = bot->GetMap())
-                        {
-                            float groundZ = map->GetHeight(rx, ry, rz);
-                            if (groundZ == VMAP_INVALID_HEIGHT_VALUE)
-                                rz = groundZ;
-                        }
 
                         pos.Set(rx, ry, rz, go->GetMapId());
                         posMap["bg objective"] = pos;
@@ -2084,13 +2078,6 @@ bool BGTactics::selectObjective(bool reset)
                     float rx, ry, rz;
                     bot->GetRandomPoint(waitPos, 5.0f, rx, ry, rz);
 
-                    if (Map* map = bot->GetMap())
-                    {
-                        float groundZ = map->GetHeight(rx, ry, rz);
-                        if (groundZ == VMAP_INVALID_HEIGHT_VALUE)
-                            rz = groundZ;
-                    }
-
                     pos.Set(rx, ry, rz, bot->GetMapId());
                     posMap["bg objective"] = pos;
 
@@ -2126,13 +2113,6 @@ bool BGTactics::selectObjective(bool reset)
                 }
                 else
                     bot->GetRandomPoint(objPos, frand(-2.0f, 2.0f), rx, ry, rz);
-
-                if (Map* map = bot->GetMap())
-                {
-                    float groundZ = map->GetHeight(rx, ry, rz);
-                    if (groundZ == VMAP_INVALID_HEIGHT_VALUE)
-                        rz = groundZ;
-                }
 
                 pos.Set(rx, ry, rz, BgObjective->GetMapId());
                 posMap["bg objective"] = pos;
@@ -2369,12 +2349,6 @@ bool BGTactics::selectObjective(bool reset)
                 Position camp = (team == TEAM_ALLIANCE) ? AB_GY_CAMPING_HORDE : AB_GY_CAMPING_ALLIANCE;
                 float rx, ry, rz;
                 bot->GetRandomPoint(camp, 10.0f, rx, ry, rz);
-                if (Map* map = bot->GetMap())
-                {
-                    float groundZ = map->GetHeight(rx, ry, rz);
-                    if (groundZ == VMAP_INVALID_HEIGHT_VALUE)
-                        rz = groundZ;
-                }
                 pos.Set(rx, ry, rz, bot->GetMapId());
                 posMap["bg objective"] = pos;
                 break;
@@ -2459,13 +2433,6 @@ bool BGTactics::selectObjective(bool reset)
                 float rx, ry, rz;
                 Position objPos = BgObjective->GetPosition();
                 bot->GetRandomPoint(objPos, frand(5.0f, 15.0f), rx, ry, rz);
-
-                if (Map* map = bot->GetMap())
-                {
-                    float groundZ = map->GetHeight(rx, ry, rz);
-                    if (groundZ == VMAP_INVALID_HEIGHT_VALUE)
-                        rz = groundZ;
-                }
 
                 pos.Set(rx, ry, rz, BgObjective->GetMapId());
                 posMap["bg objective"] = pos;
@@ -2554,13 +2521,6 @@ bool BGTactics::selectObjective(bool reset)
                     float rx, ry, rz;
                     bot->GetRandomPoint(targetPos, 5.0f, rx, ry, rz);
 
-                    if (Map* map = bot->GetMap())
-                    {
-                        float groundZ = map->GetHeight(rx, ry, rz);
-                        if (groundZ == VMAP_INVALID_HEIGHT_VALUE)
-                            rz = groundZ;
-                    }
-
                     pos.Set(rx, ry, rz, bot->GetMapId());
 
                     // Check AreaTrigger activation range
@@ -2581,13 +2541,6 @@ bool BGTactics::selectObjective(bool reset)
 
                     float rx, ry, rz;
                     bot->GetRandomPoint(fallback, 5.0f, rx, ry, rz);
-
-                    if (Map* map = bot->GetMap())
-                    {
-                        float groundZ = map->GetHeight(rx, ry, rz);
-                        if (groundZ == VMAP_INVALID_HEIGHT_VALUE)
-                            rz = groundZ;
-                    }
 
                     pos.Set(rx, ry, rz, bot->GetMapId());
                     foundObjective = true;
@@ -2611,7 +2564,6 @@ bool BGTactics::selectObjective(bool reset)
                     {
                         float rx, ry, rz;
                         bot->GetRandomPoint(p, 5.0f, rx, ry, rz);
-                        rz = bot->GetMap()->GetHeight(rx, ry, rz);
                         pos.Set(rx, ry, rz, bot->GetMapId());
                         foundObjective = true;
                     }
@@ -2686,7 +2638,6 @@ bool BGTactics::selectObjective(bool reset)
                             Position const& p = EY_NodePositions[chosenId];
                             float rx, ry, rz;
                             bot->GetRandomPoint(p, 5.0f, rx, ry, rz);
-                            rz = bot->GetMap()->GetHeight(rx, ry, rz);
                             pos.Set(rx, ry, rz, bot->GetMapId());
                             foundObjective = true;
                         }
@@ -2748,7 +2699,6 @@ bool BGTactics::selectObjective(bool reset)
                         Position const& p = EY_NodePositions[*bestNode];
                         float rx, ry, rz;
                         bot->GetRandomPoint(p, 5.0f, rx, ry, rz);
-                        rz = bot->GetMap()->GetHeight(rx, ry, rz);
                         pos.Set(rx, ry, rz, bot->GetMapId());
                         foundObjective = true;
                     }
@@ -2816,7 +2766,6 @@ bool BGTactics::selectObjective(bool reset)
                 Position camp = (team == TEAM_HORDE) ? EY_GY_CAMPING_ALLIANCE : EY_GY_CAMPING_HORDE;
                 float rx, ry, rz;
                 bot->GetRandomPoint(camp, 10.0f, rx, ry, rz);
-                rz = bot->GetMap()->GetHeight(rx, ry, rz);
                 pos.Set(rx, ry, rz, bot->GetMapId());
                 foundObjective = true;
             }
