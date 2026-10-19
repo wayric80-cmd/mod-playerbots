@@ -29,6 +29,140 @@
 #include "Player.h"
 #include "PlayerbotAI.h"
 #include "PlayerbotAIConfig.h"
+
+// ---- wov: play schedules -------------------------------------------------------------------------
+// Every random bot is "played" by a person with a schedule (table wov_player, written by
+// wov/gen_players.py). A bot only logs in while its player would be online. Reference implementation
+// and simulator: wov/wov_schedule.py -- keep the two in sync.
+#include "Config.h"
+#include <unordered_map>
+namespace
+{
+struct WovSched { uint8 kind; uint8 startHour; uint16 mins; };
+std::unordered_map<uint32, WovSched> g_wovSched;
+time_t g_wovSchedLoaded = 0;
+bool   g_wovSchedEnable = false;
+uint32 g_wovSessionPct = 100;
+uint32 g_wovMinOnline = 0;
+uint32 g_wovLogoutsPerMinute = 10;
+
+uint64 WovH(uint64 a, uint64 b)
+{
+    uint64 x = a * 0x9E3779B97F4A7C15ULL + b * 0xBF58476D1CE4E5B9ULL + 0x94D049BB133111EBULL;
+    x ^= x >> 31;
+    x *= 0xBF58476D1CE4E5B9ULL;
+    x ^= x >> 29;
+    return x;
+}
+
+int32 WovTzOffsetHours(uint32 guid)
+{
+    uint64 b = WovH(guid, 7) % 100;
+    if (b < 45) return 0;
+    if (b < 60) return -1;
+    if (b < 82) return -6;
+    if (b < 94) return -9;
+    return 8;
+}
+
+uint8 WovKind(std::string const& d)
+{
+    static char const* names[] = {"almost every day", "most evenings", "late at night", "irregularly",
+                                  "weekends", "on weekday mornings", "in short sessions after work"};
+    for (uint8 i = 0; i < 7; ++i)
+        if (d == names[i])
+            return i;
+    return 7;
+}
+
+uint32 WovPlayProb(uint8 kind, int64 weekday)  // weekday 0=Sun .. 6=Sat
+{
+    bool we = weekday == 0 || weekday == 6;
+    switch (kind)
+    {
+        case 0: return 90;
+        case 1: return 70;
+        case 2: return 60;
+        case 3: return 40;
+        case 4: return we ? 90 : (weekday == 5 ? 30 : 10);
+        case 5: return we ? 20 : 80;
+        case 6: return we ? 30 : 80;
+        default: return 50;
+    }
+}
+
+void WovLoadSchedules()
+{
+    time_t now = time(nullptr);
+    if (g_wovSchedLoaded && now < g_wovSchedLoaded + 600)
+        return;
+    g_wovSchedLoaded = now;
+    g_wovSchedEnable = sConfigMgr->GetOption<bool>("AiPlayerbot.WoV.Schedule.Enable", false);
+    g_wovSessionPct = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.Schedule.SessionPercent", 100);
+    g_wovMinOnline = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.Schedule.MinOnline", 0);
+    g_wovLogoutsPerMinute = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.Schedule.LogoutsPerMinute", 10);
+    if (!g_wovSchedEnable)
+        return;
+    QueryResult r = CharacterDatabase.Query(
+        "SELECT guid, play_days, play_start_hour, session_minutes FROM wov_player");
+    g_wovSched.clear();
+    if (r)
+    {
+        do
+        {
+            Field* f = r->Fetch();
+            g_wovSched[f[0].Get<uint32>()] = {WovKind(f[1].Get<std::string>()), f[2].Get<uint8>(),
+                                              f[3].Get<uint16>()};
+        } while (r->NextRow());
+    }
+    LOG_INFO("playerbots", "WoV schedules: {} players loaded, session {}%, min online {}", g_wovSched.size(),
+             g_wovSessionPct, g_wovMinOnline);
+}
+
+bool WovScheduledOnline(uint32 guid)
+{
+    auto it = g_wovSched.find(guid);
+    if (it == g_wovSched.end())
+        return false;
+    WovSched const& w = it->second;
+    time_t now = time(nullptr);
+    tm lt{};
+    localtime_r(&now, &lt);
+    int64 sec = int64(now) + int64(lt.tm_gmtoff) + int64(WovTzOffsetHours(guid)) * 3600;
+    int64 day = sec / 86400;
+    int64 minute = (sec % 86400) / 60;
+    for (int64 dd = day; dd >= day - 1; --dd)
+    {
+        int64 wd = (dd + 4) % 7;
+        if (WovH(guid, uint64(dd * 8 + 1)) % 100 >= WovPlayProb(w.kind, wd))
+            continue;
+        int64 st = int64(w.startHour) * 60 + int64(WovH(guid, uint64(dd * 8 + 2)) % 81) - 40;
+        int64 ln = int64(w.mins) * (70 + int64(WovH(guid, uint64(dd * 8 + 3)) % 71)) / 100;
+        ln = ln * g_wovSessionPct / 100;
+        int64 m = minute + (day - dd) * 1440;
+        if (st <= m && m < st + ln)
+            return true;
+    }
+    return false;
+}
+
+bool WovLogoutBudget()
+{
+    static time_t window = 0;
+    static uint32 used = 0;
+    time_t now = time(nullptr);
+    if (now >= window + 60)
+    {
+        window = now;
+        used = 0;
+    }
+    if (used >= g_wovLogoutsPerMinute)
+        return false;
+    ++used;
+    return true;
+}
+}  // namespace
+// ---- end wov ---------------------------------------------------------------------------------------
 #include "PlayerbotFactory.h"
 #include "PlayerbotTextMgr.h"
 #include "Playerbots.h"
@@ -657,6 +791,14 @@ bool RandomPlayerbotMgr::IsAccountType(uint32 accountId, uint8 accountType)
 uint32 RandomPlayerbotMgr::AddRandomBots()
 {
     uint32 maxAllowedBotCount = GetEventValue(0, "bot_count");
+    WovLoadSchedules();  // wov
+    if (g_wovSchedEnable)
+    {
+        static time_t wovLastScan = 0;
+        if (time(nullptr) < wovLastScan + 60)
+            return currentBots.size();
+        wovLastScan = time(nullptr);
+    }
     static time_t missingBotsTimer = 0;
 
     if (currentBots.size() < maxAllowedBotCount)
@@ -766,6 +908,10 @@ uint32 RandomPlayerbotMgr::AddRandomBots()
             {
                 return false;
             }
+
+            // wov: only while the player behind this character would be playing (or to keep the floor)
+            if (g_wovSchedEnable && !WovScheduledOnline(charInfo.guid) && currentBots.size() >= g_wovMinOnline)
+                return false;
 
             uint32 add_time = sPlayerbotAIConfig.enablePeriodicOnlineOffline
                                 ? urand(sPlayerbotAIConfig.minRandomBotInWorldTime,
@@ -1379,6 +1525,18 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
                 LogoutPlayerBot(botGUID);
         }
 
+        return false;
+    }
+
+    // wov: session over -> log out, a few per minute, never in a group or next to a real player
+    if (g_wovSchedEnable && player && player->IsInWorld() && !player->GetGroup() &&
+        currentBots.size() > g_wovMinOnline && !WovScheduledOnline(bot) &&
+        !(botAI && botAI->HasPlayerNearby(40.0f)) && WovLogoutBudget())
+    {
+        LOG_DEBUG("playerbots", "WoV: {} logs off (session over)", player->GetName());
+        SetEventValue(bot, "add", 0, 0);
+        currentBots.erase(bot);
+        LogoutPlayerBot(botGUID);
         return false;
     }
 
