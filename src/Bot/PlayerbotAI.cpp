@@ -612,7 +612,7 @@ void PlayerbotAI::HandleCommand(uint32 type, std::string const& text, Player& fr
     std::string filtered = text;
 
     if (!IsAllowedCommand(filtered) && !GetSecurity()->CheckLevelFor(PlayerbotSecurityLevel::PLAYERBOT_SECURITY_INVITE,
-                                                                     type != CHAT_MSG_WHISPER, &fromPlayer))
+                                                                     true /* wov: never answer non-masters with security refusals */, &fromPlayer))
         return;
 
     if (type == CHAT_MSG_ADDON)
@@ -679,7 +679,7 @@ void PlayerbotAI::HandleCommand(uint32 type, std::string const& text, Player& fr
     }
 
     if (!IsAllowedCommand(filtered) &&
-        !GetSecurity()->CheckLevelFor(PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, type != CHAT_MSG_WHISPER,
+        !GetSecurity()->CheckLevelFor(PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, true /* wov */,
                                       &fromPlayer))
         return;
 
@@ -956,7 +956,7 @@ bool PlayerbotAI::IsAllowedCommand(std::string const text)
 
 void PlayerbotAI::HandleCommand(uint32 type, std::string const text, Player* fromPlayer)
 {
-    if (!GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_INVITE, type != CHAT_MSG_WHISPER, fromPlayer))
+    if (!GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_INVITE, true /* wov */, fromPlayer))
         return;
 
     if (type == CHAT_MSG_ADDON)
@@ -1020,7 +1020,7 @@ void PlayerbotAI::HandleCommand(uint32 type, std::string const text, Player* fro
         return;
     }
     if (!IsAllowedCommand(filtered) &&
-        (!GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, type != CHAT_MSG_WHISPER, fromPlayer)))
+        (!GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true /* wov */, fromPlayer)))
         return;
 
     if (type == CHAT_MSG_RAID_WARNING && filtered.find(bot->GetName()) != std::string::npos &&
