@@ -34,7 +34,8 @@ bool TradeStatusAction::Execute(Event event)
 
     // Bots refuse to trade with a person (whether active or selfbotting) who is neither their
     // master nor a group member. Bot traders (other than selfbots) are handled further down.
-    if (trader != master && traderIsGameClientPlayer &&
+    if (trader != master && traderIsGameClientPlayer && !sRandomPlayerbotMgr.IsRandomBot(bot) &&  // wov: random bots trade with anyone
+       
         (!bot->GetGroup() || !bot->GetGroup()->IsMember(trader->GetGUID())))
     {
         bot->Whisper(PlayerbotTextMgr::instance().GetBotTextOrDefault(
@@ -57,7 +58,7 @@ bool TradeStatusAction::Execute(Event event)
     // Bots also refuse their own master when ungrouped and security withholds full access.
     if ((!bot->GetGroup() || !bot->GetGroup()->IsMember(trader->GetGUID())) &&
         (trader != master || !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, master)) &&
-        traderIsGameClientPlayer)
+        traderIsGameClientPlayer && !sRandomPlayerbotMgr.IsRandomBot(bot))  // wov
     {
         CancelTrade();
         return false;
