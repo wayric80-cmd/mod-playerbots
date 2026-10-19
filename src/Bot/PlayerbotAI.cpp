@@ -1542,7 +1542,8 @@ void PlayerbotAI::DoNextAction(bool min)
 
     if (minimal)
     {
-        if (!bot->isAFK() && !bot->InBattleground() && !HasGameClientMaster())
+        // wov: throttled bots no longer show <Away>; an AFK tag on a bot that answers instantly gives it away
+        if (false && !bot->isAFK() && !bot->InBattleground() && !HasGameClientMaster())
             bot->ToggleAFK();
 
         SetNextCheckDelay(sPlayerbotAIConfig.passiveDelay);
