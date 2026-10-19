@@ -92,6 +92,15 @@ bool LeaveGroupAction::Leave()
             PlayerbotTextMgr::instance().GetBotTextOrDefault("goodbye", "Goodbye!", {}),
             PLAYERBOT_SECURITY_TALK);
 
+    // wov: a player says bye in party chat when they leave, not a whisper
+    if (sRandomPlayerbotMgr.IsRandomBot(bot) && bot->GetGroup() && urand(0, 99) < 70)
+    {
+        static char const* const kBye[] = {"ty for group", "thx for group", "ty all", "gg ty", "cya", "thx all gl",
+                                           "ty gl", "bye all", "gtg ty", "thanks for the group", "ty ty", "gg",
+                                           "thx guys", "ty, gl all", "cya guys", "ty for the run", "later all"};
+        botAI->SayToParty(kBye[urand(0, sizeof(kBye) / sizeof(kBye[0]) - 1)]);
+    }
+
     botAI->LeaveOrDisbandGroup();
     return true;
 }

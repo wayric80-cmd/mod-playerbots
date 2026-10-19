@@ -72,6 +72,15 @@ bool AcceptInvitationAction::Execute(Event event)
 
     botAI->TellMaster(PlayerbotTextMgr::instance().GetBotTextOrDefault("hello", "Hello", {}));
 
+    // wov: a player says hi in party chat when they join, not a whisper
+    if (sRandomPlayerbotMgr.IsRandomBot(bot) && urand(0, 99) < 75)
+    {
+        static char const* const kHi[] = {"hi", "hey", "hey all", "hi all", "yo", "o/", "hello", "ty for inv",
+                                          "thx for the inv", "thanks for the invite", "ty", "sup", "hey guys",
+                                          "hiya", "ty for invite", "heya", "hi guys", "yo ty", "thx", "sup all"};
+        botAI->SayToParty(kHi[urand(0, sizeof(kHi) / sizeof(kHi[0]) - 1)]);
+    }
+
     if (sPlayerbotAIConfig.summonWhenGroup && bot->GetDistance(inviter) > sPlayerbotAIConfig.sightDistance)
     {
         Teleport(inviter, bot, true);
