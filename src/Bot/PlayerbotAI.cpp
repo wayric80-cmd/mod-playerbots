@@ -3040,6 +3040,10 @@ bool PlayerbotAI::TellMasterNoFacing(std::ostringstream& stream, PlayerbotSecuri
 
 bool PlayerbotAI::TellMasterNoFacing(std::string const text, PlayerbotSecurityLevel securityLevel)
 {
+    // wov: random bots are "players"; they never whisper bot-style status reports (quest x/y, errors...)
+    if (sRandomPlayerbotMgr.IsRandomBot(bot))
+        return false;
+
     Player* master = GetMaster();
     PlayerbotAI* masterBotAI = nullptr;
     if (master)
@@ -3076,6 +3080,10 @@ bool PlayerbotAI::TellMasterNoFacing(std::string const text, PlayerbotSecurityLe
 
 bool PlayerbotAI::TellError(std::string const text, PlayerbotSecurityLevel securityLevel)
 {
+    // wov: random bots are "players"; they never whisper bot-style status reports (quest x/y, errors...)
+    if (sRandomPlayerbotMgr.IsRandomBot(bot))
+        return false;
+
     Player* master = GetMaster();
     if (!IsTellAllowed(securityLevel) || !master || GET_PLAYERBOT_AI(master))
         return false;
@@ -3111,6 +3119,10 @@ bool PlayerbotAI::TellMaster(std::ostringstream& stream, PlayerbotSecurityLevel 
 
 bool PlayerbotAI::TellMaster(std::string const text, PlayerbotSecurityLevel securityLevel)
 {
+    // wov: random bots are "players"; they never whisper bot-style status reports (quest x/y, errors...)
+    if (sRandomPlayerbotMgr.IsRandomBot(bot))
+        return false;
+
     if (!master)
     {
         if (sPlayerbotAIConfig.randomBotSayWithoutMaster)
