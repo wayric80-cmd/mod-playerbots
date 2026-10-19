@@ -140,6 +140,7 @@ class PlayerbotsPlayerScript : public PlayerScript
 public:
     PlayerbotsPlayerScript() : PlayerScript("PlayerbotsPlayerScript", {
         PLAYERHOOK_ON_LOGIN,
+        PLAYERHOOK_ON_PVP_KILL,
         PLAYERHOOK_ON_AFTER_UPDATE,
         PLAYERHOOK_ON_BEFORE_CRITERIA_PROGRESS,
         PLAYERHOOK_ON_BEFORE_ACHI_COMPLETE,
@@ -337,6 +338,8 @@ public:
 
         return true;
     }
+
+    void OnPlayerPVPKill(Player* killer, Player* killed) override { WovWar_OnPvpKill(killer, killed); }  // wov
 
     void OnPlayerAfterUpdate(Player* player, uint32 diff) override
     {

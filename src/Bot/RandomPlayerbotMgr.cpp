@@ -163,6 +163,560 @@ bool WovLogoutBudget()
 }
 }  // namespace
 // ---- end wov ---------------------------------------------------------------------------------------
+
+// ---- wov: Call to Arms (world PvP) -------------------------------------------------------------------
+// A PvP kill in the open world can grow into a skirmish: the side that is losing people calls for help in
+// General/LocalDefense, bots of the right level fly in on flight paths and the other side answers in kind.
+// In the evening bots also organise raids on enemy towns. See wov/HANDOVER.md.
+#include "Playerbots.h"
+#include "TravelNode.h"
+#include "WorldSessionMgr.h"
+#include "WorldPacket.h"
+#include <deque>
+#include <mutex>
+namespace
+{
+struct WovHotspot
+{
+    char const* name;
+    uint32 fmEntry;
+    TeamId owner;
+    uint8 minL;
+    uint8 maxL;
+    uint32 map = 0;
+    float x = 0, y = 0, z = 0;
+    bool loaded = false;
+};
+std::vector<WovHotspot> g_wovHot = {
+    {"Southshore", 2432, TEAM_ALLIANCE, 20, 34},  {"Tarren Mill", 2389, TEAM_HORDE, 20, 34},
+    {"the Crossroads", 3615, TEAM_HORDE, 12, 25}, {"Astranaar", 4267, TEAM_ALLIANCE, 18, 30},
+    {"Splintertree", 12616, TEAM_HORDE, 20, 32},  {"Lakeshire", 931, TEAM_ALLIANCE, 15, 27},
+    {"Darkshire", 2409, TEAM_ALLIANCE, 20, 32},   {"Grom'gol", 1387, TEAM_HORDE, 30, 45},
+    {"Refuge Pointe", 2835, TEAM_ALLIANCE, 30, 42}, {"Hammerfall", 2851, TEAM_HORDE, 30, 42},
+    {"the Sepulcher", 2226, TEAM_HORDE, 10, 22}};
+
+struct WovKill
+{
+    time_t t = 0;
+    uint32 map = 0;
+    float x = 0, y = 0, z = 0;
+    TeamId killerTeam = TEAM_NEUTRAL;
+    bool real = false;
+    uint8 victimLevel = 1;
+    uint32 killerLow = 0, victimLow = 0;
+    bool killerBot = false, victimBot = false;
+    std::string place;
+};
+
+struct WovSkirmish
+{
+    uint32 id = 0;
+    uint32 map = 0;
+    float x = 0, y = 0, z = 0;
+    std::string place;
+    uint8 minL = 1, maxL = 60;
+    time_t start = 0, lastKill = 0, lastWave = 0;
+    bool raid = false;
+    TeamId raidTeam = TEAM_NEUTRAL;
+    TeamId owner = TEAM_NEUTRAL;
+    uint32 raidTarget = 0;
+    bool announced = false;
+    bool cried[2] = {false, false};
+    std::set<uint32> members[2];
+    std::set<uint32> invitedReal;
+};
+
+std::mutex g_wovWarMutex;
+std::deque<WovKill> g_wovKillQueue;
+std::deque<WovKill> g_wovRecent;
+std::vector<WovSkirmish> g_wovSk;
+uint32 g_wovSkSeq = 0;
+std::unordered_map<uint32, uint32> g_wovBotSk;
+
+bool g_wovWarEnable = false;
+uint32 g_wovWarMaxPerSide = 30, g_wovWarMaxActive = 2, g_wovWarSparkKills = 2, g_wovWarSparkWindow = 300,
+       g_wovWarIdleEnd = 420, g_wovWarMaxMinutes = 40, g_wovWarRaidChance = 17, g_wovWarRaidFrom = 17,
+       g_wovWarRaidTo = 24, g_wovWarAccept = 55;
+time_t g_wovWarCfgT = 0;
+
+char const* const kWovCry[] = {"need help at {place}!! {n} {enemy} here", "{enemy} raiding {place}, anyone around??",
+                               "inc {place}, need ppl", "{place} getting camped by {enemy}, help pls",
+                               "any {us} near {place}? {enemy} ganking", "{n} {enemy} at {place}, come help",
+                               "help at {place} pls, {enemy} everywhere", "{enemy} at {place}!!",
+                               "need ppl at {place} asap, {enemy} camping"};
+char const* const kWovOmw[] = {"omw", "otw", "on my way", "omw 2 min", "coming", "flying in", "be there soon", "omw!"};
+char const* const kWovInvite[] = {"{place} getting hit by {enemy}, u coming?", "yo, pvp at {place}, come",
+                                  "we need ppl at {place}, {enemy} raiding", "wanna kill some {enemy}? {place}",
+                                  "{enemy} at {place}, u around?"};
+char const* const kWovRaidCall[] = {"raiding {place}, who's in?", "lets go hit {place}", "{place} raid, come",
+                                    "anyone up for raiding {place}?", "going to {place} to kill some {enemy}, join"};
+char const* const kWovEnd[] = {"gg", "lol they ran", "ez", "gg wp", "that was fun", "they'll be back",
+                               "gg, that was nuts", "ffs i died like 5 times", "good fight", "lol gg"};
+
+template <size_t N>
+char const* WovPick(char const* const (&a)[N])
+{
+    return a[urand(0, N - 1)];
+}
+
+TeamId WovOther(TeamId t) { return t == TEAM_ALLIANCE ? TEAM_HORDE : TEAM_ALLIANCE; }
+
+std::string WovFill(std::string s, std::string const& place, uint32 n, TeamId enemy)
+{
+    auto rep = [&s](std::string const& k, std::string const& v)
+    {
+        for (size_t p = s.find(k); p != std::string::npos; p = s.find(k, p + v.size()))
+            s.replace(p, k.size(), v);
+    };
+    rep("{place}", place);
+    rep("{n}", std::to_string(std::max<uint32>(n, 2)));
+    rep("{enemy}", enemy == TEAM_HORDE ? "hordes" : "allys");
+    rep("{us}", enemy == TEAM_HORDE ? "ally" : "horde");
+    return s;
+}
+
+void WovWarConfig(time_t now)
+{
+    if (g_wovWarCfgT && now < g_wovWarCfgT + 60)
+        return;
+    g_wovWarCfgT = now;
+    g_wovWarEnable = sConfigMgr->GetOption<bool>("AiPlayerbot.WoV.War.Enable", false);
+    g_wovWarMaxPerSide = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.War.MaxPerSide", 30);
+    g_wovWarMaxActive = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.War.MaxActive", 2);
+    g_wovWarSparkKills = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.War.SparkKills", 2);
+    g_wovWarSparkWindow = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.War.SparkWindow", 300);
+    g_wovWarIdleEnd = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.War.IdleEnd", 420);
+    g_wovWarMaxMinutes = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.War.MaxMinutes", 40);
+    g_wovWarRaidChance = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.War.RaidChance", 17);
+    g_wovWarRaidFrom = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.War.RaidFromHour", 17);
+    g_wovWarRaidTo = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.War.RaidToHour", 24);
+    g_wovWarAccept = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.War.AcceptChance", 55);
+}
+
+void WovHotLoad()
+{
+    static bool done = false;
+    if (done)
+        return;
+    done = true;
+    for (WovHotspot& h : g_wovHot)
+    {
+        QueryResult r = WorldDatabase.Query("SELECT map, position_x, position_y, position_z FROM creature WHERE id = {} LIMIT 1",
+                                            h.fmEntry);
+        if (!r)
+            continue;
+        Field* f = r->Fetch();
+        h.map = f[0].Get<uint32>();
+        h.x = f[1].Get<float>();
+        h.y = f[2].Get<float>();
+        h.z = f[3].Get<float>();
+        h.loaded = true;
+    }
+}
+
+bool WovOpenWorld(Player* p)
+{
+    Map* m = p ? p->GetMap() : nullptr;
+    return m && !m->Instanceable() && (p->GetMapId() == 0 || p->GetMapId() == 1);
+}
+
+float WovDist(Player* p, WovSkirmish const& s)
+{
+    if (!p || p->GetMapId() != s.map)
+        return 1.0e9f;
+    return p->GetExactDist(s.x, s.y, s.z);
+}
+
+void WovSend(Player* bot, WovSkirmish const& s)
+{
+    PlayerbotAI* ai = GET_PLAYERBOT_AI(bot);
+    if (!ai)
+        return;
+    WorldPosition dest(s.map, s.x, s.y, s.z);
+    if (bot->GetMapId() == s.map && bot->GetExactDist(s.x, s.y, s.z) < 450.0f)
+    {
+        ai->rpgInfo.ChangeToGoGrind(dest);
+        return;
+    }
+    if (TravelMgr::FlightMasterInfo const* fm = sTravelMgr.GetNearestFlightMasterInfo(bot))
+    {
+        uint32 to = sObjectMgr->GetNearestTaxiNode(s.x, s.y, s.z, s.map, bot->GetTeamId());
+        if (fm->taxiNodeId && to && fm->taxiNodeId != to)
+        {
+            std::vector<uint32> path = sTravelNodeMap.FindTaxiPath(fm->taxiNodeId, to);
+            if (!path.empty())
+            {
+                ai->rpgInfo.ChangeToTravelFlight(fm->templateEntry, fm->pos, path);
+                return;
+            }
+        }
+    }
+    if (bot->GetMapId() == s.map)
+        ai->rpgInfo.ChangeToGoGrind(dest);
+}
+
+void WovSayChannel(Player* bot, std::string const& text, bool alsoDefense)
+{
+    PlayerbotAI* ai = GET_PLAYERBOT_AI(bot);
+    if (!ai || text.empty())
+        return;
+    ai->SayToChannel(text, ChatChannelId::GENERAL);
+    if (alsoDefense)
+        ai->SayToChannel(text, ChatChannelId::LOCAL_DEFENSE);
+}
+
+void WovCry(WovSkirmish& s, TeamId defender, uint32 enemies)
+{
+    if (s.cried[defender])
+        return;
+    for (uint32 low : s.members[defender])
+    {
+        Player* p = ObjectAccessor::FindPlayerByLowGUID(low);
+        if (!p || WovDist(p, s) > 250.0f)
+            continue;
+        WovSayChannel(p, WovFill(WovPick(kWovCry), s.place, enemies, WovOther(defender)), urand(0, 1));
+        s.cried[defender] = true;
+        return;
+    }
+}
+
+uint32 WovRecruit(WovSkirmish& s, TeamId team, uint32 want)
+{
+    if (!want)
+        return 0;
+    std::vector<Player*> cands;
+    for (auto const& [guid, bot] : sRandomPlayerbotMgr.GetAllBots())
+    {
+        if (!bot || !bot->IsInWorld() || !bot->IsAlive() || bot->GetTeamId() != team)
+            continue;
+        if (bot->GetGroup() || bot->InBattleground() || bot->IsInFlight() || !WovOpenWorld(bot))
+            continue;
+        if (bot->GetLevel() < s.minL || bot->GetLevel() > s.maxL)
+            continue;
+        if (g_wovBotSk.count(bot->GetGUID().GetCounter()))
+            continue;
+        cands.push_back(bot);
+    }
+    std::shuffle(cands.begin(), cands.end(), std::mt19937(std::random_device{}()));
+    uint32 got = 0;
+    Player* firstRecruit = nullptr;
+    for (Player* bot : cands)
+    {
+        if (got >= want)
+            break;
+        if (urand(0, 99) >= g_wovWarAccept)
+            continue;
+        uint32 low = bot->GetGUID().GetCounter();
+        g_wovBotSk[low] = s.id;
+        s.members[team].insert(low);
+        WovSend(bot, s);
+        ++got;
+        if (!firstRecruit)
+            firstRecruit = bot;
+        PlayerbotAI* ai = GET_PLAYERBOT_AI(bot);
+        if (ai && bot->GetGuild() && urand(0, 99) < 30)
+            ai->SayToGuild(s.raid && team == s.raidTeam && got == 1 ? WovFill(WovPick(kWovRaidCall), s.place, 0, WovOther(team))
+                                                                    : std::string(WovPick(kWovOmw)));
+    }
+    if (firstRecruit)
+    {
+        for (auto const& [id, session] : sWorldSessionMgr->GetAllSessions())
+        {
+            Player* p = session ? session->GetPlayer() : nullptr;
+            if (!p || session->IsBot() || !p->IsInWorld() || p->GetTeamId() != team || !WovOpenWorld(p))
+                continue;
+            if (p->GetLevel() < s.minL || p->GetLevel() > s.maxL + 5 || WovDist(p, s) < 300.0f)
+                continue;
+            if (s.invitedReal.count(p->GetGUID().GetCounter()) || urand(0, 99) >= 60)
+                continue;
+            s.invitedReal.insert(p->GetGUID().GetCounter());
+            firstRecruit->Whisper(WovFill(WovPick(kWovInvite), s.place, 0, WovOther(team)), LANG_UNIVERSAL, p);
+        }
+    }
+    if (got)
+        LOG_INFO("playerbots", "WoV war #{} {}: {} {} recruited", s.id, s.place, got,
+                 team == TEAM_ALLIANCE ? "alliance" : "horde");
+    return got;
+}
+
+void WovAddMember(WovSkirmish& s, uint32 low, TeamId team)
+{
+    if (!low || g_wovBotSk.count(low))
+        return;
+    g_wovBotSk[low] = s.id;
+    s.members[team].insert(low);
+}
+
+void WovStartRaid(time_t now)
+{
+    std::vector<WovHotspot*> options;
+    for (WovHotspot& h : g_wovHot)
+    {
+        if (!h.loaded)
+            continue;
+        TeamId att = WovOther(h.owner);
+        uint32 attackers = 0, defenders = 0;
+        for (auto const& [guid, bot] : sRandomPlayerbotMgr.GetAllBots())
+        {
+            if (!bot || !bot->IsInWorld() || bot->GetLevel() < h.minL || bot->GetLevel() > h.maxL || !WovOpenWorld(bot))
+                continue;
+            if (bot->GetTeamId() == att)
+                ++attackers;
+            else
+                ++defenders;
+        }
+        if (attackers >= 10 && defenders >= 6)
+            options.push_back(&h);
+    }
+    if (options.empty())
+        return;
+    WovHotspot* h = options[urand(0, options.size() - 1)];
+    for (WovSkirmish const& s : g_wovSk)
+        if (s.map == h->map && std::hypot(s.x - h->x, s.y - h->y) < 600.0f)
+            return;
+    WovSkirmish s;
+    s.id = ++g_wovSkSeq;
+    s.map = h->map;
+    s.x = h->x;
+    s.y = h->y;
+    s.z = h->z;
+    s.place = h->name;
+    s.minL = h->minL;
+    s.maxL = h->maxL;
+    s.start = now;
+    s.lastKill = now + 480;  // grace while the raid flies in
+    s.lastWave = now;
+    s.raid = true;
+    s.owner = h->owner;
+    s.raidTeam = WovOther(h->owner);
+    s.raidTarget = urand(12, std::max<uint32>(12, g_wovWarMaxPerSide));
+    g_wovSk.push_back(s);
+    LOG_INFO("playerbots", "WoV war #{}: {} raid on {} ({} attackers wanted)", s.id,
+             s.raidTeam == TEAM_ALLIANCE ? "alliance" : "horde", s.place, s.raidTarget);
+    WovRecruit(g_wovSk.back(), s.raidTeam, s.raidTarget);
+}
+
+void WovHandleKill(WovKill const& k, time_t now)
+{
+    TeamId victimTeam = WovOther(k.killerTeam);
+    for (WovSkirmish& s : g_wovSk)
+    {
+        if (s.map == k.map && std::hypot(s.x - k.x, s.y - k.y) < 300.0f)
+        {
+            s.lastKill = std::max(s.lastKill, now);
+            if (k.killerBot)
+                WovAddMember(s, k.killerLow, k.killerTeam);
+            if (k.victimBot)
+                WovAddMember(s, k.victimLow, victimTeam);
+            return;
+        }
+    }
+    g_wovRecent.push_back(k);
+    while (!g_wovRecent.empty() && g_wovRecent.front().t + time_t(g_wovWarSparkWindow) < now)
+        g_wovRecent.pop_front();
+    uint32 n = 0;
+    for (WovKill const& r : g_wovRecent)
+        if (r.map == k.map && std::hypot(r.x - k.x, r.y - k.y) < 220.0f)
+            ++n;
+    if (!(n >= g_wovWarSparkKills || k.real) || g_wovSk.size() >= g_wovWarMaxActive)
+        return;
+    WovSkirmish s;
+    s.id = ++g_wovSkSeq;
+    s.map = k.map;
+    s.x = k.x;
+    s.y = k.y;
+    s.z = k.z;
+    s.place = k.place.empty() ? std::string("here") : k.place;
+    s.minL = uint8(std::max<int>(1, int(k.victimLevel) - 7));
+    s.maxL = uint8(std::min<int>(60, int(k.victimLevel) + 7));
+    s.start = now;
+    s.lastKill = now;
+    s.lastWave = 0;
+    s.owner = victimTeam;
+    g_wovSk.push_back(s);
+    WovSkirmish& ref = g_wovSk.back();
+    if (k.killerBot)
+        WovAddMember(ref, k.killerLow, k.killerTeam);
+    if (k.victimBot)
+        WovAddMember(ref, k.victimLow, victimTeam);
+    LOG_INFO("playerbots", "WoV war #{}: skirmish at {} (lvl {}-{})", ref.id, ref.place, ref.minL, ref.maxL);
+    WovCry(ref, victimTeam, n);
+}
+
+void WovEnd(WovSkirmish& s)
+{
+    uint32 said = 0;
+    for (int t = 0; t < 2; ++t)
+    {
+        for (uint32 low : s.members[t])
+        {
+            g_wovBotSk.erase(low);
+            Player* p = ObjectAccessor::FindPlayerByLowGUID(low);
+            if (!p)
+                continue;
+            PlayerbotAI* ai = GET_PLAYERBOT_AI(p);
+            if (!ai)
+                continue;
+            if (said < 3 && p->IsAlive() && WovDist(p, s) < 200.0f && urand(0, 99) < 15)
+            {
+                WovSayChannel(p, WovPick(kWovEnd), false);
+                ++said;
+            }
+            if (ai->rpgInfo.GetStatus() == RPG_GO_GRIND)
+                ai->rpgInfo.ChangeToIdle();
+        }
+    }
+    LOG_INFO("playerbots", "WoV war #{} at {} over ({} vs {})", s.id, s.place, s.members[0].size(), s.members[1].size());
+}
+
+void WovWar_Tick(time_t now)
+{
+    WovWarConfig(now);
+    if (!g_wovWarEnable)
+        return;
+    static time_t last = 0;
+    if (now < last + 5)
+        return;
+    last = now;
+    WovHotLoad();
+
+    std::deque<WovKill> kills;
+    {
+        std::lock_guard<std::mutex> lock(g_wovWarMutex);
+        kills.swap(g_wovKillQueue);
+    }
+    for (WovKill const& k : kills)
+        WovHandleKill(k, now);
+
+    static time_t lastRaidCheck = now;
+    if (now >= lastRaidCheck + 600)
+    {
+        lastRaidCheck = now;
+        tm lt{};
+        localtime_r(&now, &lt);
+        uint32 hour = uint32(lt.tm_hour);
+        if (hour >= g_wovWarRaidFrom && hour < g_wovWarRaidTo && g_wovSk.size() < g_wovWarMaxActive &&
+            urand(0, 99) < g_wovWarRaidChance)
+            WovStartRaid(now);
+    }
+
+    for (size_t i = 0; i < g_wovSk.size();)
+    {
+        WovSkirmish& s = g_wovSk[i];
+        uint32 nearCount[2] = {0, 0};
+        WorldPosition dest(s.map, s.x, s.y, s.z);
+        for (int t = 0; t < 2; ++t)
+        {
+            for (auto it = s.members[t].begin(); it != s.members[t].end();)
+            {
+                Player* p = ObjectAccessor::FindPlayerByLowGUID(*it);
+                if (!p || !p->IsInWorld())
+                {
+                    g_wovBotSk.erase(*it);
+                    it = s.members[t].erase(it);
+                    continue;
+                }
+                float d = WovDist(p, s);
+                if (p->IsAlive() && d < 160.0f)
+                    ++nearCount[t];
+                PlayerbotAI* ai = GET_PLAYERBOT_AI(p);
+                if (ai && p->IsAlive() && !p->IsInFlight() && !p->GetGroup() &&
+                    ai->rpgInfo.GetStatus() != RPG_TRAVEL_FLIGHT && d > 70.0f)
+                {
+                    if (d > 450.0f)
+                        WovSend(p, s);
+                    else
+                        ai->rpgInfo.ChangeToGoGrind(dest);
+                }
+                ++it;
+            }
+        }
+        for (auto const& [id, session] : sWorldSessionMgr->GetAllSessions())
+        {
+            Player* p = session ? session->GetPlayer() : nullptr;
+            if (p && !session->IsBot() && p->IsInWorld() && p->IsAlive() && WovDist(p, s) < 160.0f)
+                ++nearCount[p->GetTeamId() == TEAM_ALLIANCE ? 0 : 1];
+        }
+
+        if (s.raid && !s.announced && nearCount[s.raidTeam] >= 3)
+        {
+            s.announced = true;
+            s.lastKill = std::max(s.lastKill, now);
+            for (uint32 low : s.members[s.raidTeam])
+            {
+                Player* p = ObjectAccessor::FindPlayerByLowGUID(low);
+                if (p && WovDist(p, s) < 160.0f)
+                {
+                    WorldPacket data(SMSG_ZONE_UNDER_ATTACK, 4);
+                    data << uint32(p->GetAreaId());
+                    sWorldSessionMgr->SendGlobalMessage(&data, nullptr, s.owner);
+                    break;
+                }
+            }
+            WovCry(s, s.owner, nearCount[s.raidTeam]);
+        }
+
+        if (now >= s.lastWave + 90)
+        {
+            s.lastWave = now;
+            for (int t = 0; t < 2; ++t)
+            {
+                TeamId team = TeamId(t);
+                uint32 have = s.members[t].size();
+                uint32 want = 0;
+                if (s.raid && team == s.raidTeam)
+                    want = have < s.raidTarget ? std::min<uint32>(s.raidTarget - have, 10) : 0;
+                else if (!(s.raid && !s.announced))
+                {
+                    uint32 enemies = nearCount[1 - t];
+                    uint32 target = std::min<uint32>(g_wovWarMaxPerSide, enemies * 5 / 4 + 3);
+                    if (!enemies)
+                        target = 0;
+                    want = target > have ? std::min<uint32>(target - have, 8) : 0;
+                }
+                WovRecruit(s, team, want);
+            }
+        }
+
+        bool timeout = now > s.start + time_t(g_wovWarMaxMinutes) * 60;
+        bool idle = now > s.lastKill + time_t(g_wovWarIdleEnd) && now > s.start + 300;
+        if (timeout || idle)
+        {
+            WovEnd(s);
+            g_wovSk.erase(g_wovSk.begin() + i);
+            continue;
+        }
+        ++i;
+    }
+}
+}  // namespace
+
+// Called from the PvP kill hook (map threads): only queues.
+void WovWar_OnPvpKill(Player* killer, Player* killed)
+{
+    if (!g_wovWarEnable || !killer || !killed || killer == killed || killer->GetTeamId() == killed->GetTeamId())
+        return;
+    if (!WovOpenWorld(killed))
+        return;
+    WovKill k;
+    k.t = time(nullptr);
+    k.map = killed->GetMapId();
+    k.x = killed->GetPositionX();
+    k.y = killed->GetPositionY();
+    k.z = killed->GetPositionZ();
+    k.killerTeam = killer->GetTeamId();
+    k.killerBot = sRandomPlayerbotMgr.IsRandomBot(killer);
+    k.victimBot = sRandomPlayerbotMgr.IsRandomBot(killed);
+    k.real = !k.killerBot || !k.victimBot;
+    k.victimLevel = killed->GetLevel();
+    k.killerLow = killer->GetGUID().GetCounter();
+    k.victimLow = killed->GetGUID().GetCounter();
+    if (AreaTableEntry const* area = sAreaTableStore.LookupEntry(killed->GetAreaId()))
+        k.place = area->area_name[0];
+    std::lock_guard<std::mutex> lock(g_wovWarMutex);
+    g_wovKillQueue.push_back(std::move(k));
+}
+// ---- end wov: Call to Arms ----------------------------------------------------------------------------
 #include "PlayerbotFactory.h"
 #include "PlayerbotTextMgr.h"
 #include "Playerbots.h"
@@ -426,6 +980,7 @@ void RandomPlayerbotMgr::UpdateAIInternal(uint32 /*elapsed*/, bool /*minimal*/)
         return;
 
     CompanyStanding::instance().Update();  // local: company standing (custom wow plans/14, step C)
+    WovWar_Tick(time(nullptr));  // wov: Call to Arms
 
     /*if (sPlayerbotAIConfig.enablePrototypePerformanceDiff)
     {

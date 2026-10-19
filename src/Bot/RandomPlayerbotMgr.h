@@ -267,4 +267,7 @@ private:
 
 #define sRandomPlayerbotMgr RandomPlayerbotMgr::instance()
 
+// wov: world PvP skirmishes (RandomPlayerbotMgr.cpp)
+void WovWar_OnPvpKill(Player* killer, Player* killed);
+
 #endif
