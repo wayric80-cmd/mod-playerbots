@@ -760,6 +760,7 @@ void WovWar_OnPvpKill(Player* killer, Player* killed)
 // can see, asking real players nearby to group ("inv?"), inviting them when they answer an LFM, and guild
 // leaders inviting unguilded real players. See wov/HANDOVER.md.
 #include "GuildMgr.h"
+#include <unordered_set>
 #include <tuple>
 #include <cstring>
 #include <cctype>
@@ -1557,6 +1558,59 @@ void WovTogether_OnChannel(Player* player, std::string const& msg)
     g_wovChatQueue.push_back({player->GetGUID().GetCounter(), msg});
 }
 // ---- end wov: play together ----------------------------------------------------------------------------
+
+// ---- wov: regear once ----------------------------------------------------------------------------------
+// Bots used to get a fresh set of blues at every level. Each random bot is re-geared ONCE with ordinary
+// leveling gear (greens at most, often worse; RandomGearLoweringChance) a few at a time; after that, gear
+// comes only from what they loot and quest (AutoUpgradeEquip = 0). Done bots are listed in wov_regear.
+#include "PlayerbotFactory.h"
+namespace
+{
+void WovRegear_Tick(time_t now)
+{
+    static time_t last = 0, cfgT = 0;
+    static bool enable = false;
+    static uint32 perTick = 4;
+    static std::unordered_set<uint32> done;
+    static bool loaded = false;
+    if (now >= cfgT + 60)
+    {
+        cfgT = now;
+        enable = sConfigMgr->GetOption<bool>("AiPlayerbot.WoV.RegearOnce.Enable", false);
+        perTick = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.RegearOnce.PerTick", 4);
+    }
+    if (!enable || now < last + 10)
+        return;
+    last = now;
+    if (!loaded)
+    {
+        loaded = true;
+        if (QueryResult r = CharacterDatabase.Query("SELECT guid FROM wov_regear"))
+            do
+                done.insert(r->Fetch()[0].Get<uint32>());
+            while (r->NextRow());
+    }
+    uint32 n = 0;
+    for (auto const& [guid, bot] : sRandomPlayerbotMgr.GetAllBots())
+    {
+        if (n >= perTick)
+            break;
+        if (!bot || !bot->IsInWorld() || !bot->IsAlive() || bot->IsInCombat() || bot->GetGroup() || bot->IsInFlight())
+            continue;
+        if (bot->GetMap() && bot->GetMap()->Instanceable())
+            continue;
+        uint32 low = bot->GetGUID().GetCounter();
+        if (done.count(low))
+            continue;
+        done.insert(low);
+        PlayerbotFactory factory(bot, bot->GetLevel(), ITEM_QUALITY_UNCOMMON);
+        factory.InitEquipment(false);
+        CharacterDatabase.Execute("INSERT IGNORE INTO wov_regear (guid) VALUES ({})", low);
+        ++n;
+    }
+}
+}  // namespace
+// ---- end wov: regear once ------------------------------------------------------------------------------
 #include "PlayerbotFactory.h"
 #include "PlayerbotTextMgr.h"
 #include "Playerbots.h"
@@ -1823,6 +1877,7 @@ void RandomPlayerbotMgr::UpdateAIInternal(uint32 /*elapsed*/, bool /*minimal*/)
     WovWar_Tick(time(nullptr));  // wov: Call to Arms
     WovInit_Tick(time(nullptr));  // wov: initiative
     WovTogether_Tick(time(nullptr));  // wov: play together
+    WovRegear_Tick(time(nullptr));  // wov: regear once
 
     /*if (sPlayerbotAIConfig.enablePrototypePerformanceDiff)
     {
