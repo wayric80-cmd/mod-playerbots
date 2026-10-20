@@ -817,6 +817,14 @@ std::unordered_map<uint32, WovLfx> g_wovLfx;
 std::vector<std::pair<uint32, uint32>> g_wovInviteQueue;
 std::vector<std::tuple<uint32, uint32, WovDungeon const*>> g_wovJoinTrack;
 std::unordered_map<uint32, time_t> g_wovNextGroupAsk, g_wovNextGuildAsk;
+struct WovGuildApp
+{
+    time_t due;
+    uint32 applicant, recruiter, guildId;
+};
+std::vector<WovGuildApp> g_wovGuildApps;
+char const* const kWovApply[] = {"saw {guild} recruiting, can i get an inv?", "hey, still recruiting? inv pls", "inv to {guild}? pls",
+                                 "looking for a guild, can i join?", "{guild} recruiting? id like an inv"};
 
 void WovInitConfig(time_t now)
 {
@@ -885,6 +893,8 @@ Player* WovPickPoster(Player* real, bool needCapital, uint8 preferDrive = 0)
         if (!bot || !bot->IsInWorld() || bot->GetTeamId() != real->GetTeamId() || bot->GetZoneId() != real->GetZoneId())
             continue;
         if (needCapital && !WovInCapital(bot))
+            continue;
+        if (bot->GetGroup() || (bot->GetMap() && bot->GetMap()->Instanceable()))
             continue;
         if (g_wovBotSk.count(bot->GetGUID().GetCounter()))
             continue;
@@ -971,7 +981,7 @@ void WovPostRecruit(Player* real)
     std::vector<Player*> c;
     for (auto const& [guid, bot] : sRandomPlayerbotMgr.GetAllBots())
         if (bot && bot->IsInWorld() && bot->GetGuild() && bot->GetTeamId() == real->GetTeamId() &&
-            bot->GetZoneId() == real->GetZoneId())
+            bot->GetZoneId() == real->GetZoneId() && !bot->GetGroup() && bot->GetMap() && !bot->GetMap()->Instanceable())
             c.push_back(bot);
     if (c.empty())
         return;
@@ -981,6 +991,21 @@ void WovPostRecruit(Player* real)
         return;
     std::string text = WovRep(WovPick(kWovRecruit), "{guild}", bot->GetGuild()->GetName());
     ai->SayToChannel(text, WovInCapital(bot) ? ChatChannelId::GUILD_RECRUITMENT : ChatChannelId::GENERAL);
+    // a few unguilded players around answer the post
+    time_t now = time(nullptr);
+    uint32 apps = 0;
+    for (auto const& [guid, a] : sRandomPlayerbotMgr.GetAllBots())
+    {
+        if (apps >= 2)
+            break;
+        if (!a || a == bot || !a->IsInWorld() || a->GetGuild() || a->GetTeamId() != bot->GetTeamId() || a->GetLevel() < 5)
+            continue;
+        if (a->GetZoneId() != bot->GetZoneId() || urand(0, 99) >= 25)
+            continue;
+        g_wovGuildApps.push_back({now + time_t(urand(20, 120)), a->GetGUID().GetCounter(), bot->GetGUID().GetCounter(),
+                                  bot->GetGuild()->GetId()});
+        ++apps;
+    }
 }
 
 void WovAskGroup(Player* real)
@@ -1054,6 +1079,32 @@ void WovInit_Tick(time_t now)
         pk << p->GetName();
         pk << uint32(0);
         bot->GetSession()->HandleGroupInviteOpcode(pk);
+    }
+
+    for (size_t i = 0; i < g_wovGuildApps.size();)
+    {
+        WovGuildApp app = g_wovGuildApps[i];
+        if (now < app.due)
+        {
+            ++i;
+            continue;
+        }
+        g_wovGuildApps.erase(g_wovGuildApps.begin() + i);
+        Player* a = ObjectAccessor::FindPlayerByLowGUID(app.applicant);
+        Player* r = ObjectAccessor::FindPlayerByLowGUID(app.recruiter);
+        Guild* g = sGuildMgr->GetGuildById(app.guildId);
+        if (!a || a->GetGuild() || !g)
+            continue;
+        Player* leader = ObjectAccessor::FindPlayer(g->GetLeaderGUID());
+        std::string text = WovRep(WovPick(kWovApply), "{guild}", g->GetName());
+        if (leader && leader->IsInWorld() && !GET_PLAYERBOT_AI(leader))
+            a->Whisper(text, LANG_UNIVERSAL, leader);  // a real guild master decides
+        else if (r)
+        {
+            a->Whisper(text, LANG_UNIVERSAL, r);
+            g->AddMember(a->GetGUID());
+            LOG_INFO("playerbots", "WoV init: {} joined <{}> after {}'s recruitment post", a->GetName(), g->GetName(), r->GetName());
+        }
     }
 
     static time_t nextLfg[2] = {0, 0}, nextTrade[2] = {0, 0}, nextRecruit[2] = {0, 0};
