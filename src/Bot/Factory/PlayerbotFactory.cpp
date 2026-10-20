@@ -5,6 +5,7 @@
  */
 
 #include "PlayerbotFactory.h"
+uint64 WovWealthTarget(Player* bot);  // wov: RandomPlayerbotMgr.cpp
 #include "PlayerbotsDatabase.h"
 #include "AccountMgr.h"
 #include "AiFactory.h"
@@ -1039,7 +1040,7 @@ void PlayerbotFactory::Randomize(bool incremental)
 
     pmo = sPerfMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_Save");
     LOG_DEBUG("playerbots", "Saving to DB...");
-    bot->SetMoney(urand(level * 100000, level * 5 * 100000));
+    bot->SetMoney(uint32(WovWealthTarget(bot)));  // wov: Classic-like gold
     bot->SetHealth(bot->GetMaxHealth());
     bot->SetPower(POWER_MANA, bot->GetMaxPower(POWER_MANA));
     bot->SaveToDB(false, false);

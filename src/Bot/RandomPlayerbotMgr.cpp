@@ -174,6 +174,20 @@ uint8 WovDriveOf(uint32 guidLow)
     return it == g_wovSched.end() ? 0 : it->second.drive;
 }
 
+// wov: Classic-like gold for a bot of this level (about level^3 / 500 gold, so ~2 g at 10, 54 g at 30, 430 g at 60),
+// spread per bot; savers (drive gold) keep more. Used for new bots and the one-time trim (wov_wealth).
+uint64 WovWealthTarget(Player* bot)
+{
+    uint64 level = bot ? bot->GetLevel() : 1;
+    uint64 copper = level * level * level * 20;
+    uint32 low = bot ? bot->GetGUID().GetCounter() : 0;
+    uint32 spread = 40 + (low * 2654435761u >> 16) % 121;  // 40-160 %, fixed per bot
+    copper = copper * spread / 100;
+    if (WovDriveOf(low) == 3)
+        copper = copper * 8 / 5;
+    return std::max<uint64>(copper, 500);
+}
+
 // Percent multiplier on RpgStatusProbWeight (NewRpgBaseAction::RandomChangeStatus).
 uint32 WovRpgWeightPct(Player* bot, int status)
 {
@@ -829,6 +843,7 @@ void WovWar_OnPvpKill(Player* killer, Player* killed)
 // ---- end wov: Call to Arms ----------------------------------------------------------------------------
 
 // ---- wov: initiative -----------------------------------------------------------------------------------
+uint32 WovMarketPriceOf(uint32 entry, TeamId team);  // wov: market (below)
 // Bots act like players who want things: LFG/LFM, WTS/WTB and guild recruitment in the channels real players
 // can see, asking real players nearby to group ("inv?"), inviting them when they answer an LFM, and guild
 // leaders inviting unguilded real players. See wov/HANDOVER.md.
@@ -1030,6 +1045,8 @@ void WovPostTrade(Player* bot)
             Item* it = sellable[urand(0, sellable.size() - 1)];
             ItemTemplate const* p = it->GetTemplate();
             uint32 price = std::max<uint32>(p->SellPrice * urand(3, 6) * std::max<uint32>(1, it->GetCount()), 500);
+            if (uint32 unit = WovMarketPriceOf(p->ItemId, bot->GetTeamId()))  // what it goes for on the AH right now
+                price = std::max<uint32>(unit * std::max<uint32>(1, it->GetCount()) * urand(85, 105) / 100, p->SellPrice + 1);
             text = WovRep(WovRep(WovPick(kWovWts), "{item}", ChatHelper::FormatItem(p, it->GetCount() > 1 ? it->GetCount() : 0)),
                           "{price}", WovPrice(price));
         }
@@ -1684,6 +1701,485 @@ void WovRegear_Tick(time_t now)
 }
 }  // namespace
 // ---- end wov: regear once ------------------------------------------------------------------------------
+// ---- wov: market ---------------------------------------------------------------------------------------
+// Bots use the auction house the way players do. Now and then a bot makes a trip to its faction's auction
+// house (walks when close, else flies), puts surplus loot up (AuctionPosting, in the npc-reach hook), buys one
+// gear upgrade it can afford, then walks to the nearest mailbox and collects what the house mailed it (won items,
+// sale proceeds, expired listings). Every packet goes through the bot's own session, so the core does all checks.
+// Bot gold is brought down once per bot to a Classic-like curve (wov_wealth) and new bots start on that curve.
+#include "AuctionHouseMgr.h"
+#include "ItemUsageValue.h"
+#include "GameTime.h"
+#include <atomic>
+#include "Mail.h"
+namespace
+{
+struct WovAuctioneer
+{
+    uint32 entry = 0, map = 0;
+    float x = 0, y = 0, z = 0;
+    TeamId team = TEAM_NEUTRAL;
+};
+struct WovAhLot
+{
+    uint32 id = 0, entry = 0, count = 0, buyout = 0, ownerLow = 0;
+};
+struct WovTrip
+{
+    int phase = 1;  // 1 to the auctioneer, 2 at the auction house, 3 to the mailbox
+    uint32 entry = 0, map = 0;
+    float x = 0, y = 0, z = 0;
+    time_t start = 0, phaseT = 0;
+    ObjectGuid target;
+};
+struct WovReach
+{
+    uint32 low = 0;
+    int kind = 0;  // 1 auctioneer, 2 mailbox
+    ObjectGuid obj;
+};
+
+std::vector<WovAuctioneer> g_wovAuctioneers;
+std::mutex g_wovAhMutex;
+std::unordered_map<AuctionHouseObject const*, std::vector<WovAhLot>> g_wovAhLots;
+std::unordered_map<uint32, time_t> g_wovAhBought;  // bot -> last purchase (under g_wovAhMutex)
+std::unordered_map<uint32, WovTrip> g_wovTrips;     // world thread only
+std::mutex g_wovReachMutex;
+std::vector<WovReach> g_wovReached;
+std::atomic<bool> g_wovMarketEnable{false};
+std::atomic<uint32> g_wovMarketBudgetPct{35};
+uint32 g_wovMarketTrips = 40;  // expected trips per bot per hour, in hundredths
+bool g_wovWealthEnable = false;
+
+void WovMarketConfig(time_t now)
+{
+    static time_t cfgT = 0;
+    if (now < cfgT + 60)
+        return;
+    cfgT = now;
+    g_wovMarketEnable = sConfigMgr->GetOption<bool>("AiPlayerbot.WoV.Market.Enable", false);
+    g_wovMarketTrips = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.Market.TripsPerHourPct", 40);
+    g_wovMarketBudgetPct = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.Market.BudgetPct", 35);
+    g_wovWealthEnable = sConfigMgr->GetOption<bool>("AiPlayerbot.WoV.Wealth.Enable", false);
+}
+
+void WovAuctioneersLoad()
+{
+    static bool done = false;
+    if (done)
+        return;
+    done = true;
+    QueryResult r = WorldDatabase.Query(
+        "SELECT c.id1, c.map, c.position_x, c.position_y, c.position_z, t.faction FROM creature c JOIN creature_template t "
+        "ON t.entry = c.id1 WHERE (t.npcflag & 2097152) <> 0 AND c.map IN (0, 1)");
+    if (!r)
+        return;
+    AuctionHouseObject* ally = sAuctionMgr->GetAuctionsMapByHouseId(AuctionHouseId::Alliance);
+    AuctionHouseObject* horde = sAuctionMgr->GetAuctionsMapByHouseId(AuctionHouseId::Horde);
+    do
+    {
+        Field* f = r->Fetch();
+        WovAuctioneer a;
+        a.entry = f[0].Get<uint32>();
+        a.map = f[1].Get<uint32>();
+        a.x = f[2].Get<float>();
+        a.y = f[3].Get<float>();
+        a.z = f[4].Get<float>();
+        AuctionHouseObject* house = sAuctionMgr->GetAuctionsMap(f[5].Get<uint32>());
+        a.team = house == ally ? TEAM_ALLIANCE : house == horde ? TEAM_HORDE : TEAM_NEUTRAL;
+        if (a.team != TEAM_NEUTRAL)
+            g_wovAuctioneers.push_back(a);
+    } while (r->NextRow());
+    LOG_INFO("playerbots", "WoV market: {} faction auctioneers", g_wovAuctioneers.size());
+}
+
+void WovAhSnapshot()
+{
+    std::unordered_map<AuctionHouseObject const*, std::vector<WovAhLot>> lots;
+    for (AuctionHouseId id : {AuctionHouseId::Alliance, AuctionHouseId::Horde})
+    {
+        AuctionHouseObject* house = sAuctionMgr->GetAuctionsMapByHouseId(id);
+        if (!house)
+            continue;
+        std::vector<WovAhLot>& v = lots[house];
+        for (auto const& [aid, a] : house->GetAuctions())
+            if (a && a->buyout && a->itemCount == 1)
+                v.push_back({a->Id, a->item_template, a->itemCount, a->buyout, uint32(a->owner.GetCounter())});
+    }
+    std::lock_guard<std::mutex> lock(g_wovAhMutex);
+    g_wovAhLots.swap(lots);
+}
+
+// The bot (map thread, its own AI) is standing at an auctioneer: buy one upgrade it can afford.
+void WovAhBuy(PlayerbotAI* ai, Player* bot, Creature* auctioneer)
+{
+    uint32 low = bot->GetGUID().GetCounter();
+    time_t now = time(nullptr);
+    std::vector<WovAhLot> lots;
+    {
+        std::lock_guard<std::mutex> lock(g_wovAhMutex);
+        auto b = g_wovAhBought.find(low);
+        if (b != g_wovAhBought.end() && now < b->second + 1800)
+            return;
+        auto it = g_wovAhLots.find(sAuctionMgr->GetAuctionsMap(auctioneer->GetFaction()));
+        if (it == g_wovAhLots.end())
+            return;
+        lots = it->second;
+    }
+    uint64 budget = uint64(bot->GetMoney()) * g_wovMarketBudgetPct / 100;
+    std::vector<std::pair<WovAhLot, ItemTemplate const*>> cands;
+    for (WovAhLot const& lot : lots)
+    {
+        if (lot.ownerLow == low || lot.buyout > budget)
+            continue;
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(lot.entry);
+        if (!proto || proto->InventoryType == INVTYPE_NON_EQUIP || proto->RequiredLevel > bot->GetLevel())
+            continue;
+        if (proto->Quality < ITEM_QUALITY_NORMAL || proto->Quality > ITEM_QUALITY_RARE)
+            continue;
+        if (bot->CanUseItem(proto) != EQUIP_ERR_OK)
+            continue;
+        cands.push_back({lot, proto});
+    }
+    if (cands.empty())
+        return;
+    std::shuffle(cands.begin(), cands.end(), std::mt19937(std::random_device{}()));
+    if (cands.size() > 80)
+        cands.resize(80);
+    WovAhLot const* best = nullptr;
+    ItemTemplate const* bestProto = nullptr;
+    for (auto const& [lot, proto] : cands)
+    {
+        ItemUsage usage = ai->GetAiObjectContext()->GetValue<ItemUsage>("item usage", int32(lot.entry))->Get();
+        if (usage != ITEM_USAGE_EQUIP && usage != ITEM_USAGE_REPLACE)
+            continue;
+        if (!best || proto->ItemLevel > bestProto->ItemLevel ||
+            (proto->ItemLevel == bestProto->ItemLevel && lot.buyout < best->buyout))
+        {
+            best = &lot;
+            bestProto = proto;
+        }
+    }
+    if (!best)
+        return;
+    {
+        std::lock_guard<std::mutex> lock(g_wovAhMutex);
+        g_wovAhBought[low] = now;
+    }
+    WorldPacket* p = new WorldPacket(CMSG_AUCTION_PLACE_BID);  // QueuePacket takes ownership
+    *p << auctioneer->GetGUID();
+    *p << best->id;
+    *p << best->buyout;
+    bot->GetSession()->QueuePacket(p);
+    LOG_INFO("playerbots", "WoV market: {} (lvl {}) buys {} for {}c", bot->GetName(), bot->GetLevel(), bestProto->Name1,
+             best->buyout);
+}
+
+// World thread: the bot stands at a mailbox; collect everything the auction house sent.
+void WovTakeMail(Player* bot, ObjectGuid mailbox)
+{
+    time_t now = GameTime::GetGameTime().count();
+    uint32 n = 0;
+    for (Mail* m : bot->GetMails())
+    {
+        if (!m || m->state == MAIL_STATE_DELETED || m->deliver_time > now || m->COD || m->messageType != MAIL_AUCTION)
+            continue;
+        for (MailItemInfo const& it : m->items)
+        {
+            WorldPacket* p = new WorldPacket(CMSG_MAIL_TAKE_ITEM);
+            *p << mailbox << m->messageID << it.item_guid;
+            bot->GetSession()->QueuePacket(p);
+        }
+        if (m->money)
+        {
+            WorldPacket* p = new WorldPacket(CMSG_MAIL_TAKE_MONEY);
+            *p << mailbox << m->messageID;
+            bot->GetSession()->QueuePacket(p);
+        }
+        WorldPacket* d = new WorldPacket(CMSG_MAIL_DELETE);
+        *d << mailbox << m->messageID << uint32(m->mailTemplateId);
+        bot->GetSession()->QueuePacket(d);
+        if (++n >= 20)
+            break;
+    }
+    if (n)
+        LOG_INFO("playerbots", "WoV market: {} empties {} auction mails", bot->GetName(), n);
+}
+
+bool WovAimAt(Player* bot, PlayerbotAI* ai, ObjectGuid target)
+{
+    if (ai->rpgInfo.GetStatus() != RPG_WANDER_NPC)
+        ai->rpgInfo.ChangeToWanderNpc();
+    auto* data = std::get_if<NewRpgInfo::WanderNpc>(&ai->rpgInfo.data);
+    if (!data)
+        return false;
+    if (data->npcOrGo != target)
+    {
+        data->npcOrGo = target;
+        data->lastReach = 0;
+    }
+    return true;
+}
+
+bool WovTripStart(Player* bot, PlayerbotAI* ai, time_t now)
+{
+    WovAuctioneer const* best = nullptr;
+    float bestD = 1.0e9f;
+    for (WovAuctioneer const& a : g_wovAuctioneers)
+    {
+        if (a.team != bot->GetTeamId() || a.map != bot->GetMapId())
+            continue;
+        float d = bot->GetExactDist(a.x, a.y, a.z);
+        if (d < bestD)
+        {
+            bestD = d;
+            best = &a;
+        }
+    }
+    if (!best)
+        return false;
+    WovTrip t;
+    t.entry = best->entry;
+    t.map = best->map;
+    t.x = best->x;
+    t.y = best->y;
+    t.z = best->z;
+    t.start = t.phaseT = now;
+    if (bestD > 600.0f)
+    {
+        TravelMgr::FlightMasterInfo const* fm = sTravelMgr.GetNearestFlightMasterInfo(bot);
+        uint32 to = sObjectMgr->GetNearestTaxiNode(t.x, t.y, t.z, t.map, bot->GetTeamId());
+        if (!fm || !fm->taxiNodeId || !to || fm->taxiNodeId == to)
+            return false;
+        std::vector<uint32> path = sTravelNodeMap.FindTaxiPath(fm->taxiNodeId, to);
+        if (path.empty())
+            return false;
+        ai->rpgInfo.ChangeToTravelFlight(fm->templateEntry, fm->pos, path);
+    }
+    g_wovTrips[bot->GetGUID().GetCounter()] = t;
+    return true;
+}
+
+void WovWealthTick()
+{
+    static std::unordered_set<uint32> done;
+    static bool loaded = false;
+    if (!loaded)
+    {
+        loaded = true;
+        if (QueryResult r = CharacterDatabase.Query("SELECT guid FROM wov_wealth"))
+            do
+                done.insert(r->Fetch()[0].Get<uint32>());
+            while (r->NextRow());
+    }
+    uint32 n = 0;
+    for (auto const& [guid, bot] : sRandomPlayerbotMgr.GetAllBots())
+    {
+        if (n >= 25)
+            break;
+        if (!bot || !bot->IsInWorld())
+            continue;
+        uint32 low = bot->GetGUID().GetCounter();
+        if (done.count(low))
+            continue;
+        done.insert(low);
+        ++n;
+        uint64 target = WovWealthTarget(bot);
+        if (bot->GetMoney() > target * 2)
+            bot->SetMoney(uint32(target * urand(60, 140) / 100));
+        CharacterDatabase.Execute("INSERT IGNORE INTO wov_wealth (guid) VALUES ({})", low);
+    }
+}
+
+void WovMarket_Tick(time_t now)
+{
+    WovMarketConfig(now);
+    static time_t last = 0, lastSnap = 0;
+    if (now < last + 10)
+        return;
+    last = now;
+    if (g_wovWealthEnable)
+        WovWealthTick();
+    if (!g_wovMarketEnable)
+        return;
+    WovAuctioneersLoad();
+    if (now >= lastSnap + 60)
+    {
+        lastSnap = now;
+        WovAhSnapshot();
+    }
+
+    std::vector<WovReach> reached;
+    {
+        std::lock_guard<std::mutex> lock(g_wovReachMutex);
+        reached.swap(g_wovReached);
+    }
+    for (WovReach const& r : reached)
+    {
+        Player* bot = ObjectAccessor::FindPlayerByLowGUID(r.low);
+        auto t = g_wovTrips.find(r.low);
+        if (r.kind == 1 && t != g_wovTrips.end() && t->second.phase == 1)
+        {
+            t->second.phase = 2;
+            t->second.phaseT = now;
+        }
+        else if (r.kind == 2)
+        {
+            if (bot && bot->IsInWorld())
+                WovTakeMail(bot, r.obj);
+            if (t != g_wovTrips.end())
+                g_wovTrips.erase(t);
+        }
+    }
+
+    for (auto it = g_wovTrips.begin(); it != g_wovTrips.end();)
+    {
+        WovTrip& t = it->second;
+        Player* bot = ObjectAccessor::FindPlayerByLowGUID(it->first);
+        PlayerbotAI* ai = bot ? GET_PLAYERBOT_AI(bot) : nullptr;
+        if (!bot || !ai || !bot->IsInWorld() || now > t.start + 1500 || bot->GetGroup() || bot->InBattleground() ||
+            g_wovBotSk.count(it->first))
+        {
+            it = g_wovTrips.erase(it);
+            continue;
+        }
+        if (bot->IsInFlight() || ai->rpgInfo.GetStatus() == RPG_TRAVEL_FLIGHT || !bot->IsAlive() || bot->IsInCombat())
+        {
+            ++it;
+            continue;
+        }
+        if (bot->GetMapId() != t.map)
+        {
+            it = g_wovTrips.erase(it);
+            continue;
+        }
+        if (t.phase == 1)
+        {
+            float d = bot->GetExactDist(t.x, t.y, t.z);
+            if (d > 700.0f)
+            {
+                it = g_wovTrips.erase(it);  // the flight did not bring it here
+                continue;
+            }
+            if (d > 40.0f)
+            {
+                if (ai->rpgInfo.GetStatus() != RPG_GO_CAMP)
+                    ai->rpgInfo.ChangeToGoCamp(WorldPosition(t.map, t.x, t.y, t.z));
+            }
+            else
+            {
+                if (!t.target)
+                    if (Creature* c = bot->FindNearestCreature(t.entry, 60.0f))
+                        t.target = c->GetGUID();
+                if (!t.target || !WovAimAt(bot, ai, t.target))
+                {
+                    it = g_wovTrips.erase(it);
+                    continue;
+                }
+            }
+        }
+        else if (t.phase == 2 && now >= t.phaseT + 8)
+        {
+            GameObject* mb = bot->FindNearestGameObjectOfType(GAMEOBJECT_TYPE_MAILBOX, 150.0f);
+            if (!mb)
+            {
+                it = g_wovTrips.erase(it);
+                continue;
+            }
+            t.phase = 3;
+            t.phaseT = now;
+            t.target = mb->GetGUID();
+            WovAimAt(bot, ai, t.target);
+        }
+        else if (t.phase == 3)
+        {
+            if (!bot->GetMailSize() || now > t.phaseT + 120)
+            {
+                it = g_wovTrips.erase(it);  // nothing to fetch, or could not get there
+                continue;
+            }
+            WovAimAt(bot, ai, t.target);
+        }
+        ++it;
+    }
+
+    // new trips
+    uint32 started = 0;
+    for (auto const& [guid, bot] : sRandomPlayerbotMgr.GetAllBots())
+    {
+        if (started >= 6)
+            break;
+        if (!bot || !bot->IsInWorld() || !bot->IsAlive() || bot->IsInCombat() || bot->IsInFlight() || bot->GetGroup())
+            continue;
+        if (bot->GetLevel() < 10 || !WovOpenWorld(bot) || bot->InBattleground())
+            continue;
+        uint32 low = bot->GetGUID().GetCounter();
+        if (g_wovTrips.count(low) || g_wovBotSk.count(low))
+            continue;
+        PlayerbotAI* ai = GET_PLAYERBOT_AI(bot);
+        if (!ai || ai->rpgInfo.GetStatus() == RPG_TRAVEL_FLIGHT)
+            continue;
+        uint32 rate = g_wovMarketTrips;  // hundredths of a trip per hour; one roll per 10 s = 360 per hour
+        if (WovDriveOf(low) == 3)
+            rate *= 2;
+        if (bot->GetFreeInventorySpace() < 4)
+            rate *= 3;
+        if (urand(0, 35999) >= rate)
+            continue;
+        if (WovTripStart(bot, ai, now))
+            ++started;
+    }
+}
+}  // namespace
+
+// Median buyout of one item in this faction's auction house right now (0 when nobody sells it).
+uint32 WovMarketPriceOf(uint32 entry, TeamId team)
+{
+    AuctionHouseObject const* house =
+        sAuctionMgr->GetAuctionsMapByHouseId(team == TEAM_ALLIANCE ? AuctionHouseId::Alliance : AuctionHouseId::Horde);
+    std::vector<uint32> prices;
+    {
+        std::lock_guard<std::mutex> lock(g_wovAhMutex);
+        auto it = g_wovAhLots.find(house);
+        if (it == g_wovAhLots.end())
+            return 0;
+        for (WovAhLot const& lot : it->second)
+            if (lot.entry == entry)
+                prices.push_back(lot.buyout);
+    }
+    if (prices.empty())
+        return 0;
+    std::nth_element(prices.begin(), prices.begin() + prices.size() / 2, prices.end());
+    return prices[prices.size() / 2];
+}
+
+// Called from NewRpgWanderNpcAction when a random bot reaches an npc or a game object (map thread).
+void WovMarket_OnReach(PlayerbotAI* ai, Player* bot, WorldObject* obj)
+{
+    if (!g_wovMarketEnable || !ai || !bot || !obj || !sRandomPlayerbotMgr.IsRandomBot(bot))
+        return;
+    WovReach r;
+    r.low = bot->GetGUID().GetCounter();
+    r.obj = obj->GetGUID();
+    if (Creature* c = obj->ToCreature())
+    {
+        if (!c->HasNpcFlag(UNIT_NPC_FLAG_AUCTIONEER))
+            return;
+        WovAhBuy(ai, bot, c);
+        r.kind = 1;
+    }
+    else if (GameObject* go = obj->ToGameObject())
+    {
+        if (go->GetGoType() != GAMEOBJECT_TYPE_MAILBOX || !bot->GetMailSize())
+            return;
+        r.kind = 2;
+    }
+    else
+        return;
+    std::lock_guard<std::mutex> lock(g_wovReachMutex);
+    g_wovReached.push_back(r);
+}
+// ---- end wov: market -----------------------------------------------------------------------------------
 #include "PlayerbotFactory.h"
 #include "PlayerbotTextMgr.h"
 #include "Playerbots.h"
@@ -1951,6 +2447,7 @@ void RandomPlayerbotMgr::UpdateAIInternal(uint32 /*elapsed*/, bool /*minimal*/)
     WovInit_Tick(time(nullptr));  // wov: initiative
     WovTogether_Tick(time(nullptr));  // wov: play together
     WovRegear_Tick(time(nullptr));  // wov: regear once
+    WovMarket_Tick(time(nullptr));  // wov: market
 
     /*if (sPlayerbotAIConfig.enablePrototypePerformanceDiff)
     {

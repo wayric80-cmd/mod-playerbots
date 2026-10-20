@@ -7,6 +7,7 @@
 #include "NewRpgAction.h"
 #include "AreaDefines.h"
 #include "AuctionPosting.h"
+void WovMarket_OnReach(PlayerbotAI* ai, Player* bot, WorldObject* obj);  // wov: RandomPlayerbotMgr.cpp
 #include "BroadcastHelper.h"
 #include "ChatHelper.h"
 #include "CompanyStanding.h"
@@ -417,6 +418,7 @@ bool NewRpgWanderNpcAction::Execute(Event /*event*/)
             // local: auctions (custom wow plans/17, §3.E.5)
             if (Creature* creature = object->ToCreature())
                 AuctionPosting::instance().TryPost(botAI, bot, creature);
+            WovMarket_OnReach(botAI, bot, object);  // wov: market
             return true;
         }
 
