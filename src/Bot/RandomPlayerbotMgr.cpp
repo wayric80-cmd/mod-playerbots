@@ -723,6 +723,9 @@ void WovWar_OnPvpKill(Player* killer, Player* killed)
 // can see, asking real players nearby to group ("inv?"), inviting them when they answer an LFM, and guild
 // leaders inviting unguilded real players. See wov/HANDOVER.md.
 #include "GuildMgr.h"
+#include <tuple>
+#include <cstring>
+#include <cctype>
 namespace
 {
 bool g_wovInitEnable = false;
@@ -770,10 +773,12 @@ struct WovLfx
 {
     time_t t = 0;
     bool lfm = false;
+    WovDungeon const* dg = nullptr;
 };
 std::mutex g_wovInitMutex;
 std::unordered_map<uint32, WovLfx> g_wovLfx;
 std::vector<std::pair<uint32, uint32>> g_wovInviteQueue;
+std::vector<std::tuple<uint32, uint32, WovDungeon const*>> g_wovJoinTrack;
 std::unordered_map<uint32, time_t> g_wovNextGroupAsk, g_wovNextGuildAsk;
 
 void WovInitConfig(time_t now)
@@ -868,7 +873,7 @@ void WovPostLfx(Player* bot, Player* real)
     else
         ai->SayToChannel(text, ChatChannelId::GENERAL);
     std::lock_guard<std::mutex> lock(g_wovInitMutex);
-    g_wovLfx[bot->GetGUID().GetCounter()] = {time(nullptr), lfm};
+    g_wovLfx[bot->GetGUID().GetCounter()] = {time(nullptr), lfm, d};
 }
 
 bool WovSellable(ItemTemplate const* p)
@@ -1080,9 +1085,369 @@ void WovInit_OnWhisper(Player* from, Player* to)
     if (it == g_wovLfx.end() || time(nullptr) > it->second.t + 600)
         return;
     g_wovInviteQueue.emplace_back(to->GetGUID().GetCounter(), from->GetGUID().GetCounter());
+    g_wovJoinTrack.emplace_back(to->GetGUID().GetCounter(), from->GetGUID().GetCounter(), it->second.dg);
     g_wovLfx.erase(it);
 }
 // ---- end wov: initiative --------------------------------------------------------------------------------
+
+// ---- wov: play together --------------------------------------------------------------------------------
+// A real player who posts LFM/LFG in a channel gets answers like on a real server: bots of the right level and
+// role whisper "inv, healer" (LFM), or a bot forms a group and invites them (LFG). A bot-led group fills its
+// open slots with bots, then hands the lead to the real player so the bots follow them into the dungeon.
+namespace
+{
+struct WovParty
+{
+    uint32 leaderBot = 0, player = 0;
+    WovDungeon const* dg = nullptr;
+    time_t start = 0, nextInvite = 0;
+    uint32 invited = 0;
+};
+struct WovReply
+{
+    time_t due = 0;
+    uint32 bot = 0, player = 0;
+    std::string text;
+    bool invitePlayer = false;
+    WovDungeon const* dg = nullptr;
+};
+struct WovChatEvt
+{
+    uint32 player = 0;
+    std::string msg;
+};
+std::vector<WovParty> g_wovParties;
+std::vector<WovReply> g_wovReplies;
+std::vector<WovChatEvt> g_wovChatQueue;
+std::unordered_map<uint32, time_t> g_wovLastLfReply;
+std::unordered_map<uint32, uint32> g_wovBusyBot;
+
+char const* const kWovTank[] = {"tank here, inv", "can tank, inv pls", "{lvl} warrior, can tank", "inv, tank", "tank inv?"};
+char const* const kWovHeal[] = {"healer here, inv", "can heal, inv", "{lvl} {cls} heals, inv pls", "inv heals", "heals here"};
+char const* const kWovDps[] = {"inv dps", "{lvl} {cls} dps inv?", "inv pls", "dps here, inv", "can i come? {cls} {lvl}", "inv"};
+char const* const kWovLead[] = {"need {role}? doing {dg}, sent inv", "we need a {role} for {dg}, inv sent", "inv for {dg}?",
+                                "{dg}? sent u an inv"};
+char const* const kWovHand[] = {"u lead pls, havent done {dg} in ages", "ok we're full, u lead", "full, lead the way",
+                                "u lead? i'll follow", "gogo, u lead", "made u lead, lets go"};
+
+int WovRoleOf(Player* p)
+{
+    switch (p->getClass())
+    {
+        case CLASS_WARRIOR: return 0;
+        case CLASS_PRIEST: return 1;
+        case CLASS_DRUID:
+        case CLASS_SHAMAN:
+        case CLASS_PALADIN: return (p->GetGUID().GetCounter() % 2) ? 1 : 2;
+        default: return 2;
+    }
+}
+
+char const* WovClassName(Player* p)
+{
+    switch (p->getClass())
+    {
+        case CLASS_WARRIOR: return "warrior";
+        case CLASS_PALADIN: return "pala";
+        case CLASS_HUNTER: return "hunter";
+        case CLASS_ROGUE: return "rogue";
+        case CLASS_PRIEST: return "priest";
+        case CLASS_SHAMAN: return "shaman";
+        case CLASS_MAGE: return "mage";
+        case CLASS_WARLOCK: return "lock";
+        case CLASS_DRUID: return "druid";
+        default: return "dps";
+    }
+}
+
+WovDungeon const* WovDungeonByName(char const* n)
+{
+    for (WovDungeon const& d : kWovDungeons)
+        if (!strcmp(d.name, n))
+            return &d;
+    return nullptr;
+}
+
+std::vector<std::string> WovTokens(std::string const& m)
+{
+    std::vector<std::string> t;
+    std::string cur;
+    for (char c : m)
+    {
+        if (std::isalnum(static_cast<unsigned char>(c)))
+            cur += char(std::tolower(static_cast<unsigned char>(c)));
+        else if (!cur.empty())
+        {
+            t.push_back(cur);
+            cur.clear();
+        }
+    }
+    if (!cur.empty())
+        t.push_back(cur);
+    return t;
+}
+
+WovDungeon const* WovParseDungeon(std::vector<std::string> const& tok, uint8 level)
+{
+    static std::pair<char const*, char const*> const al[] = {
+        {"rfc", "RFC"}, {"ragefire", "RFC"}, {"deadmines", "deadmines"}, {"vc", "deadmines"}, {"wc", "WC"},
+        {"wailing", "WC"}, {"sfk", "SFK"}, {"shadowfang", "SFK"}, {"bfd", "BFD"}, {"blackfathom", "BFD"},
+        {"stocks", "stockades"}, {"stockade", "stockades"}, {"stockades", "stockades"}, {"gnomer", "gnomer"},
+        {"gnomeregan", "gnomer"}, {"rfk", "RFK"}, {"kraul", "RFK"}, {"gy", "SM GY"}, {"graveyard", "SM GY"},
+        {"lib", "SM lib"}, {"library", "SM lib"}, {"arm", "SM arm"}, {"armory", "SM arm"}, {"cath", "SM cath"},
+        {"cathedral", "SM cath"}, {"rfd", "RFD"}, {"downs", "RFD"}, {"ulda", "uldaman"}, {"uldaman", "uldaman"},
+        {"zf", "ZF"}, {"mara", "mara"}, {"maraudon", "mara"}, {"st", "ST"}, {"sunken", "ST"}, {"brd", "BRD"},
+        {"lbrs", "LBRS"}, {"ubrs", "UBRS"}, {"strat", "strat"}, {"stratholme", "strat"}, {"scholo", "scholo"},
+        {"scholomance", "scholo"}};
+    for (std::string const& w : tok)
+    {
+        if (w == "dm")
+            return WovDungeonByName(level >= 45 ? "DM east" : "deadmines");
+        if (w == "sm")
+            return WovDungeonByName(level < 33 ? "SM GY" : level < 36 ? "SM lib" : level < 40 ? "SM arm" : "SM cath");
+        for (auto const& [k, v] : al)
+            if (w == k)
+                return WovDungeonByName(v);
+    }
+    return nullptr;
+}
+
+int WovIntent(std::vector<std::string> const& tok)
+{
+    for (size_t i = 0; i < tok.size(); ++i)
+    {
+        std::string const& w = tok[i];
+        if (w == "lfm" || (w.size() == 4 && w[0] == 'l' && w[1] == 'f' && std::isdigit(static_cast<unsigned char>(w[2])) && w[3] == 'm'))
+            return 1;
+        if (w == "lfg" || (w == "lf" && i + 1 < tok.size() && (tok[i + 1] == "group" || tok[i + 1] == "grp")))
+            return 2;
+    }
+    return 0;
+}
+
+bool WovFreeBot(Player* bot, TeamId team, time_t now)
+{
+    if (!bot || !bot->IsInWorld() || !bot->IsAlive() || bot->GetTeamId() != team || bot->GetGroup() || bot->InBattleground())
+        return false;
+    if (g_wovBotSk.count(bot->GetGUID().GetCounter()))
+        return false;
+    auto it = g_wovBusyBot.find(bot->GetGUID().GetCounter());
+    return it == g_wovBusyBot.end() || now >= time_t(it->second);
+}
+
+bool WovLevelFits(Player* bot, WovDungeon const* dg, uint8 around)
+{
+    uint8 l = bot->GetLevel();
+    return l + 1 >= dg->minL && l <= dg->maxL + 2 && std::abs(int(l) - int(around)) <= 6;
+}
+
+std::string WovRoleLine(Player* bot)
+{
+    int r = WovRoleOf(bot);
+    std::string t = r == 0 ? WovPick(kWovTank) : r == 1 ? WovPick(kWovHeal) : WovPick(kWovDps);
+    t = WovRep(t, "{lvl}", std::to_string(bot->GetLevel()));
+    return WovRep(t, "{cls}", WovClassName(bot));
+}
+
+void WovHandleChat(WovChatEvt const& e, time_t now)
+{
+    Player* p = ObjectAccessor::FindPlayerByLowGUID(e.player);
+    if (!p || !p->IsInWorld() || sRandomPlayerbotMgr.IsRandomBot(p))
+        return;
+    std::vector<std::string> tok = WovTokens(e.msg);
+    int intent = WovIntent(tok);
+    if (!intent)
+        return;
+    time_t& last = g_wovLastLfReply[e.player];
+    if (now < last + 90)
+        return;
+    last = now;
+    WovDungeon const* dg = WovParseDungeon(tok, p->GetLevel());
+    if (!dg)
+        dg = WovDungeonFor(p);
+    if (!dg)
+        return;
+    bool wantRole[3] = {false, false, false};
+    for (std::string const& w : tok)
+    {
+        if (w == "tank")
+            wantRole[0] = true;
+        if (w == "heal" || w == "heals" || w == "healer" || w == "healz")
+            wantRole[1] = true;
+        if (w == "dps" || w == "dd")
+            wantRole[2] = true;
+    }
+    bool anyRole = !wantRole[0] && !wantRole[1] && !wantRole[2];
+
+    std::vector<Player*> cands;
+    for (auto const& [guid, bot] : sRandomPlayerbotMgr.GetAllBots())
+        if (WovFreeBot(bot, p->GetTeamId(), now) && WovLevelFits(bot, dg, p->GetLevel()))
+            cands.push_back(bot);
+    std::shuffle(cands.begin(), cands.end(), std::mt19937(std::random_device{}()));
+
+    if (intent == 1)
+    {
+        uint32 freeSlots = p->GetGroup() ? (p->GetGroup()->IsFull() ? 0 : 5 - p->GetGroup()->GetMembersCount()) : 4;
+        uint32 want = std::min<uint32>(freeSlots + 1, 4);
+        uint32 sent = 0;
+        for (Player* bot : cands)
+        {
+            if (sent >= want)
+                break;
+            if (!anyRole && !wantRole[WovRoleOf(bot)])
+                continue;
+            g_wovReplies.push_back({now + time_t(urand(3, 25)), bot->GetGUID().GetCounter(), e.player, WovRoleLine(bot), false, dg});
+            g_wovBusyBot[bot->GetGUID().GetCounter()] = uint32(now + 300);
+            ++sent;
+        }
+        LOG_INFO("playerbots", "WoV together: {} LFM {} -> {} answers", p->GetName(), dg->name, sent);
+    }
+    else if (!p->GetGroup())
+    {
+        for (Player* bot : cands)
+        {
+            std::string t = WovRep(WovRep(WovPick(kWovLead), "{dg}", dg->name), "{role}",
+                                   WovRoleOf(p) == 0 ? "tank" : WovRoleOf(p) == 1 ? "healer" : "dps");
+            g_wovReplies.push_back({now + time_t(urand(4, 15)), bot->GetGUID().GetCounter(), e.player, t, true, dg});
+            g_wovBusyBot[bot->GetGUID().GetCounter()] = uint32(now + 600);
+            LOG_INFO("playerbots", "WoV together: {} LFG {} -> {} forms a group", p->GetName(), dg->name, bot->GetName());
+            break;
+        }
+    }
+}
+
+void WovInviteFrom(Player* inviter, Player* who)
+{
+    WorldPacket pk;
+    pk << who->GetName();
+    pk << uint32(0);
+    inviter->GetSession()->HandleGroupInviteOpcode(pk);
+}
+
+void WovTrackParty(uint32 botLow, uint32 playerLow, WovDungeon const* dg, time_t now)
+{
+    for (WovParty const& p : g_wovParties)
+        if (p.leaderBot == botLow)
+            return;
+    g_wovParties.push_back({botLow, playerLow, dg, now, now + 5, 0});
+}
+
+void WovTogether_Tick(time_t now)
+{
+    if (!g_wovInitEnable)
+        return;
+    std::vector<WovChatEvt> evts;
+    {
+        std::lock_guard<std::mutex> lock(g_wovInitMutex);
+        evts.swap(g_wovChatQueue);
+    }
+    for (WovChatEvt const& e : evts)
+        WovHandleChat(e, now);
+
+    std::vector<std::tuple<uint32, uint32, WovDungeon const*>> joins;
+    {
+        std::lock_guard<std::mutex> lock(g_wovInitMutex);
+        joins.swap(g_wovJoinTrack);
+    }
+    for (auto const& [b, pl, d] : joins)
+        WovTrackParty(b, pl, d, now);
+
+    for (size_t i = 0; i < g_wovReplies.size();)
+    {
+        WovReply r = g_wovReplies[i];
+        if (now < r.due)
+        {
+            ++i;
+            continue;
+        }
+        g_wovReplies.erase(g_wovReplies.begin() + i);
+        Player* bot = ObjectAccessor::FindPlayerByLowGUID(r.bot);
+        Player* p = ObjectAccessor::FindPlayerByLowGUID(r.player);
+        if (!bot || !p || bot->GetGroup())
+            continue;
+        bot->Whisper(r.text, LANG_UNIVERSAL, p);
+        if (r.invitePlayer && !p->GetGroup())
+        {
+            WovInviteFrom(bot, p);
+            WovTrackParty(r.bot, r.player, r.dg, now);
+        }
+    }
+
+    for (size_t i = 0; i < g_wovParties.size();)
+    {
+        WovParty& w = g_wovParties[i];
+        Player* leader = ObjectAccessor::FindPlayerByLowGUID(w.leaderBot);
+        Player* p = ObjectAccessor::FindPlayerByLowGUID(w.player);
+        Group* g = leader ? leader->GetGroup() : nullptr;
+        bool joined = g && p && g->IsMember(p->GetGUID());
+        if (!leader || !p || (!joined && now > w.start + 120) || (g && !g->IsLeader(leader->GetGUID())))
+        {
+            g_wovParties.erase(g_wovParties.begin() + i);
+            continue;
+        }
+        if (!joined)
+        {
+            ++i;
+            continue;
+        }
+        uint32 members = g->GetMembersCount();
+        if (members < 5 && w.invited < 6 && now >= w.nextInvite && now <= w.start + 150)
+        {
+            bool have[3] = {false, false, false};
+            for (GroupReference* ref = g->GetFirstMember(); ref; ref = ref->next())
+                if (Player* m = ref->GetSource())
+                    have[WovRoleOf(m)] = true;
+            int need = !have[0] ? 0 : !have[1] ? 1 : 2;
+            if (w.dg)
+                for (auto const& [guid, bot] : sRandomPlayerbotMgr.GetAllBots())
+                {
+                    if (!WovFreeBot(bot, p->GetTeamId(), now) || !WovLevelFits(bot, w.dg, p->GetLevel()) || WovRoleOf(bot) != need)
+                        continue;
+                    WovInviteFrom(leader, bot);
+                    g_wovBusyBot[bot->GetGUID().GetCounter()] = uint32(now + 600);
+                    break;
+                }
+            ++w.invited;
+            w.nextInvite = now + urand(5, 12);
+            ++i;
+            continue;
+        }
+        if (members >= 5 || now > w.start + 150)
+        {
+            g->ChangeLeader(p->GetGUID());
+            for (GroupReference* ref = g->GetFirstMember(); ref; ref = ref->next())
+            {
+                Player* m = ref->GetSource();
+                PlayerbotAI* ai = m ? GET_PLAYERBOT_AI(m) : nullptr;
+                if (!ai)
+                    continue;
+                ai->SetMaster(p);
+                ai->ResetStrategies();
+                ai->ChangeStrategy("+follow,-lfg,-bg", BOT_STATE_NON_COMBAT);
+                ai->Reset();
+                if (m->GetMapId() != p->GetMapId() || m->GetExactDist(p) > 250.0f)
+                    m->TeleportTo(p->GetMapId(), p->GetPositionX() + frand(-3.0f, 3.0f), p->GetPositionY() + frand(-3.0f, 3.0f),
+                                  p->GetPositionZ(), p->GetOrientation());
+            }
+            if (PlayerbotAI* lai = GET_PLAYERBOT_AI(leader))
+                lai->SayToParty(WovRep(WovPick(kWovHand), "{dg}", w.dg ? w.dg->name : "this"));
+            LOG_INFO("playerbots", "WoV together: group of {} handed to {} for {}", members, p->GetName(), w.dg ? w.dg->name : "?");
+            g_wovParties.erase(g_wovParties.begin() + i);
+            continue;
+        }
+        ++i;
+    }
+}
+}  // namespace
+
+void WovTogether_OnChannel(Player* player, std::string const& msg)
+{
+    if (!g_wovInitEnable || !player || msg.size() > 255 || sRandomPlayerbotMgr.IsRandomBot(player))
+        return;
+    std::lock_guard<std::mutex> lock(g_wovInitMutex);
+    g_wovChatQueue.push_back({player->GetGUID().GetCounter(), msg});
+}
+// ---- end wov: play together ----------------------------------------------------------------------------
 #include "PlayerbotFactory.h"
 #include "PlayerbotTextMgr.h"
 #include "Playerbots.h"
@@ -1348,6 +1713,7 @@ void RandomPlayerbotMgr::UpdateAIInternal(uint32 /*elapsed*/, bool /*minimal*/)
     CompanyStanding::instance().Update();  // local: company standing (custom wow plans/14, step C)
     WovWar_Tick(time(nullptr));  // wov: Call to Arms
     WovInit_Tick(time(nullptr));  // wov: initiative
+    WovTogether_Tick(time(nullptr));  // wov: play together
 
     /*if (sPlayerbotAIConfig.enablePrototypePerformanceDiff)
     {

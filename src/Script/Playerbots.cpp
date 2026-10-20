@@ -136,6 +136,7 @@ public:
 };
 
 void WovInit_OnWhisper(Player* from, Player* to);  // wov (RandomPlayerbotMgr.cpp)
+void WovTogether_OnChannel(Player* player, std::string const& msg);  // wov
 
 class PlayerbotsPlayerScript : public PlayerScript
 {
@@ -441,6 +442,8 @@ public:
             playerbotMgr->HandleCommand(type, msg);
 
         sRandomPlayerbotMgr.HandleCommand(type, msg, player);
+
+        WovTogether_OnChannel(player, msg);  // wov: LFM/LFG from real players
 
         return true;
     }
