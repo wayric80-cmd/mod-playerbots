@@ -1080,8 +1080,13 @@ bool NewRpgBaseAction::SelectRandomFlightTaxiNode(uint32& flightMasterEntry, Wor
     return true;
 }
 
+uint32 WovRpgWeightPct(Player* bot, int status);  // wov (RandomPlayerbotMgr.cpp)
+
 bool NewRpgBaseAction::RandomChangeStatus(std::vector<NewRpgStatus> candidateStatus)
 {
+    // wov: the player's drive (pvp, dungeon, gold, level, social, explore) weights what the bot does next
+    auto wovW = [&](NewRpgStatus st) -> uint32
+    { return sPlayerbotAIConfig.RpgStatusProbWeight[st] * WovRpgWeightPct(bot, int(st)) / 100; };
     std::vector<NewRpgStatus> availableStatus;
     uint32 probSum = 0;
     for (NewRpgStatus status : candidateStatus)
@@ -1092,7 +1097,7 @@ bool NewRpgBaseAction::RandomChangeStatus(std::vector<NewRpgStatus> candidateSta
         if (CheckRpgStatusAvailable(status))
         {
             availableStatus.push_back(status);
-            probSum += sPlayerbotAIConfig.RpgStatusProbWeight[status];
+            probSum += wovW(status);
         }
     }
     // Safety check. Default to "rest" if all RPG weights = 0
@@ -1107,7 +1112,7 @@ bool NewRpgBaseAction::RandomChangeStatus(std::vector<NewRpgStatus> candidateSta
     NewRpgStatus chosenStatus = RPG_STATUS_END;
     for (NewRpgStatus status : availableStatus)
     {
-        accumulate += sPlayerbotAIConfig.RpgStatusProbWeight[status];
+        accumulate += wovW(status);
         if (accumulate >= rand)
         {
             chosenStatus = status;

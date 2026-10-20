@@ -38,7 +38,7 @@
 #include <unordered_map>
 namespace
 {
-struct WovSched { uint8 kind; uint8 startHour; uint16 mins; };
+struct WovSched { uint8 kind; uint8 startHour; uint16 mins; uint8 drive; };
 std::unordered_map<uint32, WovSched> g_wovSched;
 time_t g_wovSchedLoaded = 0;
 bool   g_wovSchedEnable = false;
@@ -104,15 +104,17 @@ void WovLoadSchedules()
     if (!g_wovSchedEnable)
         return;
     QueryResult r = CharacterDatabase.Query(
-        "SELECT guid, play_days, play_start_hour, session_minutes FROM wov_player");
+        "SELECT guid, play_days, play_start_hour, session_minutes, drive FROM wov_player");
     g_wovSched.clear();
     if (r)
     {
         do
         {
             Field* f = r->Fetch();
+            std::string const d = f[4].Get<std::string>();
+            uint8 drive = d == "pvp" ? 1 : d == "dungeon" ? 2 : d == "gold" ? 3 : d == "level" ? 4 : d == "social" ? 5 : d == "explore" ? 6 : 0;
             g_wovSched[f[0].Get<uint32>()] = {WovKind(f[1].Get<std::string>()), f[2].Get<uint8>(),
-                                              f[3].Get<uint16>()};
+                                              f[3].Get<uint16>(), drive};
         } while (r->NextRow());
     }
     LOG_INFO("playerbots", "WoV schedules: {} players loaded, session {}%, min online {}", g_wovSched.size(),
@@ -163,6 +165,31 @@ bool WovLogoutBudget()
 }
 }  // namespace
 // ---- end wov ---------------------------------------------------------------------------------------
+
+// wov: what the player behind a bot wants to do (wov_player.drive, set by wov/drives.py)
+// 1 pvp, 2 dungeon, 3 gold, 4 level, 5 social, 6 explore, 0 unknown
+uint8 WovDriveOf(uint32 guidLow)
+{
+    auto it = g_wovSched.find(guidLow);
+    return it == g_wovSched.end() ? 0 : it->second.drive;
+}
+
+// Percent multiplier on RpgStatusProbWeight (NewRpgBaseAction::RandomChangeStatus).
+uint32 WovRpgWeightPct(Player* bot, int status)
+{
+    if (!g_wovSchedEnable || !bot)
+        return 100;
+    switch (WovDriveOf(bot->GetGUID().GetCounter()))
+    {
+        case 1: return status == RPG_OUTDOOR_PVP ? 300 : status == RPG_TRAVEL_FLIGHT ? 150 : 100;
+        case 2: return status == RPG_DO_QUEST ? 120 : status == RPG_GO_CAMP ? 150 : 100;
+        case 3: return status == RPG_GO_GRIND ? 300 : status == RPG_WANDER_NPC ? 150 : status == RPG_DO_QUEST ? 70 : 100;
+        case 4: return status == RPG_DO_QUEST ? 160 : (status == RPG_REST || status == RPG_WANDER_NPC) ? 60 : 100;
+        case 5: return (status == RPG_WANDER_NPC || status == RPG_GO_CAMP) ? 220 : status == RPG_REST ? 200 : status == RPG_DO_QUEST ? 70 : 100;
+        case 6: return status == RPG_TRAVEL_FLIGHT ? 350 : status == RPG_WANDER_RANDOM ? 200 : 100;
+        default: return 100;
+    }
+}
 
 // ---- wov: Call to Arms (world PvP) -------------------------------------------------------------------
 // A PvP kill in the open world can grow into a skirmish: the side that is losing people calls for help in
@@ -404,7 +431,17 @@ uint32 WovRecruit(WovSkirmish& s, TeamId team, uint32 want)
     {
         if (got >= want)
             break;
-        if (urand(0, 99) >= g_wovWarAccept)
+        uint32 accept = g_wovWarAccept;
+        switch (WovDriveOf(bot->GetGUID().GetCounter()))
+        {
+            case 1: accept = std::min<uint32>(95, accept * 9 / 5); break;
+            case 5:
+            case 6: accept = accept * 3 / 5; break;
+            case 2:
+            case 4: accept = accept * 4 / 5; break;
+            default: break;
+        }
+        if (urand(0, 99) >= accept)
             continue;
         uint32 low = bot->GetGUID().GetCounter();
         g_wovBotSk[low] = s.id;
@@ -840,7 +877,7 @@ WovDungeon const* WovDungeonFor(Player* bot)
     return fit.empty() ? nullptr : fit[urand(0, fit.size() - 1)];
 }
 
-Player* WovPickPoster(Player* real, bool needCapital)
+Player* WovPickPoster(Player* real, bool needCapital, uint8 preferDrive = 0)
 {
     std::vector<Player*> c;
     for (auto const& [guid, bot] : sRandomPlayerbotMgr.GetAllBots())
@@ -852,6 +889,9 @@ Player* WovPickPoster(Player* real, bool needCapital)
         if (g_wovBotSk.count(bot->GetGUID().GetCounter()))
             continue;
         c.push_back(bot);
+        if (preferDrive && WovDriveOf(bot->GetGUID().GetCounter()) == preferDrive)
+            for (int k = 0; k < 3; ++k)
+                c.push_back(bot);
     }
     return c.empty() ? nullptr : c[urand(0, c.size() - 1)];
 }
@@ -1032,14 +1072,14 @@ void WovInit_Tick(time_t now)
         if (now >= nextLfg[t])
         {
             nextLfg[t] = now + urand(g_wovInitLfgSec / 2, g_wovInitLfgSec * 3 / 2);
-            if (Player* bot = WovPickPoster(real, false))
+            if (Player* bot = WovPickPoster(real, false, 2))
                 WovPostLfx(bot, real);
         }
         if (now >= nextTrade[t])
         {
             nextTrade[t] = now + urand(g_wovInitTradeSec / 2, g_wovInitTradeSec * 3 / 2);
             if (WovInCapital(real))
-                if (Player* bot = WovPickPoster(real, true))
+                if (Player* bot = WovPickPoster(real, true, 3))
                     WovPostTrade(bot);
         }
         if (now >= nextRecruit[t])
