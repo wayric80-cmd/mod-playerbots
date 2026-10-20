@@ -255,6 +255,7 @@ struct WovSkirmish
     std::set<uint32> arrived;    // members that reached the fight
     uint32 kills[2] = {0, 0};    // kills made by each side
     uint32 arriveSaid[2] = {0, 0};
+    std::map<uint32, time_t> joined;  // when a recruit was sent
 };
 
 std::mutex g_wovWarMutex;
@@ -383,7 +384,20 @@ void WovSend(Player* bot, WovSkirmish const& s)
                 return;
             }
         }
+        if (fm->taxiNodeId && fm->taxiNodeId == to)
+        {
+            ai->rpgInfo.ChangeToGoGrind(dest);  // our own flight master is the closest one: just ride there
+            return;
+        }
     }
+    // no usable flight path: put the bot at its faction's flight master next to the fight, as if it had flown in
+    uint32 to2 = sObjectMgr->GetNearestTaxiNode(s.x, s.y, s.z, s.map, bot->GetTeamId());
+    if (TaxiNodesEntry const* n = to2 ? sTaxiNodesStore.LookupEntry(to2) : nullptr)
+        if (n->map_id == s.map && bot->GetMapId() == s.map && bot->GetExactDist(n->x, n->y, n->z) > 450.0f)
+        {
+            LOG_INFO("playerbots", "WoV war #{}: {} has no flight path, placed at flight master", s.id, bot->GetName());
+            bot->TeleportTo(n->map_id, n->x, n->y, n->z, bot->GetOrientation());
+        }
     if (bot->GetMapId() == s.map)
         ai->rpgInfo.ChangeToGoGrind(dest);
 }
@@ -426,7 +440,7 @@ uint32 WovRecruit(WovSkirmish& s, TeamId team, uint32 want)
             continue;
         if (bot->GetLevel() < s.minL || bot->GetLevel() > s.maxL)
             continue;
-        if (g_wovBotSk.count(bot->GetGUID().GetCounter()))
+        if (g_wovBotSk.count(bot->GetGUID().GetCounter()) || bot->GetMapId() != s.map)
             continue;
         cands.push_back(bot);
     }
@@ -452,6 +466,7 @@ uint32 WovRecruit(WovSkirmish& s, TeamId team, uint32 want)
         uint32 low = bot->GetGUID().GetCounter();
         g_wovBotSk[low] = s.id;
         s.members[team].insert(low);
+        s.joined[low] = time(nullptr);
         WovSend(bot, s);
         ++got;
         if (!firstRecruit)
@@ -680,6 +695,14 @@ void WovWar_Tick(time_t now)
                     continue;
                 }
                 float d = WovDist(p, s);
+                auto jn = s.joined.find(*it);
+                if (!s.arrived.count(*it) && d > 450.0f && jn != s.joined.end() && now > jn->second + 480)
+                {
+                    g_wovBotSk.erase(*it);  // never made it: free the slot for someone closer
+                    s.joined.erase(jn);
+                    it = s.members[t].erase(it);
+                    continue;
+                }
                 if (p->IsAlive() && d < 160.0f)
                     ++nearCount[t];
                 if (p->IsAlive() && d < 120.0f && !s.arrived.count(*it))
@@ -731,6 +754,8 @@ void WovWar_Tick(time_t now)
         if (now >= s.lastWave + 60)
         {
             s.lastWave = now;
+            LOG_INFO("playerbots", "WoV war #{} {}: alliance {} ({} here), horde {} ({} here), kills {}-{}", s.id, s.place,
+                     s.members[0].size(), nearCount[0], s.members[1].size(), nearCount[1], s.kills[0], s.kills[1]);
             for (int t = 0; t < 2; ++t)
             {
                 TeamId team = TeamId(t);
