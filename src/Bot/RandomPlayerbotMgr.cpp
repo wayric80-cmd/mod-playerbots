@@ -717,6 +717,372 @@ void WovWar_OnPvpKill(Player* killer, Player* killed)
     g_wovKillQueue.push_back(std::move(k));
 }
 // ---- end wov: Call to Arms ----------------------------------------------------------------------------
+
+// ---- wov: initiative -----------------------------------------------------------------------------------
+// Bots act like players who want things: LFG/LFM, WTS/WTB and guild recruitment in the channels real players
+// can see, asking real players nearby to group ("inv?"), inviting them when they answer an LFM, and guild
+// leaders inviting unguilded real players. See wov/HANDOVER.md.
+#include "GuildMgr.h"
+namespace
+{
+bool g_wovInitEnable = false;
+uint32 g_wovInitLfgSec = 150, g_wovInitTradeSec = 140, g_wovInitRecruitSec = 600, g_wovInitGroupMin = 12,
+       g_wovInitGuildMin = 60;
+time_t g_wovInitCfgT = 0;
+
+struct WovDungeon
+{
+    char const* name;
+    uint8 minL, maxL;
+    int team;  // -1 both, 0 alliance, 1 horde
+};
+WovDungeon const kWovDungeons[] = {
+    {"RFC", 13, 18, 1},      {"deadmines", 17, 26, 0}, {"WC", 17, 25, -1},     {"SFK", 22, 30, -1},
+    {"BFD", 24, 32, -1},     {"stockades", 24, 32, 0}, {"gnomer", 29, 38, -1}, {"RFK", 29, 38, -1},
+    {"SM GY", 28, 37, -1},   {"SM lib", 30, 39, -1},   {"SM arm", 32, 42, -1}, {"SM cath", 35, 45, -1},
+    {"RFD", 37, 46, -1},     {"uldaman", 41, 51, -1},  {"ZF", 44, 54, -1},     {"mara", 46, 55, -1},
+    {"ST", 50, 56, -1},      {"BRD", 52, 60, -1},      {"LBRS", 55, 60, -1},   {"DM east", 55, 60, -1},
+    {"strat", 58, 60, -1},   {"scholo", 58, 60, -1},   {"UBRS", 58, 60, -1}};
+
+char const* const kWovLfg[] = {"LFG {dg}", "lfg {dg}", "{role} LFG {dg}", "lfg {dg} {role}", "LFG {dg} as {role}",
+                               "{role} lf {dg} grp", "anyone doing {dg}? {role} here", "lfg {dg} pst"};
+char const* const kWovLfm[] = {"LF{n}M {dg} need {need}", "LFM {dg} need {need}", "{dg} LF{n}M", "LF1M {dg} {need} pst",
+                               "LF{n}M {dg}, {need} then go", "need {need} for {dg}, pst", "LF{n}M {dg} pst"};
+char const* const kWovNeed[] = {"tank", "heals", "dps", "tank and heals", "healer", "1 dps", "a tank"};
+char const* const kWovWts[] = {"WTS {item} {price}", "WTS {item} pst", "selling {item} {price}", "WTS {item}, {price} obo",
+                               "{item} for sale, pst", "WTS {item} cheap, pst"};
+char const* const kWovWtb[] = {"WTB {item} pst", "WTB {item} x{n}", "buying {item}, pst", "WTB {item}, paying well",
+                               "anyone selling {item}? pst"};
+char const* const kWovRecruit[] = {"<{guild}> recruiting all lvls, pst for inv", "{guild} is recruiting, chill ppl, all classes",
+                                   "{guild} lf members for dungeons and pvp, /w me", "looking for a guild? {guild} is recruiting, whisper me",
+                                   "<{guild}> is recruiting! lvl 10+ pst"};
+char const* const kWovAskGroup[] = {"wanna group? doing the same quests", "hey u wanna duo for a bit?", "group up? inv me",
+                                    "inv? we're on the same quests lol", "want to team up? inv me", "yo wanna group"};
+char const* const kWovAskGuild[] = {"hey, want a guild? we're chill, sent u an inv", "u need a guild? {guild} is recruiting, sent inv",
+                                    "yo, sent u a guild inv, we run dungeons and stuff", "want to join {guild}? invited u"};
+char const* const kWovInvOk[] = {"inv sent", "sent", "invited", "inv'd", "sure, sent"};
+
+uint32 const kWovWtbItems[][2] = {{2589, 1}, {2592, 15}, {4306, 25}, {4338, 35}, {14047, 48},
+                                  {2840, 1}, {3576, 12}, {3575, 25}, {3860, 35}, {12359, 48},
+                                  {858, 10}, {929, 20}, {1710, 30}, {3928, 40}, {13446, 50}};
+
+struct WovLfx
+{
+    time_t t = 0;
+    bool lfm = false;
+};
+std::mutex g_wovInitMutex;
+std::unordered_map<uint32, WovLfx> g_wovLfx;
+std::vector<std::pair<uint32, uint32>> g_wovInviteQueue;
+std::unordered_map<uint32, time_t> g_wovNextGroupAsk, g_wovNextGuildAsk;
+
+void WovInitConfig(time_t now)
+{
+    if (g_wovInitCfgT && now < g_wovInitCfgT + 60)
+        return;
+    g_wovInitCfgT = now;
+    g_wovInitEnable = sConfigMgr->GetOption<bool>("AiPlayerbot.WoV.Init.Enable", false);
+    g_wovInitLfgSec = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.Init.LfgSeconds", 150);
+    g_wovInitTradeSec = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.Init.TradeSeconds", 140);
+    g_wovInitRecruitSec = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.Init.RecruitSeconds", 600);
+    g_wovInitGroupMin = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.Init.GroupAskMinutes", 12);
+    g_wovInitGuildMin = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.Init.GuildAskMinutes", 60);
+}
+
+bool WovInCapital(Player* p)
+{
+    AreaTableEntry const* zone = sAreaTableStore.LookupEntry(p->GetZoneId());
+    return zone && (zone->flags & AREA_FLAG_CAPITAL);
+}
+
+std::string WovRep(std::string s, std::string const& k, std::string const& v)
+{
+    for (size_t p = s.find(k); p != std::string::npos; p = s.find(k, p + v.size()))
+        s.replace(p, k.size(), v);
+    return s;
+}
+
+std::string WovRole(Player* bot)
+{
+    switch (bot->getClass())
+    {
+        case CLASS_WARRIOR: return urand(0, 1) ? "tank" : "dps";
+        case CLASS_PRIEST: return urand(0, 3) ? "healer" : "heals";
+        case CLASS_DRUID:
+        case CLASS_SHAMAN:
+        case CLASS_PALADIN: return urand(0, 1) ? "healer" : "dps";
+        default: return "dps";
+    }
+}
+
+std::string WovPrice(uint32 copper)
+{
+    uint32 g = copper / 10000, s = (copper % 10000) / 100;
+    if (g && s >= 10)
+        return std::to_string(g) + "g " + std::to_string(s) + "s";
+    if (g)
+        return std::to_string(g) + "g";
+    return std::to_string(std::max<uint32>(s, 1)) + "s";
+}
+
+WovDungeon const* WovDungeonFor(Player* bot)
+{
+    std::vector<WovDungeon const*> fit;
+    int team = bot->GetTeamId() == TEAM_ALLIANCE ? 0 : 1;
+    for (WovDungeon const& d : kWovDungeons)
+        if (bot->GetLevel() >= d.minL && bot->GetLevel() <= d.maxL && (d.team < 0 || d.team == team))
+            fit.push_back(&d);
+    return fit.empty() ? nullptr : fit[urand(0, fit.size() - 1)];
+}
+
+Player* WovPickPoster(Player* real, bool needCapital)
+{
+    std::vector<Player*> c;
+    for (auto const& [guid, bot] : sRandomPlayerbotMgr.GetAllBots())
+    {
+        if (!bot || !bot->IsInWorld() || bot->GetTeamId() != real->GetTeamId() || bot->GetZoneId() != real->GetZoneId())
+            continue;
+        if (needCapital && !WovInCapital(bot))
+            continue;
+        if (g_wovBotSk.count(bot->GetGUID().GetCounter()))
+            continue;
+        c.push_back(bot);
+    }
+    return c.empty() ? nullptr : c[urand(0, c.size() - 1)];
+}
+
+void WovPostLfx(Player* bot, Player* real)
+{
+    PlayerbotAI* ai = GET_PLAYERBOT_AI(bot);
+    WovDungeon const* d = WovDungeonFor(bot);
+    if (!ai || !d || bot->GetGroup())
+        return;
+    bool lfm = urand(0, 99) < 45;
+    std::string text = lfm ? WovPick(kWovLfm) : WovPick(kWovLfg);
+    text = WovRep(text, "{dg}", d->name);
+    text = WovRep(text, "{role}", WovRole(bot));
+    text = WovRep(text, "{need}", WovPick(kWovNeed));
+    text = WovRep(text, "{n}", std::to_string(urand(1, 3)));
+    if (WovInCapital(real))
+        ai->SayToChannel(text, urand(0, 1) ? ChatChannelId::LOOKING_FOR_GROUP : ChatChannelId::TRADE);
+    else
+        ai->SayToChannel(text, ChatChannelId::GENERAL);
+    std::lock_guard<std::mutex> lock(g_wovInitMutex);
+    g_wovLfx[bot->GetGUID().GetCounter()] = {time(nullptr), lfm};
+}
+
+bool WovSellable(ItemTemplate const* p)
+{
+    return p && p->Bonding != BIND_WHEN_PICKED_UP && p->Bonding != BIND_QUEST_ITEM && p->SellPrice > 0 &&
+           (p->Quality >= ITEM_QUALITY_UNCOMMON || p->Class == ITEM_CLASS_TRADE_GOODS);
+}
+
+void WovPostTrade(Player* bot)
+{
+    PlayerbotAI* ai = GET_PLAYERBOT_AI(bot);
+    if (!ai)
+        return;
+    std::string text;
+    if (urand(0, 99) < 55)
+    {
+        std::vector<Item*> sellable;
+        for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
+            if (Bag* b = bot->GetBagByPos(bag))
+                for (uint32 slot = 0; slot < b->GetBagSize(); ++slot)
+                    if (Item* it = b->GetItemByPos(slot))
+                        if (WovSellable(it->GetTemplate()))
+                            sellable.push_back(it);
+        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+            if (Item* it = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                if (WovSellable(it->GetTemplate()))
+                    sellable.push_back(it);
+        if (!sellable.empty())
+        {
+            Item* it = sellable[urand(0, sellable.size() - 1)];
+            ItemTemplate const* p = it->GetTemplate();
+            uint32 price = std::max<uint32>(p->SellPrice * urand(3, 6) * std::max<uint32>(1, it->GetCount()), 500);
+            text = WovRep(WovRep(WovPick(kWovWts), "{item}", ChatHelper::FormatItem(p, it->GetCount() > 1 ? it->GetCount() : 0)),
+                          "{price}", WovPrice(price));
+        }
+    }
+    if (text.empty())
+    {
+        std::vector<uint32> wants;
+        for (auto const& w : kWovWtbItems)
+            if (bot->GetLevel() >= w[1] && bot->GetLevel() <= w[1] + 20)
+                wants.push_back(w[0]);
+        if (wants.empty())
+            return;
+        ItemTemplate const* p = sObjectMgr->GetItemTemplate(wants[urand(0, wants.size() - 1)]);
+        if (!p)
+            return;
+        text = WovRep(WovRep(WovPick(kWovWtb), "{item}", ChatHelper::FormatItem(p)), "{n}", std::to_string(urand(1, 4) * 5));
+    }
+    ai->SayToChannel(text, ChatChannelId::TRADE);
+}
+
+void WovPostRecruit(Player* real)
+{
+    std::vector<Player*> c;
+    for (auto const& [guid, bot] : sRandomPlayerbotMgr.GetAllBots())
+        if (bot && bot->IsInWorld() && bot->GetGuild() && bot->GetTeamId() == real->GetTeamId() &&
+            bot->GetZoneId() == real->GetZoneId())
+            c.push_back(bot);
+    if (c.empty())
+        return;
+    Player* bot = c[urand(0, c.size() - 1)];
+    PlayerbotAI* ai = GET_PLAYERBOT_AI(bot);
+    if (!ai)
+        return;
+    std::string text = WovRep(WovPick(kWovRecruit), "{guild}", bot->GetGuild()->GetName());
+    ai->SayToChannel(text, WovInCapital(bot) ? ChatChannelId::GUILD_RECRUITMENT : ChatChannelId::GENERAL);
+}
+
+void WovAskGroup(Player* real)
+{
+    if (real->GetGroup() || !WovOpenWorld(real))
+        return;
+    for (auto const& [guid, bot] : sRandomPlayerbotMgr.GetAllBots())
+    {
+        if (!bot || !bot->IsInWorld() || !bot->IsAlive() || bot->GetGroup() || bot->GetTeamId() != real->GetTeamId())
+            continue;
+        if (bot->GetMapId() != real->GetMapId() || bot->GetExactDist(real) > 60.0f)
+            continue;
+        if (std::abs(int(bot->GetLevel()) - int(real->GetLevel())) > 3 || g_wovBotSk.count(bot->GetGUID().GetCounter()))
+            continue;
+        bot->Whisper(WovPick(kWovAskGroup), LANG_UNIVERSAL, real);
+        LOG_INFO("playerbots", "WoV init: {} asks {} to group", bot->GetName(), real->GetName());
+        return;
+    }
+}
+
+void WovAskGuild(Player* real)
+{
+    if (real->GetGuild() || real->GetLevel() < 5)
+        return;
+    std::vector<Guild*> guilds;
+    std::set<uint32> seen;
+    for (auto const& [guid, bot] : sRandomPlayerbotMgr.GetAllBots())
+    {
+        Guild* g = bot ? bot->GetGuild() : nullptr;
+        if (!g || bot->GetTeamId() != real->GetTeamId() || seen.count(g->GetId()))
+            continue;
+        seen.insert(g->GetId());
+        Player* leader = ObjectAccessor::FindPlayer(g->GetLeaderGUID());
+        if (leader && leader->IsInWorld() && GET_PLAYERBOT_AI(leader))
+            guilds.push_back(g);
+    }
+    if (guilds.empty())
+        return;
+    Guild* g = guilds[urand(0, guilds.size() - 1)];
+    Player* leader = ObjectAccessor::FindPlayer(g->GetLeaderGUID());
+    if (!leader)
+        return;
+    g->HandleInviteMember(leader->GetSession(), real->GetName());
+    leader->Whisper(WovRep(WovPick(kWovAskGuild), "{guild}", g->GetName()), LANG_UNIVERSAL, real);
+    LOG_INFO("playerbots", "WoV init: {} invites {} to <{}>", leader->GetName(), real->GetName(), g->GetName());
+}
+
+void WovInit_Tick(time_t now)
+{
+    WovInitConfig(now);
+    if (!g_wovInitEnable)
+        return;
+    static time_t last = 0;
+    if (now < last + 5)
+        return;
+    last = now;
+
+    std::vector<std::pair<uint32, uint32>> invites;
+    {
+        std::lock_guard<std::mutex> lock(g_wovInitMutex);
+        invites.swap(g_wovInviteQueue);
+    }
+    for (auto const& [botLow, playerLow] : invites)
+    {
+        Player* bot = ObjectAccessor::FindPlayerByLowGUID(botLow);
+        Player* p = ObjectAccessor::FindPlayerByLowGUID(playerLow);
+        if (!bot || !p || p->GetGroup() || (bot->GetGroup() && bot->GetGroup()->IsFull()))
+            continue;
+        bot->Whisper(WovPick(kWovInvOk), LANG_UNIVERSAL, p);
+        WorldPacket pk;
+        pk << p->GetName();
+        pk << uint32(0);
+        bot->GetSession()->HandleGroupInviteOpcode(pk);
+    }
+
+    static time_t nextLfg[2] = {0, 0}, nextTrade[2] = {0, 0}, nextRecruit[2] = {0, 0};
+    std::vector<Player*> reals[2];
+    for (auto const& [id, session] : sWorldSessionMgr->GetAllSessions())
+    {
+        Player* p = session ? session->GetPlayer() : nullptr;
+        if (p && !session->IsBot() && p->IsInWorld())
+            reals[p->GetTeamId() == TEAM_ALLIANCE ? 0 : 1].push_back(p);
+    }
+    for (int t = 0; t < 2; ++t)
+    {
+        if (reals[t].empty())
+            continue;
+        Player* real = reals[t][urand(0, reals[t].size() - 1)];
+        if (now >= nextLfg[t])
+        {
+            nextLfg[t] = now + urand(g_wovInitLfgSec / 2, g_wovInitLfgSec * 3 / 2);
+            if (Player* bot = WovPickPoster(real, false))
+                WovPostLfx(bot, real);
+        }
+        if (now >= nextTrade[t])
+        {
+            nextTrade[t] = now + urand(g_wovInitTradeSec / 2, g_wovInitTradeSec * 3 / 2);
+            if (WovInCapital(real))
+                if (Player* bot = WovPickPoster(real, true))
+                    WovPostTrade(bot);
+        }
+        if (now >= nextRecruit[t])
+        {
+            nextRecruit[t] = now + urand(g_wovInitRecruitSec / 2, g_wovInitRecruitSec * 3 / 2);
+            WovPostRecruit(real);
+        }
+        for (Player* p : reals[t])
+        {
+            uint32 low = p->GetGUID().GetCounter();
+            time_t& ng = g_wovNextGroupAsk[low];
+            if (!ng)
+                ng = now + urand(3, 8) * 60;
+            else if (now >= ng)
+            {
+                ng = now + urand(g_wovInitGroupMin * 60 / 2, g_wovInitGroupMin * 60 * 3 / 2);
+                if (urand(0, 99) < 40)
+                    WovAskGroup(p);
+            }
+            time_t& nu = g_wovNextGuildAsk[low];
+            if (!nu)
+                nu = now + urand(10, 25) * 60;
+            else if (now >= nu)
+            {
+                nu = now + urand(g_wovInitGuildMin * 60 / 2, g_wovInitGuildMin * 60 * 3 / 2);
+                if (urand(0, 99) < 50)
+                    WovAskGuild(p);
+            }
+        }
+    }
+}
+}  // namespace
+
+// Whisper hook (Playerbots.cpp): a real player answering a recent LFG/LFM post gets an invite.
+void WovInit_OnWhisper(Player* from, Player* to)
+{
+    if (!g_wovInitEnable || !from || !to || from->GetTeamId() != to->GetTeamId())
+        return;
+    if (sRandomPlayerbotMgr.IsRandomBot(from) || !sRandomPlayerbotMgr.IsRandomBot(to))
+        return;
+    std::lock_guard<std::mutex> lock(g_wovInitMutex);
+    auto it = g_wovLfx.find(to->GetGUID().GetCounter());
+    if (it == g_wovLfx.end() || time(nullptr) > it->second.t + 600)
+        return;
+    g_wovInviteQueue.emplace_back(to->GetGUID().GetCounter(), from->GetGUID().GetCounter());
+    g_wovLfx.erase(it);
+}
+// ---- end wov: initiative --------------------------------------------------------------------------------
 #include "PlayerbotFactory.h"
 #include "PlayerbotTextMgr.h"
 #include "Playerbots.h"
@@ -981,6 +1347,7 @@ void RandomPlayerbotMgr::UpdateAIInternal(uint32 /*elapsed*/, bool /*minimal*/)
 
     CompanyStanding::instance().Update();  // local: company standing (custom wow plans/14, step C)
     WovWar_Tick(time(nullptr));  // wov: Call to Arms
+    WovInit_Tick(time(nullptr));  // wov: initiative
 
     /*if (sPlayerbotAIConfig.enablePrototypePerformanceDiff)
     {

@@ -135,6 +135,8 @@ public:
     }
 };
 
+void WovInit_OnWhisper(Player* from, Player* to);  // wov (RandomPlayerbotMgr.cpp)
+
 class PlayerbotsPlayerScript : public PlayerScript
 {
 public:
@@ -371,6 +373,8 @@ public:
         {
             return true;
         }
+
+        WovInit_OnWhisper(player, receiver);  // wov: answering an LFG/LFM post gets an invite
 
         botAI->HandleCommand(type, msg, player);
 
