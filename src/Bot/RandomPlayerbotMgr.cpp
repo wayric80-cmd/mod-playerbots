@@ -364,7 +364,7 @@ float WovDist(Player* p, WovSkirmish const& s)
 void WovSend(Player* bot, WovSkirmish const& s)
 {
     PlayerbotAI* ai = GET_PLAYERBOT_AI(bot);
-    if (!ai)
+    if (!ai || bot->IsBeingTeleported())
         return;
     WorldPosition dest(s.map, s.x, s.y, s.z);
     if (bot->GetMapId() == s.map && bot->GetExactDist(s.x, s.y, s.z) < 450.0f)
@@ -372,7 +372,7 @@ void WovSend(Player* bot, WovSkirmish const& s)
         ai->rpgInfo.ChangeToGoGrind(dest);
         return;
     }
-    if (TravelMgr::FlightMasterInfo const* fm = sTravelMgr.GetNearestFlightMasterInfo(bot))
+    if (TravelMgr::FlightMasterInfo const* fm = bot->GetMapId() == s.map ? sTravelMgr.GetNearestFlightMasterInfo(bot) : nullptr)
     {
         uint32 to = sObjectMgr->GetNearestTaxiNode(s.x, s.y, s.z, s.map, bot->GetTeamId());
         if (fm->taxiNodeId && to && fm->taxiNodeId != to)
@@ -393,7 +393,7 @@ void WovSend(Player* bot, WovSkirmish const& s)
     // no usable flight path: put the bot at its faction's flight master next to the fight, as if it had flown in
     uint32 to2 = sObjectMgr->GetNearestTaxiNode(s.x, s.y, s.z, s.map, bot->GetTeamId());
     if (TaxiNodesEntry const* n = to2 ? sTaxiNodesStore.LookupEntry(to2) : nullptr)
-        if (n->map_id == s.map && bot->GetMapId() == s.map && bot->GetExactDist(n->x, n->y, n->z) > 450.0f)
+        if (n->map_id == s.map && (bot->GetMapId() != s.map || bot->GetExactDist(n->x, n->y, n->z) > 450.0f))
         {
             LOG_INFO("playerbots", "WoV war #{}: {} has no flight path, placed at flight master", s.id, bot->GetName());
             bot->TeleportTo(n->map_id, n->x, n->y, n->z, bot->GetOrientation());
@@ -440,11 +440,12 @@ uint32 WovRecruit(WovSkirmish& s, TeamId team, uint32 want)
             continue;
         if (bot->GetLevel() < s.minL || bot->GetLevel() > s.maxL)
             continue;
-        if (g_wovBotSk.count(bot->GetGUID().GetCounter()) || bot->GetMapId() != s.map)
+        if (g_wovBotSk.count(bot->GetGUID().GetCounter()) || bot->IsBeingTeleported())
             continue;
         cands.push_back(bot);
     }
     std::shuffle(cands.begin(), cands.end(), std::mt19937(std::random_device{}()));
+    std::stable_partition(cands.begin(), cands.end(), [&s](Player* b) { return b->GetMapId() == s.map; });
     uint32 got = 0;
     Player* firstRecruit = nullptr;
     for (Player* bot : cands)
@@ -619,6 +620,8 @@ void WovHandleKill(WovKill const& k, time_t now)
         WovAddMember(ref, k.victimLow, victimTeam);
     LOG_INFO("playerbots", "WoV war #{}: skirmish at {} (lvl {}-{})", ref.id, ref.place, ref.minL, ref.maxL);
     WovCry(ref, victimTeam, n);
+    if (!k.killerBot)
+        WovRecruit(ref, k.killerTeam, urand(2, 3));  // a real player is never alone for long
 }
 
 void WovEnd(WovSkirmish& s)
@@ -682,6 +685,7 @@ void WovWar_Tick(time_t now)
     {
         WovSkirmish& s = g_wovSk[i];
         uint32 nearCount[2] = {0, 0};
+        uint32 aliveCount[2] = {0, 0};
         WorldPosition dest(s.map, s.x, s.y, s.z);
         for (int t = 0; t < 2; ++t)
         {
@@ -690,6 +694,12 @@ void WovWar_Tick(time_t now)
                 Player* p = ObjectAccessor::FindPlayerByLowGUID(*it);
                 if (!p || !p->IsInWorld())
                 {
+                    Player* c = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(*it));
+                    if (c && c->IsBeingTeleportedFar())
+                    {
+                        ++it;  // on the way from the other continent
+                        continue;
+                    }
                     g_wovBotSk.erase(*it);
                     it = s.members[t].erase(it);
                     continue;
@@ -703,6 +713,8 @@ void WovWar_Tick(time_t now)
                     it = s.members[t].erase(it);
                     continue;
                 }
+                if (p->IsAlive())
+                    ++aliveCount[t];
                 if (p->IsAlive() && d < 160.0f)
                     ++nearCount[t];
                 if (p->IsAlive() && d < 120.0f && !s.arrived.count(*it))
@@ -759,7 +771,7 @@ void WovWar_Tick(time_t now)
             for (int t = 0; t < 2; ++t)
             {
                 TeamId team = TeamId(t);
-                uint32 have = s.members[t].size();
+                uint32 have = aliveCount[t];  // the dead do not count: send more
                 uint32 want = 0;
                 if (s.raid && team == s.raidTeam)
                     want = have < s.raidTarget ? std::min<uint32>(s.raidTarget - have, 10) : 0;
