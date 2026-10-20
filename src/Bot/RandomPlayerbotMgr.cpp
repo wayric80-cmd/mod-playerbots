@@ -1770,8 +1770,8 @@ void WovAuctioneersLoad()
         return;
     done = true;
     QueryResult r = WorldDatabase.Query(
-        "SELECT c.id1, c.map, c.position_x, c.position_y, c.position_z, t.faction FROM creature c JOIN creature_template t "
-        "ON t.entry = c.id1 WHERE (t.npcflag & 2097152) <> 0 AND c.map IN (0, 1)");
+        "SELECT c.id, c.map, c.position_x, c.position_y, c.position_z, t.faction FROM creature c JOIN creature_template t "
+        "ON t.entry = c.id WHERE (t.npcflag & 2097152) <> 0 AND c.map IN (0, 1)");
     if (!r)
         return;
     AuctionHouseObject* ally = sAuctionMgr->GetAuctionsMapByHouseId(AuctionHouseId::Alliance);
