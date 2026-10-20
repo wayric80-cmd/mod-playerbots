@@ -5,6 +5,8 @@
  */
 
 #include "GuildAcceptAction.h"
+#include "RandomPlayerbotMgr.h"
+#include "DatabaseEnv.h"
 #include "CompanyStanding.h"
 #include "Event.h"
 #include "GuildPackets.h"
@@ -26,6 +28,38 @@ bool GuildAcceptAction::Execute(Event event)
 
     if (!inviter)
         return false;
+
+    // wov: a random bot answers a real player's guild invite like a player would: it depends on how much it likes
+    // them (mod-ollama-chat sentiment, 0..1, 0.5 = never met). Leaving its own guild for someone is rare.
+    if (sRandomPlayerbotMgr.IsRandomBot(bot) && !GET_PLAYERBOT_AI(inviter) && inviter->GetGuildId())
+    {
+        float like = 0.5f;
+        if (QueryResult r = CharacterDatabase.Query(
+                "SELECT sentiment_value FROM mod_ollama_chat_bot_player_sentiments WHERE bot_guid = {} AND player_guid = {}",
+                bot->GetGUID().GetRawValue(), inviter->GetGUID().GetRawValue()))
+            like = r->Fetch()[0].Get<float>();
+        uint32 chance = bot->GetGuildId() ? (like >= 0.7f ? 15 : 0) : (like >= 0.6f ? 85 : (like <= 0.35f ? 5 : 40));
+        bool wovAccept = urand(0, 99) < chance;
+        if (wovAccept && bot->GetGuildId())
+        {
+            WorldPackets::Guild::GuildLeave leave = WorldPacket(CMSG_GUILD_LEAVE);
+            bot->GetSession()->HandleGuildLeaveOpcode(leave);
+            wovAccept = !bot->GetGuildId();
+        }
+        if (wovAccept)
+        {
+            WorldPackets::Guild::AcceptGuildInvite data = WorldPacket(CMSG_GUILD_ACCEPT);
+            bot->GetSession()->HandleGuildAcceptOpcode(data);
+        }
+        else
+        {
+            WorldPackets::Guild::GuildDeclineInvitation data = WorldPacket(CMSG_GUILD_DECLINE);
+            bot->GetSession()->HandleGuildDeclineOpcode(data);
+        }
+        LOG_INFO("playerbots", "WoV guild invite: {} -> {} (like {:.2f}, chance {}%) {}", inviter->GetName(), bot->GetName(),
+                 like, chance, wovAccept ? "accepted" : "declined");
+        return true;
+    }
 
     // local: company regard gate (custom wow plans/18, step P2). An unguilded bot joins a real player's company
     // only as far as it trusts them and the people already inside; it says none of the stock lines, and its
