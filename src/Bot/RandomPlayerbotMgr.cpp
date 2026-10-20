@@ -251,6 +251,10 @@ struct WovSkirmish
     bool cried[2] = {false, false};
     std::set<uint32> members[2];
     std::set<uint32> invitedReal;
+    std::set<uint32> realLows;   // real players fighting here
+    std::set<uint32> arrived;    // members that reached the fight
+    uint32 kills[2] = {0, 0};    // kills made by each side
+    uint32 arriveSaid[2] = {0, 0};
 };
 
 std::mutex g_wovWarMutex;
@@ -277,6 +281,8 @@ char const* const kWovInvite[] = {"{place} getting hit by {enemy}, u coming?", "
                                   "{enemy} at {place}, u around?"};
 char const* const kWovRaidCall[] = {"raiding {place}, who's in?", "lets go hit {place}", "{place} raid, come",
                                     "anyone up for raiding {place}?", "going to {place} to kill some {enemy}, join"};
+char const* const kWovArrive[] = {"here, where are they?", "im here", "made it, where they at?", "here, lets kill em",
+                                  "landed, where?", "ok here", "who needs help?"};
 char const* const kWovEnd[] = {"gg", "lol they ran", "ez", "gg wp", "that was fun", "they'll be back",
                                "gg, that was nuts", "ffs i died like 5 times", "good fight", "lol gg"};
 
@@ -538,8 +544,21 @@ void WovHandleKill(WovKill const& k, time_t now)
     TeamId victimTeam = WovOther(k.killerTeam);
     for (WovSkirmish& s : g_wovSk)
     {
-        if (s.map == k.map && std::hypot(s.x - k.x, s.y - k.y) < 300.0f)
+        float d = s.map == k.map ? std::hypot(s.x - k.x, s.y - k.y) : 1.0e9f;
+        bool sameReal = k.real && ((!k.killerBot && s.realLows.count(k.killerLow)) || (!k.victimBot && s.realLows.count(k.victimLow)));
+        if (d < 300.0f || (sameReal && d < 1500.0f))
         {
+            if (sameReal || k.real)
+            {
+                s.x = k.x;  // the fight moves with the real player
+                s.y = k.y;
+                s.z = k.z;
+                if (!k.killerBot)
+                    s.realLows.insert(k.killerLow);
+                if (!k.victimBot)
+                    s.realLows.insert(k.victimLow);
+            }
+            ++s.kills[k.killerTeam == TEAM_ALLIANCE ? 0 : 1];
             s.lastKill = std::max(s.lastKill, now);
             if (k.killerBot)
                 WovAddMember(s, k.killerLow, k.killerTeam);
@@ -555,7 +574,9 @@ void WovHandleKill(WovKill const& k, time_t now)
     for (WovKill const& r : g_wovRecent)
         if (r.map == k.map && std::hypot(r.x - k.x, r.y - k.y) < 220.0f)
             ++n;
-    if (!(n >= g_wovWarSparkKills || k.real) || g_wovSk.size() >= g_wovWarMaxActive)
+    if (!(n >= g_wovWarSparkKills || k.real))
+        return;
+    if (g_wovSk.size() >= g_wovWarMaxActive + (k.real ? 2 : 0))
         return;
     WovSkirmish s;
     s.id = ++g_wovSkSeq;
@@ -570,6 +591,11 @@ void WovHandleKill(WovKill const& k, time_t now)
     s.lastKill = now;
     s.lastWave = 0;
     s.owner = victimTeam;
+    s.kills[k.killerTeam == TEAM_ALLIANCE ? 0 : 1] = 1;
+    if (!k.killerBot)
+        s.realLows.insert(k.killerLow);
+    if (!k.victimBot)
+        s.realLows.insert(k.victimLow);
     g_wovSk.push_back(s);
     WovSkirmish& ref = g_wovSk.back();
     if (k.killerBot)
@@ -656,6 +682,15 @@ void WovWar_Tick(time_t now)
                 float d = WovDist(p, s);
                 if (p->IsAlive() && d < 160.0f)
                     ++nearCount[t];
+                if (p->IsAlive() && d < 120.0f && !s.arrived.count(*it))
+                {
+                    s.arrived.insert(*it);
+                    if (s.arriveSaid[t] < 3 && urand(0, 99) < 30)
+                    {
+                        ++s.arriveSaid[t];
+                        WovSayChannel(p, WovPick(kWovArrive), false);
+                    }
+                }
                 PlayerbotAI* ai = GET_PLAYERBOT_AI(p);
                 if (ai && p->IsAlive() && !p->IsInFlight() && !p->GetGroup() &&
                     ai->rpgInfo.GetStatus() != RPG_TRAVEL_FLIGHT && d > 70.0f)
@@ -693,7 +728,7 @@ void WovWar_Tick(time_t now)
             WovCry(s, s.owner, nearCount[s.raidTeam]);
         }
 
-        if (now >= s.lastWave + 90)
+        if (now >= s.lastWave + 60)
         {
             s.lastWave = now;
             for (int t = 0; t < 2; ++t)
@@ -706,10 +741,11 @@ void WovWar_Tick(time_t now)
                 else if (!(s.raid && !s.announced))
                 {
                     uint32 enemies = nearCount[1 - t];
-                    uint32 target = std::min<uint32>(g_wovWarMaxPerSide, enemies * 5 / 4 + 3);
-                    if (!enemies)
+                    uint32 lost = s.kills[1 - t];
+                    uint32 target = std::min<uint32>(g_wovWarMaxPerSide, enemies * 3 / 2 + 3 + lost * 2);
+                    if (!enemies && !lost)
                         target = 0;
-                    want = target > have ? std::min<uint32>(target - have, 8) : 0;
+                    want = target > have ? std::min<uint32>(target - have, 10) : 0;
                 }
                 WovRecruit(s, team, want);
             }
