@@ -29,6 +29,15 @@ bool GuildAcceptAction::Execute(Event event)
     if (!inviter)
         return false;
 
+    // wov: a random bot that asked to join (recruitment post) accepts an invite from a guild officer bot
+    if (sRandomPlayerbotMgr.IsRandomBot(bot) && sRandomPlayerbotMgr.IsRandomBot(inviter) && !bot->GetGuildId() &&
+        inviter->GetGuildId())
+    {
+        WorldPackets::Guild::AcceptGuildInvite data = WorldPacket(CMSG_GUILD_ACCEPT);
+        bot->GetSession()->HandleGuildAcceptOpcode(data);
+        return true;
+    }
+
     // wov: a random bot answers a real player's guild invite like a player would: it depends on how much it likes
     // them (mod-ollama-chat sentiment, 0..1, 0.5 = never met). Leaving its own guild for someone is rare.
     if (sRandomPlayerbotMgr.IsRandomBot(bot) && !GET_PLAYERBOT_AI(inviter) && inviter->GetGuildId())

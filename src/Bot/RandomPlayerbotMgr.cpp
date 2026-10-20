@@ -1097,9 +1097,27 @@ void WovInit_Tick(time_t now)
             continue;
         Player* leader = ObjectAccessor::FindPlayer(g->GetLeaderGUID());
         std::string text = WovRep(WovPick(kWovApply), "{guild}", g->GetName());
-        if (leader && leader->IsInWorld() && !GET_PLAYERBOT_AI(leader))
+        bool realLeader = g->GetLeaderGUID() && !sRandomPlayerbotMgr.IsRandomBot(g->GetLeaderGUID().GetCounter());
+        // a bot member whose rank may invite (e.g. Veteran/Officer set by a real guild master) handles it
+        Player* officer = nullptr;
+        if (realLeader)
+            for (auto const& [og, ob] : sRandomPlayerbotMgr.GetAllBots())
+                if (ob && ob->IsInWorld() && ob->GetGuildId() == g->GetId() && g->HasRankRight(ob, GR_RIGHT_INVITE))
+                {
+                    officer = ob;
+                    break;
+                }
+        if (officer)
+        {
+            static char const* const kOk[] = {"sure, sent", "inv sent", "welcome, sent u an inv", "sent, welcome", "np, inv sent"};
+            a->Whisper(text, LANG_UNIVERSAL, officer);
+            g->HandleInviteMember(officer->GetSession(), a->GetName());
+            officer->Whisper(WovPick(kOk), LANG_UNIVERSAL, a);
+            LOG_INFO("playerbots", "WoV init: officer {} invites {} to <{}>", officer->GetName(), a->GetName(), g->GetName());
+        }
+        else if (leader && leader->IsInWorld() && !GET_PLAYERBOT_AI(leader))
             a->Whisper(text, LANG_UNIVERSAL, leader);  // a real guild master decides
-        else if (r)
+        else if (r && !realLeader)
         {
             a->Whisper(text, LANG_UNIVERSAL, r);
             g->AddMember(a->GetGUID());
