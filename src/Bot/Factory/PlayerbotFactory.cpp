@@ -3455,6 +3455,13 @@ void PlayerbotFactory::InitSkills()
 
 void PlayerbotFactory::SetRandomSkill(uint16 id)
 {
+    // WoV: professions advance through crafting/gathering, not level maintenance.
+    // Starter spells in InitTradeSkills initialize new professions at 1; their
+    // trainer spells manage rank/cap. Preserve existing progress and rank here.
+    for (uint32 tradeSkill : tradeSkills)
+        if (id == tradeSkill)
+            return;
+
     uint32 maxValue = level * 5;
 
     // do not let skill go beyond limit even if maxlevel > blizzlike
