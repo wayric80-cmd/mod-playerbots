@@ -952,10 +952,14 @@ uint32 const kWovWtbItems[][2] = {{2589, 1}, {2592, 15}, {4306, 25}, {4338, 35},
 
 struct WovLfx
 {
-    time_t t = 0;
+    time_t t = 0;   // last post (0 once a real player answered it)
     bool lfm = false;
     WovDungeon const* dg = nullptr;
+    time_t t0 = 0;  // when the bot decided on this dungeon; it sticks to it for a while, then gives up
+    std::string role, need;
 };
+std::unordered_map<uint32, time_t> g_wovLastPost;  // bot -> last initiative post (world thread)
+uint32 const kWovIntentSec = 1500, kWovGiveUpQuietSec = 1800, kWovPostGapSec = 300;
 std::mutex g_wovInitMutex;
 std::unordered_map<uint32, WovLfx> g_wovLfx;
 std::vector<std::pair<uint32, uint32>> g_wovInviteQueue;
@@ -1042,6 +1046,9 @@ Player* WovPickPoster(Player* real, bool needCapital, uint8 preferDrive = 0)
             continue;
         if (g_wovBotSk.count(bot->GetGUID().GetCounter()))
             continue;
+        auto lp = g_wovLastPost.find(bot->GetGUID().GetCounter());
+        if (lp != g_wovLastPost.end() && time(nullptr) < lp->second + kWovPostGapSec)
+            continue;
         c.push_back(bot);
         if (preferDrive && WovDriveOf(bot->GetGUID().GetCounter()) == preferDrive)
             for (int k = 0; k < 3; ++k)
@@ -1053,21 +1060,46 @@ Player* WovPickPoster(Player* real, bool needCapital, uint8 preferDrive = 0)
 void WovPostLfx(Player* bot, Player* real)
 {
     PlayerbotAI* ai = GET_PLAYERBOT_AI(bot);
-    WovDungeon const* d = WovDungeonFor(bot);
-    if (!ai || !d || bot->GetGroup())
+    if (!ai || bot->GetGroup())
         return;
-    bool lfm = urand(0, 99) < 45;
+    uint32 low = bot->GetGUID().GetCounter();
+    time_t now = time(nullptr);
+    WovLfx cur;
+    {
+        std::lock_guard<std::mutex> lock(g_wovInitMutex);
+        auto it = g_wovLfx.find(low);
+        if (it != g_wovLfx.end())
+            cur = it->second;
+    }
+    if (cur.dg && now >= cur.t0 + kWovIntentSec && now < cur.t0 + kWovIntentSec + kWovGiveUpQuietSec)
+        return;  // gave up on its group; quiet for a while
+    if (!cur.dg || now >= cur.t0 + kWovIntentSec)
+    {
+        // a new plan: one dungeon, looking for a group OR building one, and it sticks to it
+        cur = WovLfx();
+        cur.dg = WovDungeonFor(bot);
+        if (!cur.dg)
+            return;
+        cur.lfm = urand(0, 99) < 45;
+        cur.t0 = now;
+        cur.role = WovRole(bot);
+        cur.need = WovPick(kWovNeed);
+    }
+    bool lfm = cur.lfm;
+    WovDungeon const* d = cur.dg;
     std::string text = lfm ? WovPick(kWovLfm) : WovPick(kWovLfg);
     text = WovRep(text, "{dg}", d->name);
-    text = WovRep(text, "{role}", WovRole(bot));
-    text = WovRep(text, "{need}", WovPick(kWovNeed));
+    text = WovRep(text, "{role}", cur.role);
+    text = WovRep(text, "{need}", cur.need);
     text = WovRep(text, "{n}", std::to_string(urand(1, 3)));
     if (WovInCapital(real))
         ai->SayToChannel(text, urand(0, 1) ? ChatChannelId::LOOKING_FOR_GROUP : ChatChannelId::TRADE);
     else
         ai->SayToChannel(text, ChatChannelId::GENERAL);
+    g_wovLastPost[low] = now;
+    cur.t = now;
     std::lock_guard<std::mutex> lock(g_wovInitMutex);
-    g_wovLfx[bot->GetGUID().GetCounter()] = {time(nullptr), lfm, d};
+    g_wovLfx[low] = cur;
 }
 
 bool WovSellable(ItemTemplate const* p)
@@ -1119,6 +1151,7 @@ void WovPostTrade(Player* bot)
             return;
         text = WovRep(WovRep(WovPick(kWovWtb), "{item}", ChatHelper::FormatItem(p)), "{n}", std::to_string(urand(1, 4) * 5));
     }
+    g_wovLastPost[bot->GetGUID().GetCounter()] = time(nullptr);
     ai->SayToChannel(text, ChatChannelId::TRADE);
 }
 
@@ -1129,12 +1162,17 @@ void WovPostRecruit(Player* real)
         if (bot && bot->IsInWorld() && bot->GetGuild() && bot->GetTeamId() == real->GetTeamId() &&
             bot->GetZoneId() == real->GetZoneId() && !bot->GetGroup() && bot->GetMap() && !bot->GetMap()->Instanceable())
             c.push_back(bot);
+    c.erase(std::remove_if(c.begin(), c.end(), [](Player* b) {
+                auto lp = g_wovLastPost.find(b->GetGUID().GetCounter());
+                return lp != g_wovLastPost.end() && time(nullptr) < lp->second + kWovPostGapSec;
+            }), c.end());
     if (c.empty())
         return;
     Player* bot = c[urand(0, c.size() - 1)];
     PlayerbotAI* ai = GET_PLAYERBOT_AI(bot);
     if (!ai)
         return;
+    g_wovLastPost[bot->GetGUID().GetCounter()] = time(nullptr);
     std::string text = WovRep(WovPick(kWovRecruit), "{guild}", bot->GetGuild()->GetName());
     ai->SayToChannel(text, WovInCapital(bot) ? ChatChannelId::GUILD_RECRUITMENT : ChatChannelId::GENERAL);
     // a few unguilded players around answer the post
@@ -1341,7 +1379,30 @@ void WovInit_OnWhisper(Player* from, Player* to)
         return;
     g_wovInviteQueue.emplace_back(to->GetGUID().GetCounter(), from->GetGUID().GetCounter());
     g_wovJoinTrack.emplace_back(to->GetGUID().GetCounter(), from->GetGUID().GetCounter(), it->second.dg);
-    g_wovLfx.erase(it);
+    it->second.t = 0;  // answered; the plan itself stays, so the bot does not switch dungeon
+}
+
+// For mod-ollama-chat's prompts: what this bot has said it is doing in the channels, so its talk stays consistent.
+std::string WovIntentOf(uint32 low)
+{
+    if (!g_wovInitEnable)
+        return "";
+    Player* bot = ObjectAccessor::FindPlayerByLowGUID(low);
+    std::lock_guard<std::mutex> lock(g_wovInitMutex);
+    auto it = g_wovLfx.find(low);
+    if (it == g_wovLfx.end() || !it->second.dg || time(nullptr) >= it->second.t0 + kWovIntentSec)
+        return "";
+    std::string dg = it->second.dg->name;
+    if (bot && bot->GetGroup())
+        return "Right now you are in a group for " + dg + ". Talk is about that group and run; do not look for other "
+               "groups or quest partners.";
+    if (it->second.lfm)
+        return "Right now you are putting a group together for " + dg + " and still need " + it->second.need +
+               " (you posted it in the channel). If you mention what you are doing, it is that; do not look for other "
+               "groups, dungeons or quest partners.";
+    return "Right now you are looking for a group for " + dg + " as " + it->second.role +
+           " (you posted it in the channel). If you mention what you are doing, it is that; do not ask for other "
+           "groups, dungeons or quest partners.";
 }
 // ---- end wov: initiative --------------------------------------------------------------------------------
 
