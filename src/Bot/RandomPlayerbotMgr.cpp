@@ -280,6 +280,11 @@ uint32 g_wovSkSeq = 0;
 std::unordered_map<uint32, uint32> g_wovBotSk;
 struct WovCool { uint32 map; float x, y; time_t until; };
 std::vector<WovCool> g_wovCool;  // places where a fight just ended: no new one there for a while
+// Graveyard camping: a bot killed twice by players within 10 minutes gives up like a player would -- once it is
+// alive again it hearths home and stays out of Call to Arms for half an hour.
+std::unordered_map<uint32, std::vector<time_t>> g_wovPvpDeaths;
+std::unordered_set<uint32> g_wovHearth;
+std::unordered_map<uint32, time_t> g_wovNoRecruit;
 
 bool g_wovWarEnable = false;
 uint32 g_wovWarMaxPerSide = 30, g_wovWarMaxActive = 2, g_wovWarSparkKills = 2, g_wovWarSparkWindow = 300,
@@ -510,6 +515,9 @@ uint32 WovRecruit(WovSkirmish& s, TeamId team, uint32 want)
             continue;
         if (g_wovBotSk.count(bot->GetGUID().GetCounter()) || bot->IsBeingTeleported())
             continue;
+        auto nr = g_wovNoRecruit.find(bot->GetGUID().GetCounter());
+        if (nr != g_wovNoRecruit.end() && time(nullptr) < nr->second)
+            continue;
         cands.push_back(bot);
     }
     std::shuffle(cands.begin(), cands.end(), std::mt19937(std::random_device{}()));
@@ -625,6 +633,18 @@ void WovStartRaid(time_t now)
 
 void WovHandleKill(WovKill const& k, time_t now)
 {
+    if (k.victimBot)
+    {
+        auto& d = g_wovPvpDeaths[k.victimLow];
+        d.erase(std::remove_if(d.begin(), d.end(), [now](time_t t) { return t + 600 < now; }), d.end());
+        d.push_back(now);
+        if (d.size() >= 2)
+        {
+            g_wovHearth.insert(k.victimLow);
+            g_wovNoRecruit[k.victimLow] = now + 1800;
+            d.clear();
+        }
+    }
     TeamId victimTeam = WovOther(k.killerTeam);
     for (WovSkirmish& s : g_wovSk)
     {
@@ -743,6 +763,36 @@ void WovWar_Tick(time_t now)
     }
     for (WovKill const& k : kills)
         WovHandleKill(k, now);
+
+    for (auto it = g_wovHearth.begin(); it != g_wovHearth.end();)
+    {
+        Player* p = ObjectAccessor::FindPlayerByLowGUID(*it);
+        if (!p || !p->IsInWorld())
+        {
+            it = g_wovHearth.erase(it);
+            continue;
+        }
+        if (!p->IsAlive() || p->IsInCombat() || p->IsBeingTeleported() || p->GetGroup())
+        {
+            ++it;
+            continue;
+        }
+        if (auto sk = g_wovBotSk.find(*it); sk != g_wovBotSk.end())
+        {
+            for (WovSkirmish& sm : g_wovSk)
+                if (sm.id == sk->second)
+                {
+                    sm.members[0].erase(*it);
+                    sm.members[1].erase(*it);
+                }
+            g_wovBotSk.erase(sk);
+        }
+        LOG_INFO("playerbots", "WoV war: {} died twice to players, hearths home", p->GetName());
+        if (PlayerbotAI* ai = GET_PLAYERBOT_AI(p))
+            ai->rpgInfo.ChangeToIdle();
+        p->TeleportTo(p->m_homebindMapId, p->m_homebindX, p->m_homebindY, p->m_homebindZ, p->GetOrientation());
+        it = g_wovHearth.erase(it);
+    }
 
     static time_t lastRaidCheck = now;
     if (now >= lastRaidCheck + 600)
