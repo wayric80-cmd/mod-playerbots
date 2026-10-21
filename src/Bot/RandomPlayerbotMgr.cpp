@@ -278,6 +278,8 @@ std::deque<WovKill> g_wovRecent;
 std::vector<WovSkirmish> g_wovSk;
 uint32 g_wovSkSeq = 0;
 std::unordered_map<uint32, uint32> g_wovBotSk;
+struct WovCool { uint32 map; float x, y; time_t until; };
+std::vector<WovCool> g_wovCool;  // places where a fight just ended: no new one there for a while
 
 bool g_wovWarEnable = false;
 uint32 g_wovWarMaxPerSide = 30, g_wovWarMaxActive = 2, g_wovWarSparkKills = 2, g_wovWarSparkWindow = 300,
@@ -410,7 +412,7 @@ void WovSend(Player* bot, WovSkirmish const& s)
         if (n->map_id == s.map && (bot->GetMapId() != s.map || bot->GetExactDist(n->x, n->y, n->z) > 450.0f))
         {
             LOG_INFO("playerbots", "WoV war #{}: {} has no flight path, placed at flight master", s.id, bot->GetName());
-            bot->TeleportTo(n->map_id, n->x, n->y, n->z, bot->GetOrientation());
+            bot->TeleportTo(n->map_id, n->x + frand(-8.0f, 8.0f), n->y + frand(-8.0f, 8.0f), n->z + 0.5f, bot->GetOrientation());
         }
     if (bot->GetMapId() == s.map)
         ai->rpgInfo.ChangeToGoGrind(dest);
@@ -658,6 +660,9 @@ void WovHandleKill(WovKill const& k, time_t now)
             ++n;
     if (!(n >= g_wovWarSparkKills || k.real))
         return;
+    for (WovCool const& c : g_wovCool)
+        if (c.map == k.map && now < c.until && std::hypot(c.x - k.x, c.y - k.y) < 800.0f)
+            return;  // a fight just ended here; the place cools down first
     if (g_wovSk.size() >= g_wovWarMaxActive + (k.real ? 2 : 0))
         return;
     WovSkirmish s;
@@ -709,10 +714,14 @@ void WovEnd(WovSkirmish& s)
                 WovSayChannel(p, WovPick(kWovEnd), false);
                 ++said;
             }
-            if (ai->rpgInfo.GetStatus() == RPG_GO_GRIND)
-                ai->rpgInfo.ChangeToIdle();
+            if (p->IsAlive() && !p->GetGroup() && ai->rpgInfo.GetStatus() != RPG_TRAVEL_FLIGHT)
+                ai->rpgInfo.ChangeToIdle();  // everyone goes back to their own business
         }
     }
+    g_wovCool.push_back({s.map, s.x, s.y, time(nullptr) + 1800});
+    g_wovCool.erase(std::remove_if(g_wovCool.begin(), g_wovCool.end(),
+                                   [](WovCool const& c) { return c.until < time(nullptr); }),
+                    g_wovCool.end());
     LOG_INFO("playerbots", "WoV war #{} at {} over ({} vs {})", s.id, s.place, s.members[0].size(), s.members[1].size());
 }
 
