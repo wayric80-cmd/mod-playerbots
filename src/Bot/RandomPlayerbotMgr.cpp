@@ -416,6 +416,58 @@ void WovSend(Player* bot, WovSkirmish const& s)
         ai->rpgInfo.ChangeToGoGrind(dest);
 }
 
+// A bot on an errand that has stood still for a while is stuck (unreachable flight master, broken path). If no
+// real player is near either end, it is put where it was heading, as if it had walked there.
+std::unordered_map<uint32, std::tuple<float, float, time_t>> g_wovStill;
+
+bool WovStuck(Player* bot, time_t now, uint32 secs)
+{
+    auto& [x, y, t] = g_wovStill[bot->GetGUID().GetCounter()];
+    if (!t || std::hypot(bot->GetPositionX() - x, bot->GetPositionY() - y) > 5.0f)
+    {
+        x = bot->GetPositionX();
+        y = bot->GetPositionY();
+        t = now;
+        return false;
+    }
+    return now > t + time_t(secs);
+}
+
+bool WovRealNear(uint32 map, float px, float py, float range)
+{
+    for (auto const& [id, session] : sWorldSessionMgr->GetAllSessions())
+    {
+        Player* p = session ? session->GetPlayer() : nullptr;
+        if (p && !session->IsBot() && p->IsInWorld() && p->GetMapId() == map &&
+            std::hypot(p->GetPositionX() - px, p->GetPositionY() - py) < range)
+            return true;
+    }
+    return false;
+}
+
+void WovUnstick(Player* bot, PlayerbotAI* ai, WorldPosition const& dest, char const* why)
+{
+    float tx = dest.GetPositionX(), ty = dest.GetPositionY(), tz = dest.GetPositionZ();
+    uint32 tmap = dest.GetMapId();
+    if (ai->rpgInfo.GetStatus() == RPG_TRAVEL_FLIGHT)
+    {
+        auto* f = std::get_if<NewRpgInfo::TravelFlight>(&ai->rpgInfo.data);
+        if (!f || f->inFlight)
+            return;
+        tx = f->flightMasterPos.GetPositionX();  // stuck on the way to the flight master
+        ty = f->flightMasterPos.GetPositionY();
+        tz = f->flightMasterPos.GetPositionZ();
+        tmap = f->flightMasterPos.GetMapId();
+    }
+    if (tmap != bot->GetMapId() || (!tx && !ty))
+        return;
+    if (WovRealNear(tmap, bot->GetPositionX(), bot->GetPositionY(), 150.0f) || WovRealNear(tmap, tx, ty, 150.0f))
+        return;
+    LOG_INFO("playerbots", "WoV unstick: {} ({}) {:.0f} yd", bot->GetName(), why, bot->GetExactDist(tx, ty, tz));
+    g_wovStill.erase(bot->GetGUID().GetCounter());
+    bot->NearTeleportTo(tx + frand(-2.0f, 2.0f), ty + frand(-2.0f, 2.0f), tz + 0.5f, bot->GetOrientation());
+}
+
 void WovSayChannel(Player* bot, std::string const& text, bool alsoDefense)
 {
     PlayerbotAI* ai = GET_PLAYERBOT_AI(bot);
@@ -749,6 +801,9 @@ void WovWar_Tick(time_t now)
                     else
                         ai->rpgInfo.ChangeToGoGrind(dest);
                 }
+                if (ai && p->IsAlive() && !p->IsInFlight() && !p->IsInCombat() && !p->GetGroup() && d > 70.0f &&
+                    WovStuck(p, now, 120))
+                    WovUnstick(p, ai, dest, "war");
                 ++it;
             }
         }
@@ -2018,6 +2073,46 @@ void WovMarket_Tick(time_t now)
     }
     if (g_wovWealthEnable)
         WovWealthTick();
+    // AiPlayerbot.WoV.Debug.Bots = "Name1,Name2": log what these bots are doing every 10 s (reload config to change)
+    {
+        static time_t dbgCfgT = 0;
+        static std::vector<std::string> dbgNames;
+        if (now >= dbgCfgT + 60)
+        {
+            dbgCfgT = now;
+            dbgNames.clear();
+            std::string list = sConfigMgr->GetOption<std::string>("AiPlayerbot.WoV.Debug.Bots", "");
+            size_t p = 0;
+            while (p < list.size())
+            {
+                size_t q = list.find(',', p);
+                std::string n = list.substr(p, q == std::string::npos ? std::string::npos : q - p);
+                n.erase(0, n.find_first_not_of(' '));
+                n.erase(n.find_last_not_of(' ') + 1);
+                if (!n.empty())
+                    dbgNames.push_back(n);
+                if (q == std::string::npos)
+                    break;
+                p = q + 1;
+            }
+        }
+        for (std::string const& n : dbgNames)
+        {
+            Player* d = ObjectAccessor::FindPlayerByName(n, false);
+            PlayerbotAI* dai = d ? GET_PLAYERBOT_AI(d) : nullptr;
+            if (!d || !dai)
+                continue;
+            std::string strat;
+            for (std::string const& st : dai->GetStrategies(BOT_STATE_NON_COMBAT))
+                strat += st + " ";
+            LOG_INFO("playerbots", "WoV debug {}: rpg {} pos {:.0f},{:.0f},{:.0f} area {} moving {} motion {} combat {} form {} "
+                     "group {} master {} | {}", d->GetName(), uint32(dai->rpgInfo.GetStatus()), d->GetPositionX(),
+                     d->GetPositionY(), d->GetPositionZ(), d->GetAreaId(), d->isMoving(),
+                     uint32(d->GetMotionMaster()->GetCurrentMovementGeneratorType()), d->IsInCombat(),
+                     uint32(d->GetShapeshiftForm()), d->GetGroup() != nullptr,
+                     dai->GetMaster() ? dai->GetMaster()->GetName() : "-", strat);
+        }
+    }
     if (!g_wovMarketEnable)
         return;
     WovAuctioneersLoad();
@@ -2110,6 +2205,9 @@ void WovMarket_Tick(time_t now)
         }
         if (bot->IsInFlight() || ai->rpgInfo.GetStatus() == RPG_TRAVEL_FLIGHT || !bot->IsAlive() || bot->IsInCombat())
         {
+            if (!bot->IsInFlight() && bot->IsAlive() && !bot->IsInCombat() && ai->rpgInfo.GetStatus() == RPG_TRAVEL_FLIGHT &&
+                WovStuck(bot, now, 90))
+                WovUnstick(bot, ai, WorldPosition(t.map, t.x, t.y, t.z), "market flight");
             ++it;
             continue;
         }
@@ -2132,6 +2230,8 @@ void WovMarket_Tick(time_t now)
             {
                 if (ai->rpgInfo.GetStatus() != RPG_GO_CAMP)
                     ai->rpgInfo.ChangeToGoCamp(WorldPosition(t.map, t.x, t.y, t.z));
+                else if (WovStuck(bot, now, 120))
+                    WovUnstick(bot, ai, WorldPosition(t.map, t.x, t.y, t.z), "market walk");
             }
             else
             {
