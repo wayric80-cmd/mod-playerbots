@@ -5,6 +5,7 @@
  */
 
 #include "PlayerbotAI.h"
+bool WovForceActive(uint32 low);  // wov: RandomPlayerbotMgr.cpp
 #include "AiFactory.h"
 #include "BudgetValues.h"
 #include "ChannelMgr.h"
@@ -4667,6 +4668,10 @@ bool PlayerbotAI::AllowActive(ActivityType activityType)
 
     // bot is waiting in a BG queue — stay active to speed up join
     if (bot->InBattlegroundQueue())
+        return true;
+
+    // wov: on an errand (auction house trip, Call to Arms) — keep going although no real player is near
+    if (WovForceActive(bot->GetGUID().GetCounter()))
         return true;
 
     // bot is in a guild that contains a real player

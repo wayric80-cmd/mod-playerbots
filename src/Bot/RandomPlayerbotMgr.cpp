@@ -1743,9 +1743,11 @@ std::vector<WovAuctioneer> g_wovAuctioneers;
 std::mutex g_wovAhMutex;
 std::unordered_map<AuctionHouseObject const*, std::vector<WovAhLot>> g_wovAhLots;
 std::unordered_map<uint32, time_t> g_wovAhBought;  // bot -> last purchase (under g_wovAhMutex)
+std::unordered_map<uint32, uint32> g_wovAhBoughtEntry;  // bot -> item entry it bought (under g_wovAhMutex)
 std::unordered_map<uint32, WovTrip> g_wovTrips;     // world thread only
 std::mutex g_wovReachMutex;
 std::vector<WovReach> g_wovReached;
+std::vector<std::tuple<uint32, uint32, time_t>> g_wovEquipLater;  // (bot, item low guid, when): world thread
 std::atomic<bool> g_wovMarketEnable{false};
 std::atomic<uint32> g_wovMarketBudgetPct{35};
 uint32 g_wovMarketTrips = 40;  // expected trips per bot per hour, in hundredths
@@ -1865,6 +1867,7 @@ void WovAhBuy(PlayerbotAI* ai, Player* bot, Creature* auctioneer)
     {
         std::lock_guard<std::mutex> lock(g_wovAhMutex);
         g_wovAhBought[low] = now;
+        g_wovAhBoughtEntry[low] = best->entry;
     }
     WorldPacket* p = new WorldPacket(CMSG_AUCTION_PLACE_BID);  // QueuePacket takes ownership
     *p << auctioneer->GetGUID();
@@ -1886,6 +1889,7 @@ void WovTakeMail(Player* bot, ObjectGuid mailbox)
             continue;
         for (MailItemInfo const& it : m->items)
         {
+            g_wovEquipLater.emplace_back(bot->GetGUID().GetCounter(), it.item_guid, time(nullptr) + 5);
             WorldPacket* p = new WorldPacket(CMSG_MAIL_TAKE_ITEM);
             *p << mailbox << m->messageID << it.item_guid;
             bot->GetSession()->QueuePacket(p);
@@ -1957,6 +1961,8 @@ bool WovTripStart(Player* bot, PlayerbotAI* ai, time_t now)
         ai->rpgInfo.ChangeToTravelFlight(fm->templateEntry, fm->pos, path);
     }
     g_wovTrips[bot->GetGUID().GetCounter()] = t;
+    LOG_INFO("playerbots", "WoV market trip: {} (lvl {}) heads to the auction house, {:.0f} yd{}", bot->GetName(),
+             bot->GetLevel(), bestD, bestD > 600.0f ? " by air" : "");
     return true;
 }
 
@@ -1991,6 +1997,9 @@ void WovWealthTick()
     }
 }
 
+std::mutex g_wovForceMutex;
+std::unordered_set<uint32> g_wovForce;  // bots on an errand: kept active although no real player is near
+
 void WovMarket_Tick(time_t now)
 {
     WovMarketConfig(now);
@@ -1998,6 +2007,15 @@ void WovMarket_Tick(time_t now)
     if (now < last + 10)
         return;
     last = now;
+    {
+        std::unordered_set<uint32> force;
+        for (auto const& [low, t] : g_wovTrips)
+            force.insert(low);
+        for (auto const& [low, sk] : g_wovBotSk)
+            force.insert(low);
+        std::lock_guard<std::mutex> lock(g_wovForceMutex);
+        g_wovForce.swap(force);
+    }
     if (g_wovWealthEnable)
         WovWealthTick();
     if (!g_wovMarketEnable)
@@ -2009,6 +2027,39 @@ void WovMarket_Tick(time_t now)
         WovAhSnapshot();
     }
 
+    // items taken from the mail: tell the bot it got them, so its own AI considers equipping them
+    for (size_t i = 0; i < g_wovEquipLater.size();)
+    {
+        auto [botLow, itemLow, when] = g_wovEquipLater[i];
+        if (now < when)
+        {
+            ++i;
+            continue;
+        }
+        if (Player* bot = ObjectAccessor::FindPlayerByLowGUID(botLow))
+            if (Item* item = bot->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(itemLow)))
+            {
+                bool bought = false;
+                {
+                    std::lock_guard<std::mutex> lock(g_wovAhMutex);
+                    auto b = g_wovAhBoughtEntry.find(botLow);
+                    if (b != g_wovAhBoughtEntry.end() && b->second == item->GetEntry())
+                    {
+                        bought = true;
+                        g_wovAhBoughtEntry.erase(b);
+                    }
+                }
+                if (bought && !item->IsEquipped())
+                {
+                    WorldPacket* p = new WorldPacket(CMSG_AUTOEQUIP_ITEM);  // put on what it bought, as a player would
+                    *p << uint8(item->GetBagSlot()) << uint8(item->GetSlot());
+                    bot->GetSession()->QueuePacket(p);
+                    LOG_INFO("playerbots", "WoV market: {} puts on {}", bot->GetName(), item->GetTemplate()->Name1);
+                }
+            }
+        g_wovEquipLater.erase(g_wovEquipLater.begin() + i);
+    }
+
     std::vector<WovReach> reached;
     {
         std::lock_guard<std::mutex> lock(g_wovReachMutex);
@@ -2018,6 +2069,8 @@ void WovMarket_Tick(time_t now)
     {
         Player* bot = ObjectAccessor::FindPlayerByLowGUID(r.low);
         auto t = g_wovTrips.find(r.low);
+        if (r.kind == 1 && bot)
+            LOG_INFO("playerbots", "WoV market trip: {} at the auctioneer", bot->GetName());
         if (r.kind == 1 && t != g_wovTrips.end() && t->second.phase == 1)
         {
             t->second.phase = 2;
@@ -2032,14 +2085,26 @@ void WovMarket_Tick(time_t now)
         }
     }
 
+    static time_t lastDump = 0;
+    bool dump = now >= lastDump + 120;
+    if (dump)
+        lastDump = now;
     for (auto it = g_wovTrips.begin(); it != g_wovTrips.end();)
     {
         WovTrip& t = it->second;
+        if (dump)
+            if (Player* db = ObjectAccessor::FindPlayerByLowGUID(it->first))
+                if (PlayerbotAI* dai = GET_PLAYERBOT_AI(db))
+                    LOG_INFO("playerbots", "WoV market dbg: {} phase {} dist {:.0f} status {} flying {} moving {} age {}",
+                             db->GetName(), t.phase, db->GetMapId() == t.map ? db->GetExactDist(t.x, t.y, t.z) : -1.0f,
+                             uint32(dai->rpgInfo.GetStatus()), db->IsInFlight(), db->isMoving(), uint32(now - t.start));
         Player* bot = ObjectAccessor::FindPlayerByLowGUID(it->first);
         PlayerbotAI* ai = bot ? GET_PLAYERBOT_AI(bot) : nullptr;
-        if (!bot || !ai || !bot->IsInWorld() || now > t.start + 1500 || bot->GetGroup() || bot->InBattleground() ||
+        if (!bot || !ai || !bot->IsInWorld() || now > t.start + 2400 || bot->GetGroup() || bot->InBattleground() ||
             g_wovBotSk.count(it->first))
         {
+            if (bot)
+                LOG_INFO("playerbots", "WoV market trip: {} gave up (phase {})", bot->GetName(), t.phase);
             it = g_wovTrips.erase(it);
             continue;
         }
@@ -2050,14 +2115,16 @@ void WovMarket_Tick(time_t now)
         }
         if (bot->GetMapId() != t.map)
         {
+            LOG_INFO("playerbots", "WoV market trip: {} left the map", bot->GetName());
             it = g_wovTrips.erase(it);
             continue;
         }
         if (t.phase == 1)
         {
             float d = bot->GetExactDist(t.x, t.y, t.z);
-            if (d > 700.0f)
+            if (d > 1500.0f)
             {
+                LOG_INFO("playerbots", "WoV market trip: {} landed too far away ({:.0f} yd)", bot->GetName(), d);
                 it = g_wovTrips.erase(it);  // the flight did not bring it here
                 continue;
             }
@@ -2073,6 +2140,7 @@ void WovMarket_Tick(time_t now)
                         t.target = c->GetGUID();
                 if (!t.target || !WovAimAt(bot, ai, t.target))
                 {
+                    LOG_INFO("playerbots", "WoV market trip: {} cannot find or aim at the auctioneer", bot->GetName());
                     it = g_wovTrips.erase(it);
                     continue;
                 }
@@ -2081,6 +2149,8 @@ void WovMarket_Tick(time_t now)
         else if (t.phase == 2 && now >= t.phaseT + 8)
         {
             GameObject* mb = bot->FindNearestGameObjectOfType(GAMEOBJECT_TYPE_MAILBOX, 150.0f);
+            LOG_INFO("playerbots", "WoV market trip: {} to the mailbox ({:.0f} yd, {} mails)", bot->GetName(),
+                     mb ? bot->GetExactDist(mb) : -1.0f, bot->GetMailSize());
             if (!mb)
             {
                 it = g_wovTrips.erase(it);
@@ -2095,10 +2165,22 @@ void WovMarket_Tick(time_t now)
         {
             if (!bot->GetMailSize() || now > t.phaseT + 120)
             {
+                LOG_INFO("playerbots", "WoV market trip: {} leaves the mailbox ({} mails, {} s, status {})", bot->GetName(),
+                         bot->GetMailSize(), uint32(now - t.phaseT), uint32(ai->rpgInfo.GetStatus()));
                 it = g_wovTrips.erase(it);  // nothing to fetch, or could not get there
                 continue;
             }
-            WovAimAt(bot, ai, t.target);
+            GameObject* mb = ObjectAccessor::GetGameObject(*bot, t.target);
+            if (mb && bot->GetExactDist(mb) < 4.5f)
+            {
+                WovTakeMail(bot, t.target);  // standing at it; the npc-reach hook did not fire
+                it = g_wovTrips.erase(it);
+                continue;
+            }
+            if (mb && bot->GetExactDist(mb) < 25.0f && now > t.phaseT + 30 && !bot->isMoving())
+                bot->GetMotionMaster()->MovePoint(0, mb->GetPositionX(), mb->GetPositionY(), mb->GetPositionZ());
+            else
+                WovAimAt(bot, ai, t.target);
         }
         ++it;
     }
@@ -2151,6 +2233,13 @@ uint32 WovMarketPriceOf(uint32 entry, TeamId team)
         return 0;
     std::nth_element(prices.begin(), prices.begin() + prices.size() / 2, prices.end());
     return prices[prices.size() / 2];
+}
+
+// Called from PlayerbotAI::AllowActive (map threads).
+bool WovForceActive(uint32 low)
+{
+    std::lock_guard<std::mutex> lock(g_wovForceMutex);
+    return g_wovForce.count(low) > 0;
 }
 
 // Called from NewRpgWanderNpcAction when a random bot reaches an npc or a game object (map thread).
