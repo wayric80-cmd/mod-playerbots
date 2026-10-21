@@ -280,11 +280,30 @@ uint32 g_wovSkSeq = 0;
 std::unordered_map<uint32, uint32> g_wovBotSk;
 struct WovCool { uint32 map; float x, y; time_t until; };
 std::vector<WovCool> g_wovCool;  // places where a fight just ended: no new one there for a while
-// Graveyard camping: a bot killed twice by players within 10 minutes gives up like a player would -- once it is
+// Last resort against graveyard camping: a bot killed 4 times by players within 15 minutes gives up like a player would -- once it is
 // alive again it hearths home and stays out of Call to Arms for half an hour.
 std::unordered_map<uint32, std::vector<time_t>> g_wovPvpDeaths;
 std::unordered_set<uint32> g_wovHearth;
 std::unordered_map<uint32, time_t> g_wovNoRecruit;
+// No fights next to a graveyard: the dead would come back right into it (graveyard camping).
+float const kWovGyClear = 250.0f;
+bool WovNearGraveyard(uint32 map, float x, float y)
+{
+    static std::vector<std::tuple<uint32, float, float>> gys;
+    static bool loaded = false;
+    if (!loaded)
+    {
+        loaded = true;
+        if (QueryResult r = WorldDatabase.Query("SELECT Map, x, y FROM game_graveyard WHERE Map IN (0, 1)"))
+            do
+                gys.emplace_back(r->Fetch()[0].Get<uint32>(), r->Fetch()[1].Get<float>(), r->Fetch()[2].Get<float>());
+            while (r->NextRow());
+    }
+    for (auto const& [m, gx, gy] : gys)
+        if (m == map && std::hypot(gx - x, gy - y) < kWovGyClear)
+            return true;
+    return false;
+}
 
 bool g_wovWarEnable = false;
 uint32 g_wovWarMaxPerSide = 30, g_wovWarMaxActive = 2, g_wovWarSparkKills = 2, g_wovWarSparkWindow = 300,
@@ -587,7 +606,7 @@ void WovStartRaid(time_t now)
     std::vector<WovHotspot*> options;
     for (WovHotspot& h : g_wovHot)
     {
-        if (!h.loaded)
+        if (!h.loaded || WovNearGraveyard(h.map, h.x, h.y))
             continue;
         TeamId att = WovOther(h.owner);
         uint32 attackers = 0, defenders = 0;
@@ -636,9 +655,9 @@ void WovHandleKill(WovKill const& k, time_t now)
     if (k.victimBot)
     {
         auto& d = g_wovPvpDeaths[k.victimLow];
-        d.erase(std::remove_if(d.begin(), d.end(), [now](time_t t) { return t + 600 < now; }), d.end());
+        d.erase(std::remove_if(d.begin(), d.end(), [now](time_t t) { return t + 900 < now; }), d.end());
         d.push_back(now);
-        if (d.size() >= 2)
+        if (d.size() >= 4)
         {
             g_wovHearth.insert(k.victimLow);
             g_wovNoRecruit[k.victimLow] = now + 1800;
@@ -652,7 +671,7 @@ void WovHandleKill(WovKill const& k, time_t now)
         bool sameReal = k.real && ((!k.killerBot && s.realLows.count(k.killerLow)) || (!k.victimBot && s.realLows.count(k.victimLow)));
         if (d < 300.0f || (sameReal && d < 1500.0f))
         {
-            if (sameReal || k.real)
+            if ((sameReal || k.real) && !WovNearGraveyard(k.map, k.x, k.y))
             {
                 s.x = k.x;  // the fight moves with the real player
                 s.y = k.y;
@@ -683,6 +702,8 @@ void WovHandleKill(WovKill const& k, time_t now)
     for (WovCool const& c : g_wovCool)
         if (c.map == k.map && now < c.until && std::hypot(c.x - k.x, c.y - k.y) < 800.0f)
             return;  // a fight just ended here; the place cools down first
+    if (WovNearGraveyard(k.map, k.x, k.y))
+        return;
     if (g_wovSk.size() >= g_wovWarMaxActive + (k.real ? 2 : 0))
         return;
     WovSkirmish s;
@@ -787,7 +808,7 @@ void WovWar_Tick(time_t now)
                 }
             g_wovBotSk.erase(sk);
         }
-        LOG_INFO("playerbots", "WoV war: {} died twice to players, hearths home", p->GetName());
+        LOG_INFO("playerbots", "WoV war: {} died 4 times to players, hearths home", p->GetName());
         if (PlayerbotAI* ai = GET_PLAYERBOT_AI(p))
             ai->rpgInfo.ChangeToIdle();
         p->TeleportTo(p->m_homebindMapId, p->m_homebindX, p->m_homebindY, p->m_homebindZ, p->GetOrientation());
