@@ -97,6 +97,7 @@ public:
         creators["reach party member to heal"] = &ActionContext::reach_party_member_to_heal;
         creators["reach party member to resurrect"] = &ActionContext::reach_party_member_to_resurrect;
         creators["flee"] = &ActionContext::flee;
+        creators["wov pvp move"] = &ActionContext::wov_pvp_move;
         creators["flee with pet"] = &ActionContext::flee_with_pet;
         creators["avoid aoe"] = &ActionContext::avoid_aoe;
         creators["combat formation move"] = &ActionContext::combat_formation_move;
@@ -314,6 +315,7 @@ private:
     static Action* ReachMelee(PlayerbotAI* botAI) { return new ReachMeleeAction(botAI); }
     static Action* reach_party_member_to_heal(PlayerbotAI* botAI) { return new ReachPartyMemberToHealAction(botAI); }
     static Action* reach_party_member_to_resurrect(PlayerbotAI* botAI) { return new ReachPartyMemberToResurrectAction(botAI); }
+    static Action* wov_pvp_move(PlayerbotAI* ai) { return new WovPvpMoveAction(ai); }
     static Action* flee(PlayerbotAI* botAI) { return new FleeAction(botAI); }
     static Action* flee_with_pet(PlayerbotAI* botAI) { return new FleeWithPetAction(botAI); }
     static Action* avoid_aoe(PlayerbotAI* botAI) { return new AvoidAoeAction(botAI); }

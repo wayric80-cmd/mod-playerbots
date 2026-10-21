@@ -144,6 +144,7 @@ public:
     PlayerbotsPlayerScript() : PlayerScript("PlayerbotsPlayerScript", {
         PLAYERHOOK_ON_LOGIN,
         PLAYERHOOK_ON_PVP_KILL,
+        PLAYERHOOK_ON_UPDATE_SKILL,
         PLAYERHOOK_ON_AFTER_UPDATE,
         PLAYERHOOK_ON_BEFORE_CRITERIA_PROGRESS,
         PLAYERHOOK_ON_BEFORE_ACHI_COMPLETE,
@@ -156,6 +157,27 @@ public:
         PLAYERHOOK_CAN_GROUP_INVITE,
         PLAYERHOOK_ON_SEND_LIST_INVENTORY
     }) {}
+
+    // WoV: opt-in test telemetry only, never sends chat or changes a skill.
+    void OnPlayerUpdateSkill(Player* player, uint32 skillId, uint32 value, uint32 /*max*/,
+                             uint32 /*step*/, uint32 newValue) override
+    {
+        if (!sConfigMgr->GetOption<bool>("AiPlayerbot.WoV.Profession.Debug", false) ||
+            !sRandomPlayerbotMgr.IsRandomBot(player) || newValue <= value)
+            return;
+        switch (skillId)
+        {
+            case SKILL_ALCHEMY: case SKILL_BLACKSMITHING: case SKILL_ENCHANTING:
+            case SKILL_ENGINEERING: case SKILL_HERBALISM: case SKILL_LEATHERWORKING:
+            case SKILL_MINING: case SKILL_SKINNING: case SKILL_TAILORING:
+            case SKILL_FIRST_AID: case SKILL_COOKING: case SKILL_FISHING:
+            case SKILL_INSCRIPTION: case SKILL_JEWELCRAFTING:
+                LOG_INFO("playerbots", "WoV profession: {} skill {} {} -> {} delta {}",
+                         player->GetName(), skillId, value, newValue, newValue - value);
+                break;
+            default: break;
+        }
+    }
 
     // Local patch (custom-wow, plans/25 item 65). Bots sell their greys when the person they are
     // travelling with opens a merchant window.

@@ -9,6 +9,8 @@
 
 void CombatStrategy::InitTriggers(std::vector<TriggerNode*>& triggers)
 {
+    triggers.push_back(new TriggerNode("timer", { NextAction("wov pvp move", ACTION_MOVE + 1) }));
+
     triggers.push_back(
         new TriggerNode(
             "enemy out of spell",

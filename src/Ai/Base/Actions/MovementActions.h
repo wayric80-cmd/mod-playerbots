@@ -83,6 +83,18 @@ private:
     void DoMovePoint(Unit* unit, float x, float y, float z, bool generatePath, bool backwards);
 };
 
+// WoV open-world PvP positioning; normal movement/path checks stay authoritative.
+class WovPvpMoveAction : public MovementAction
+{
+public:
+    WovPvpMoveAction(PlayerbotAI* ai) : MovementAction(ai, "wov pvp move") {}
+    bool isUseful() override;
+    bool Execute(Event event) override;
+private:
+    uint32 lastAttempt = 0;
+    uint32 interval = 3000;
+};
+
 class FleeAction : public MovementAction
 {
 public:

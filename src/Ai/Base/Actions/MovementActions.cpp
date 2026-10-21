@@ -1,3 +1,7 @@
+#include "WovPvpMotion.h"
+#include "Config.h"
+#include "Log.h"
+#include "RandomPlayerbotMgr.h"
 /*
  * This file is part of the mod-playerbots module for AzerothCore. See AUTHORS file for Copyright
  * information; released under GNU GPL v2 license, redistribute/modify under version 2 of the License,
@@ -2937,3 +2941,114 @@ bool MoveAwayFromPlayerWithDebuffAction::Execute(Event /*event*/)
 }
 
 bool MoveAwayFromPlayerWithDebuffAction::isPossible() { return bot->CanFreeMove(); }
+
+// WoV: deliberately scoped and paced. Never move a caster during a cast, a rooted
+// player, a stay-command bot, or a bot fighting an NPC. The existing MoveTo path
+// layer validates every destination; no teleporting or direct coordinate writes.
+bool WovPvpMoveAction::isUseful()
+{
+    if (!sConfigMgr->GetOption<bool>("AiPlayerbot.WoV.PvpMovement.Enable", false) ||
+        uint32(getMSTime() - lastAttempt) < interval)
+        return false;
+    uint32 zone = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.PvpMovement.Zone", 267);
+    if ((zone && bot->GetZoneId() != zone) || !sRandomPlayerbotMgr.IsRandomBot(bot) ||
+        IsSelfBot(bot) || !bot->IsAlive() || !bot->IsInCombat() || bot->IsInFlight() ||
+        bot->IsMounted() || bot->GetVehicle() || bot->IsBeingTeleported() ||
+        !bot->GetMap() || bot->GetMap()->Instanceable() || bot->IsNonMeleeSpellCast(false) ||
+        botAI->HasStrategy("stay", BOT_STATE_COMBAT) || !IsMovingAllowed())
+        return false;
+    Unit* target = AI_VALUE(Unit*, "current target");
+    return target && target->GetTypeId() == TYPEID_PLAYER && target->IsAlive() &&
+        target->GetMap() == bot->GetMap() && bot->IsValidAttackTarget(target) &&
+        bot->GetDistance2d(target) <= 35.0f;
+}
+
+bool WovPvpMoveAction::Execute(Event /*event*/)
+{
+    if (!isUseful())
+        return false;
+    lastAttempt = getMSTime();
+    interval = urand(2500, 6000);
+    Unit* target = AI_VALUE(Unit*, "current target");
+    if (!target)
+        return false;
+    float distance = std::hypot(bot->GetPositionX() - target->GetPositionX(),
+                                bot->GetPositionY() - target->GetPositionY());
+    bool ranged = PlayerbotAI::IsRanged(bot, true);
+    Unit* crowd = nullptr;
+    for (ObjectGuid const& guid : AI_VALUE(GuidVector, "nearest friendly players"))
+    {
+        Unit* other = botAI->GetUnit(guid);
+        if (other && other != bot && other->IsAlive() && other->GetMap() == bot->GetMap() &&
+            bot->GetDistance2d(other) < 3.0f)
+        {
+            crowd = other;
+            break;
+        }
+    }
+    using WovPvp::Intent;
+    Intent intent = WovPvp::Choose(bot->GetHealthPct(), ranged, distance, crowd != nullptr,
+                                   target->IsNonMeleeSpellCast(false));
+    if (intent == Intent::None)
+        return false;
+
+    float bx = bot->GetPositionX(), by = bot->GetPositionY(), bz = bot->GetPositionZ();
+    float away = target->GetAngle(bot);
+    float side = urand(0, 1) ? 1.0f : -1.0f;
+    float chosenX = 0, chosenY = 0, chosenZ = 0, best = -100000.0f;
+    bool found = false, foundCover = false;
+    // A handful of local candidates gives a retreat a chance to break line of
+    // sight around real cover, without an expensive map-wide cover search.
+    for (uint32 i = 0; i < 8; ++i)
+    {
+        float x, y, z = bz;
+        if (intent == Intent::Flank)
+        {
+            float radius = ranged ? std::clamp(distance, 14.0f, 24.0f) : std::clamp(distance, 2.0f, 3.5f);
+            float angle = away + side * (0.25f + 0.08f * i);
+            x = target->GetPositionX() + std::cos(angle) * radius;
+            y = target->GetPositionY() + std::sin(angle) * radius;
+        }
+        else
+        {
+            float angle = intent == Intent::Spread && crowd ? crowd->GetAngle(bot) : away;
+            angle += side * (float(i) - 3.0f) * 0.25f;
+            float step = intent == Intent::Spread ? 4.0f : intent == Intent::Retreat ? 8.0f : 6.0f;
+            x = bx + std::cos(angle) * step;
+            y = by + std::sin(angle) * step;
+        }
+        if (!bot->GetMap()->CheckCollisionAndGetValidCoords(bot, bx, by, bz, x, y, z, false) ||
+            std::fabs(z - bz) > 2.5f || std::hypot(x - bx, y - by) < 1.0f)
+            continue;
+        float newDistance = std::hypot(x - target->GetPositionX(), y - target->GetPositionY());
+        if ((intent == Intent::Flank || intent == Intent::Spread) && newDistance > (ranged ? 28.0f : 6.0f))
+            continue;
+        bool cover = !target->IsWithinLOS(x, y, z + bot->GetCollisionHeight());
+        if ((intent == Intent::Flank || intent == Intent::Spread) && cover)
+            continue;
+        if ((intent == Intent::Kite || intent == Intent::Retreat) && newDistance <= distance + 1.0f)
+            continue;
+        if (intent == Intent::Cover && !cover)
+            continue;
+        float score = -std::hypot(x - bx, y - by);
+        if (intent == Intent::Retreat || intent == Intent::Kite)
+            score = newDistance + (cover ? 20.0f : 0.0f);
+        if (crowd && intent == Intent::Spread)
+            score = std::hypot(x - crowd->GetPositionX(), y - crowd->GetPositionY());
+        if (score > best)
+        {
+            best = score; chosenX = x; chosenY = y; chosenZ = z; found = true; foundCover = cover;
+        }
+    }
+    if (!found || !MoveTo(bot->GetMapId(), chosenX, chosenY, chosenZ, false, false, true, false,
+                          MovementPriority::MOVEMENT_COMBAT, true, intent == Intent::Kite))
+        return false;
+    if (sConfigMgr->GetOption<bool>("AiPlayerbot.WoV.PvpMovement.Debug", false))
+    {
+        char const* labels[] = {"none", "flank", "kite", "spread", "retreat", "cover"};
+        LOG_INFO("playerbots", "WoV PvP move: {} zone {} {} target {} distance {:.1f} health {:.0f}% cover {} step {:.1f}",
+            bot->GetName(), bot->GetZoneId(), labels[static_cast<int>(intent)], target->GetName(), distance,
+            bot->GetHealthPct(), foundCover, std::hypot(chosenX - bx, chosenY - by));
+    }
+    return true;
+}
