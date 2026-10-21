@@ -853,11 +853,19 @@ void WovWar_Tick(time_t now)
                         target = 0;
                     want = target > have ? std::min<uint32>(target - have, 10) : 0;
                 }
+                // A side that is only being farmed stops feeding bodies in one by one, and nobody trickles in
+                // alone against a crowd: they come as a group or not at all.
+                uint32 lostT = s.kills[1 - t], madeT = s.kills[t];
+                if (lostT > madeT + 12 || s.members[t].size() >= g_wovWarMaxPerSide * 2)
+                    want = 0;
+                else if (want && want < 4 && nearCount[t] * 2 < nearCount[1 - t])
+                    want = 0;
                 WovRecruit(s, team, want);
             }
         }
 
-        bool timeout = now > s.start + time_t(g_wovWarMaxMinutes) * 60;
+        bool timeout = now > s.start + time_t(g_wovWarMaxMinutes) * 60 || s.kills[0] + s.kills[1] >= 80 ||
+                       std::max(s.kills[0], s.kills[1]) >= std::min(s.kills[0], s.kills[1]) + 30;  // over: rout or bloodbath
         bool idle = now > s.lastKill + time_t(g_wovWarIdleEnd) && now > s.start + 300;
         if (timeout || idle)
         {
