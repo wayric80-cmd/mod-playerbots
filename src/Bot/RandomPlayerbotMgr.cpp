@@ -606,8 +606,8 @@ void WovStartRaid(time_t now)
     std::vector<WovHotspot*> options;
     for (WovHotspot& h : g_wovHot)
     {
-        if (!h.loaded || WovNearGraveyard(h.map, h.x, h.y))
-            continue;
+        if (!h.loaded)
+            continue;  // town raids are allowed next to a graveyard (kill caps and the time limit end them)
         TeamId att = WovOther(h.owner);
         uint32 attackers = 0, defenders = 0;
         for (auto const& [guid, bot] : sRandomPlayerbotMgr.GetAllBots())
