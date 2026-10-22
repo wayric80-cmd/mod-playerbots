@@ -971,7 +971,7 @@ WorldPosition NewRpgBaseAction::SelectRandomGrindPos(Player* bot)
         hiRange /= 3;
         loRange /= 3;
     }
-    std::vector<WorldLocation> lo_prepared_locs, hi_prepared_locs;
+    std::vector<WorldLocation> lo_prepared_locs, hi_prepared_locs, neighboring_locs;
 
     bool inCity = false;
     if (AreaTableEntry const* zone = sAreaTableStore.LookupEntry(bot->GetZoneId()))
@@ -990,7 +990,11 @@ WorldPosition NewRpgBaseAction::SelectRandomGrindPos(Player* bot)
 
         if (!inCity && bot->GetMap()->GetZoneId(bot->GetPhaseMask(), loc.GetPositionX(), loc.GetPositionY(),
                                                 loc.GetPositionZ()) != bot->GetZoneId())
+        {
+            // Keep nearby destinations across a zone border as a last resort.
+            neighboring_locs.push_back(loc);
             continue;
+        }
 
         if (bot->GetExactDist(loc) < hiRange)
         {
@@ -1001,6 +1005,13 @@ WorldPosition NewRpgBaseAction::SelectRandomGrindPos(Player* bot)
         {
             lo_prepared_locs.push_back(loc);
         }
+    }
+    if (lo_prepared_locs.empty())
+    {
+        lo_prepared_locs = neighboring_locs;
+        for (auto const& loc : neighboring_locs)
+            if (bot->GetExactDist(loc) < hiRange)
+                hi_prepared_locs.push_back(loc);
     }
     WorldPosition dest{};
     if (urand(1, 100) <= 50 && !hi_prepared_locs.empty())
@@ -1031,7 +1042,7 @@ WorldPosition NewRpgBaseAction::SelectRandomCampPos(Player* bot)
             inCity = true;
     }
 
-    std::vector<WorldLocation> prepared_locs;
+    std::vector<WorldLocation> prepared_locs, neighboring_locs;
     for (auto& loc : locs)
     {
         if (bot->GetMapId() != loc.GetMapId())
@@ -1046,10 +1057,16 @@ WorldPosition NewRpgBaseAction::SelectRandomCampPos(Player* bot)
 
         if (!inCity && bot->GetMap()->GetZoneId(bot->GetPhaseMask(), loc.GetPositionX(), loc.GetPositionY(),
                                                 loc.GetPositionZ()) != bot->GetZoneId())
+        {
+            // Keep nearby destinations across a zone border as a last resort.
+            neighboring_locs.push_back(loc);
             continue;
+        }
 
         prepared_locs.push_back(loc);
     }
+    if (prepared_locs.empty())
+        prepared_locs = neighboring_locs;
     WorldPosition dest{};
     if (!prepared_locs.empty())
     {
