@@ -2204,6 +2204,51 @@ void WovWealthTick()
 std::mutex g_wovForceMutex;
 std::unordered_set<uint32> g_wovForce;  // bots on an errand: kept active although no real player is near
 
+// Recover autonomous leaders stranded in an expired rest, without teleporting a crowd.
+void WovCrowdRestRecovery()
+{
+    if (!sConfigMgr->GetOption<bool>("AiPlayerbot.WoV.CrowdRestRecovery.Enable", true))
+        return;
+    auto const& bots = sRandomPlayerbotMgr.GetAllBots();
+    for (auto const& [guid, bot] : bots)
+    {
+        PlayerbotAI* ai = bot ? GET_PLAYERBOT_AI(bot) : nullptr;
+        if (!ai || !bot->GetSession() || !bot->IsInWorld() || !bot->IsAlive() || bot->IsInCombat() || bot->isMoving() ||
+            bot->IsBeingTeleported() || bot->GetSession()->IsLoggingOut() || bot->IsInFlight() ||
+            bot->InBattleground() || bot->InBattlegroundQueue() || !WorldPosition(bot).isOverworld() ||
+            bot->IsNonMeleeSpellCast(false) || ai->HasStrategy("stay", BOT_STATE_NON_COMBAT) ||
+            ai->rpgInfo.GetStatus() != RPG_REST || !ai->rpgInfo.HasStatusPersisted(120000) ||
+            g_wovTrips.count(guid.GetCounter()) || g_wovBotSk.count(guid.GetCounter()))
+            continue;
+        Group* group = bot->GetGroup();
+        if ((group && !group->IsLeader(bot->GetGUID())) ||
+            (ai->GetMaster() && ai->GetMaster() != bot))
+            continue;
+        bool humanGroup = false;
+        if (group)
+            for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+                if (Player* member = ref->GetSource())
+                    if (!member->GetSession() || !member->GetSession()->IsBot() ||
+                        (GET_PLAYERBOT_AI(member) && GET_PLAYERBOT_AI(member)->HasGameClientMaster()))
+                        humanGroup = true;
+        if (humanGroup)
+            continue;
+        unsigned nearby = 0;
+        for (auto const& [otherGuid, other] : bots)
+            if (other && other != bot && other->IsInWorld() && other->IsAlive() &&
+                bot->InSamePhase(other) && other->GetMapId() == bot->GetMapId() &&
+                bot->GetExactDist(other) < 12.0f && ++nearby >= 6)
+                break;
+        if (nearby < 6)
+            continue;
+        LOG_INFO("playerbots", "WoV crowd recovery: {} expired rest in crowd; resume own activities", bot->GetName());
+        ai->Reset();
+        ai->rpgInfo.ChangeToIdle();
+        ai->ChangeStrategy("-follow,+new rpg", BOT_STATE_NON_COMBAT);
+        bot->SetStandState(UNIT_STAND_STATE_STAND);
+    }
+}
+
 void WovMarket_Tick(time_t now)
 {
     WovMarketConfig(now);
@@ -2211,6 +2256,7 @@ void WovMarket_Tick(time_t now)
     if (now < last + 10)
         return;
     last = now;
+    WovCrowdRestRecovery();
     {
         std::unordered_set<uint32> force;
         for (auto const& [low, t] : g_wovTrips)
