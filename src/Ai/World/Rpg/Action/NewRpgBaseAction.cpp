@@ -1067,6 +1067,19 @@ WorldPosition NewRpgBaseAction::SelectRandomCampPos(Player* bot)
     }
     if (prepared_locs.empty())
         prepared_locs = neighboring_locs;
+    // A level-filtered local hub list can be empty near a city/zone boundary.
+    // Walk to a friendly flight master, where ordinary level-appropriate travel can resume.
+    // This fallback never teleports and does not override an available ordinary destination.
+    if (prepared_locs.empty() && bot->GetLevel() >= 10)
+    {
+        if (auto const* fm = sTravelMgr.GetNearestFlightMasterInfo(bot))
+        {
+            float distance = bot->GetExactDist(fm->pos);
+            if (fm->taxiNodeId && fm->pos.GetMapId() == bot->GetMapId() &&
+                distance > 50.0f && distance <= 10000.0f)
+                return fm->pos;
+        }
+    }
     WorldPosition dest{};
     if (!prepared_locs.empty())
     {
