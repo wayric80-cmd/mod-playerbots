@@ -2442,7 +2442,10 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool second_chance)
         }
 
         int32 desiredQuality = itemQuality;
-        if (urand(0, 100) < 100 * sPlayerbotAIConfig.randomGearLoweringChance && desiredQuality > ITEM_QUALITY_NORMAL)
+        int32 minimumQuality = (itemQuality >= ITEM_QUALITY_UNCOMMON && level >= 20)
+                                   ? ITEM_QUALITY_UNCOMMON : ITEM_QUALITY_POOR;
+        if (urand(0, 100) < 100 * sPlayerbotAIConfig.randomGearLoweringChance &&
+            desiredQuality > std::max<int32>(ITEM_QUALITY_NORMAL, minimumQuality))
             desiredQuality--;
 
         do
@@ -2510,7 +2513,7 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool second_chance)
         // wov: from level 20, a bot asked for green-or-better gear never fills the pool with vendor whites;
         // whites outscored greens for some slots and left 50+ bots in grey/white items.
         } while (items[slot].size() < 25 &&
-                 desiredQuality-- > ((itemQuality >= ITEM_QUALITY_UNCOMMON && level >= 20) ? ITEM_QUALITY_UNCOMMON : ITEM_QUALITY_POOR));
+                 desiredQuality-- > minimumQuality);
 
         std::vector<std::pair<uint32, int32>>& ids = items[slot];
         if (ids.empty())
