@@ -83,6 +83,15 @@ bool LootRollAction::Execute(Event /*event*/)
                     break;
             }
         }
+        // wov: with a real player in the group a bot only needs real upgrades; "can wear it" is a greed
+        if (vote == NEED && usage == ITEM_USAGE_BAD_EQUIP)
+            for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+                if (Player* m = ref->GetSource())
+                    if (m != bot && m->GetSession() && !GET_PLAYERBOT_AI(m))
+                    {
+                        vote = GREED;
+                        break;
+                    }
         if (vote == NEED)
         {
             if (sPlayerbotAIConfig.lootNeedRollLevel == 0 || RollUniqueCheck(proto, bot))

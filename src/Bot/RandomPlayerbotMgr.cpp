@@ -1873,6 +1873,212 @@ void WovTogether_OnChannel(Player* player, std::string const& msg)
 }
 // ---- end wov: play together ----------------------------------------------------------------------------
 
+// ---- wov: dungeon talk --------------------------------------------------------------------------------
+// Short party lines a pug says that no model is needed for: a sorry when a bot's need beats a real player's,
+// gz on a real player's blue, "wipe" and "run back?" after a wipe, "r"/"gogo" on zoning in. Only in groups with
+// a real player in them, with chances and cooldowns, so it reads like people and not like a feed.
+#include "Group.h"
+#include <unordered_set>
+namespace
+{
+struct WovRollEvt
+{
+    uint32 winner = 0, item = 0;
+    uint8 vote = 0;
+    std::vector<std::pair<uint32, uint8>> votes;  // (low guid, RollVote)
+};
+struct WovPartyLine
+{
+    time_t due = 0;
+    uint32 bot = 0;
+    std::string text;
+};
+std::mutex g_wovDgMutex;
+std::vector<WovRollEvt> g_wovRollEvts;
+std::vector<WovPartyLine> g_wovPartyLines;
+std::unordered_map<uint32, time_t> g_wovWipeCd;    // group low guid -> next allowed
+std::unordered_map<uint64, time_t> g_wovZoneSeen;  // (player low << 32 | instance id) -> seen until
+time_t g_wovDgNext = 0;
+
+char const* const kWovSorry[] = {"sry, was an upgrade for me", "oh sry, big upgrade", "sry man", "sry, needed that one",
+                                 "oops sry, upgrade", "sry, ill pass the next one", "my bad, was an upgrade tho"};
+char const* const kWovMine[] = {"nice", "finally", "yes!!", "omg finally", "sweet", "been farming that lol", "ty ty"};
+char const* const kWovGz[] = {"gz", "grats", "gz!", "nice gz", "gz, nice drop", "grats man", "gz gz"};
+char const* const kWovUnlucky[] = {"unlucky", "rip", "next time", "unlucky man"};
+char const* const kWovWipe[] = {"wipe", "welp", "rip", "lol wipe", "rip us", "oops", "that went well", "gg"};
+char const* const kWovAfter[] = {"run back?", "who pulled that lol", "ok run back", "rez up and rebuff",
+                                 "pull slower pls", "lets wait for mana next time", "my bad", "again?", "brb corpse run"};
+char const* const kWovEnter[] = {"r", "ready", "gogo", "lets go", "1 sec drinking", "pull when ready", "buffs?",
+                                 "need to repair after this lol", "havent been here in ages", "r, gogo"};
+
+bool WovRealIn(Group* g)
+{
+    if (!g)
+        return false;
+    for (GroupReference* ref = g->GetFirstMember(); ref; ref = ref->next())
+        if (Player* m = ref->GetSource())
+            if (m->GetSession() && !GET_PLAYERBOT_AI(m) && !sRandomPlayerbotMgr.IsRandomBot(m))
+                return true;
+    return false;
+}
+
+bool WovIsReal(Player* m) { return m && m->GetSession() && !GET_PLAYERBOT_AI(m) && !sRandomPlayerbotMgr.IsRandomBot(m); }
+
+void WovPartySay(Player* bot, std::string const& text, time_t due)
+{
+    if (bot && sRandomPlayerbotMgr.IsRandomBot(bot))
+        g_wovPartyLines.push_back({due, bot->GetGUID().GetCounter(), text});
+}
+
+// a random bot of the group other than `not1`, or nullptr
+Player* WovOtherBot(Group* g, Player* not1)
+{
+    std::vector<Player*> c;
+    for (GroupReference* ref = g->GetFirstMember(); ref; ref = ref->next())
+        if (Player* m = ref->GetSource())
+            if (m != not1 && m->IsInWorld() && sRandomPlayerbotMgr.IsRandomBot(m))
+                c.push_back(m);
+    return c.empty() ? nullptr : c[urand(0, c.size() - 1)];
+}
+
+void WovDgRoll(WovRollEvt const& e, time_t now)
+{
+    Player* w = ObjectAccessor::FindPlayerByLowGUID(e.winner);
+    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(e.item);
+    Group* g = w ? w->GetGroup() : nullptr;
+    if (!w || !proto || !g || !WovRealIn(g) || proto->Quality < ITEM_QUALITY_UNCOMMON)
+        return;
+    time_t due = now + urand(2, 6);
+    if (sRandomPlayerbotMgr.IsRandomBot(w))
+    {
+        bool realNeeded = false;
+        for (auto const& [low, v] : e.votes)
+            if (v == NEED && low != e.winner && WovIsReal(ObjectAccessor::FindPlayerByLowGUID(low)))
+                realNeeded = true;
+        if (e.vote == NEED && realNeeded)
+        {
+            if (urand(0, 99) < 75)
+                WovPartySay(w, WovPick(kWovSorry), due);
+            if (urand(0, 99) < 20)
+                WovPartySay(WovOtherBot(g, w), WovPick(kWovUnlucky), due + urand(2, 5));
+        }
+        else if (proto->Quality >= ITEM_QUALITY_RARE)
+        {
+            if (urand(0, 99) < 50)
+                WovPartySay(w, WovPick(kWovMine), due);
+            if (urand(0, 99) < 40)
+                WovPartySay(WovOtherBot(g, w), WovPick(kWovGz), due + urand(2, 6));
+        }
+        else if (e.vote == NEED && urand(0, 99) < 10)
+            WovPartySay(w, WovPick(kWovMine), due);
+    }
+    else if (WovIsReal(w))
+    {
+        uint32 chance = proto->Quality >= ITEM_QUALITY_RARE ? 80 : e.vote == NEED ? 25 : 0;
+        if (urand(0, 99) < chance)
+            WovPartySay(WovOtherBot(g, nullptr), WovPick(kWovGz), due);
+        if (proto->Quality >= ITEM_QUALITY_EPIC && urand(0, 99) < 60)
+            WovPartySay(WovOtherBot(g, nullptr), WovPick(kWovGz), due + urand(2, 5));
+    }
+    LOG_INFO("playerbots", "WoV dungeon: roll {} won by {} ({})", proto->Name1, w->GetName(), e.vote == NEED ? "need" : "greed");
+}
+
+void WovDgScan(time_t now)
+{
+    std::unordered_set<Group*> done;
+    for (auto const& [guid, p] : ObjectAccessor::GetPlayers())
+    {
+        if (!p || !p->IsInWorld() || !WovIsReal(p))
+            continue;
+        Group* g = p->GetGroup();
+        Map* map = p->GetMap();
+        if (!g || !map || !map->IsDungeon() || map->IsBattlegroundOrArena() || g->isRaidGroup() || !done.insert(g).second)
+            continue;
+        uint32 here = 0, dead = 0, bots = 0;
+        for (GroupReference* ref = g->GetFirstMember(); ref; ref = ref->next())
+            if (Player* m = ref->GetSource())
+                if (m->IsInWorld() && m->GetMap() == map)
+                {
+                    ++here;
+                    dead += m->IsAlive() ? 0 : 1;
+                    bots += sRandomPlayerbotMgr.IsRandomBot(m) ? 1 : 0;
+                }
+        if (!bots)
+            continue;
+        uint32 gl = g->GetGUID().GetCounter();
+        if (here >= 3 && dead == here && now >= g_wovWipeCd[gl])
+        {
+            g_wovWipeCd[gl] = now + 240;
+            Player* a = WovOtherBot(g, nullptr);
+            if (urand(0, 99) < 85)
+                WovPartySay(a, WovPick(kWovWipe), now + urand(2, 5));
+            if (urand(0, 99) < 60)
+                WovPartySay(WovOtherBot(g, a), WovPick(kWovAfter), now + urand(10, 22));
+            LOG_INFO("playerbots", "WoV dungeon: wipe in {} (group of {}, {} with {})", map->GetMapName(), here,
+                     p->GetName(), bots);
+        }
+        uint64 key = (uint64(p->GetGUID().GetCounter()) << 32) | map->GetInstanceId();
+        auto it = g_wovZoneSeen.find(key);
+        bool fresh = it == g_wovZoneSeen.end() || now >= it->second;
+        g_wovZoneSeen[key] = now + 1800;
+        if (fresh && bots >= 2 && p->IsAlive() && urand(0, 99) < 55)
+            WovPartySay(WovOtherBot(g, nullptr), WovPick(kWovEnter), now + urand(5, 12));
+    }
+    for (auto it = g_wovZoneSeen.begin(); it != g_wovZoneSeen.end();)
+        it = now >= it->second ? g_wovZoneSeen.erase(it) : std::next(it);
+    for (auto it = g_wovWipeCd.begin(); it != g_wovWipeCd.end();)
+        it = now >= it->second ? g_wovWipeCd.erase(it) : std::next(it);
+}
+}  // namespace
+
+void WovDungeon_OnRoll(Player* winner, uint32 item, uint8 vote, Roll* roll)
+{
+    if (!g_wovInitEnable || !winner || !roll)
+        return;
+    WovRollEvt e;
+    e.winner = winner->GetGUID().GetCounter();
+    e.item = item;
+    e.vote = vote;
+    for (auto const& [g, v] : roll->playerVote)
+        e.votes.push_back({uint32(g.GetCounter()), uint8(v)});
+    std::lock_guard<std::mutex> lock(g_wovDgMutex);
+    if (g_wovRollEvts.size() < 64)
+        g_wovRollEvts.push_back(std::move(e));
+}
+
+void WovDungeon_Tick(time_t now)
+{
+    if (!g_wovInitEnable)
+        return;
+    std::vector<WovRollEvt> evts;
+    {
+        std::lock_guard<std::mutex> lock(g_wovDgMutex);
+        evts.swap(g_wovRollEvts);
+    }
+    for (WovRollEvt const& e : evts)
+        WovDgRoll(e, now);
+    if (now >= g_wovDgNext)
+    {
+        g_wovDgNext = now + 2;
+        WovDgScan(now);
+    }
+    for (size_t i = 0; i < g_wovPartyLines.size();)
+    {
+        if (now < g_wovPartyLines[i].due)
+        {
+            ++i;
+            continue;
+        }
+        WovPartyLine l = g_wovPartyLines[i];
+        g_wovPartyLines.erase(g_wovPartyLines.begin() + i);
+        Player* bot = ObjectAccessor::FindPlayerByLowGUID(l.bot);
+        PlayerbotAI* ai = bot ? GET_PLAYERBOT_AI(bot) : nullptr;
+        if (ai && bot->IsInWorld() && bot->GetGroup())
+            ai->SayToParty(l.text);
+    }
+}
+// ---- end wov: dungeon talk ----------------------------------------------------------------------------
+
 // ---- wov: crafting orders -----------------------------------------------------------------------------
 // A real player links an item and asks for it ("can u make [Heavy Linen Bandage]?" in a whisper, or
 // "LF tailor [Red Linen Shirt]" in Trade). A bot that knows a recipe for it whispers back what mats it needs and
@@ -3378,6 +3584,7 @@ void RandomPlayerbotMgr::UpdateAIInternal(uint32 /*elapsed*/, bool /*minimal*/)
     WovWar_Tick(time(nullptr));  // wov: Call to Arms
     WovInit_Tick(time(nullptr));  // wov: initiative
     WovTogether_Tick(time(nullptr));  // wov: play together
+    WovDungeon_Tick(time(nullptr));  // wov: dungeon talk
     WovRegear_Tick(time(nullptr));  // wov: regear once
     WovRegearBracket_Tick(time(nullptr));  // wov: one fresh set per level bracket
     WovMarket_Tick(time(nullptr));  // wov: market

@@ -139,6 +139,7 @@ void WovInit_OnWhisper(Player* from, Player* to);  // wov (RandomPlayerbotMgr.cp
 void WovTogether_OnChannel(Player* player, std::string const& msg);  // wov
 bool WovCraft_OnWhisper(Player* from, Player* to, std::string const& msg);  // wov
 void WovCraft_OnChannel(Player* player, std::string const& msg);  // wov
+void WovDungeon_OnRoll(Player* winner, uint32 item, uint8 vote, Roll* roll);  // wov
 
 class PlayerbotsPlayerScript : public PlayerScript
 {
@@ -157,7 +158,8 @@ public:
         PLAYERHOOK_ON_GIVE_EXP,
         PLAYERHOOK_ON_BEFORE_TELEPORT,
         PLAYERHOOK_CAN_GROUP_INVITE,
-        PLAYERHOOK_ON_SEND_LIST_INVENTORY
+        PLAYERHOOK_ON_SEND_LIST_INVENTORY,
+        PLAYERHOOK_ON_GROUP_ROLL_REWARD_ITEM
     }) {}
 
     // WoV: opt-in test telemetry only, never sends chat or changes a skill.
@@ -474,6 +476,12 @@ public:
         WovCraft_OnChannel(player, msg);  // wov: crafting requests
 
         return true;
+    }
+
+    void OnPlayerGroupRollRewardItem(Player* player, Item* item, uint32 /*count*/, RollVote voteType, Roll* roll) override
+    {
+        if (item)
+            WovDungeon_OnRoll(player, item->GetEntry(), uint8(voteType), roll);  // wov: dungeon talk
     }
 
     bool OnPlayerBeforeAchievementComplete(Player* player, AchievementEntry const* achievement) override
