@@ -4237,7 +4237,11 @@ void RandomPlayerbotMgr::CheckBgQueue()
     }
 
     // If enabled, wait for all bots to have logged in before queueing for Arena's / BG's
-    if (sPlayerbotAIConfig.randomBotAutoJoinBG && playerBots.size() >= GetMaxAllowedBotCount())
+    // wov: the WoV schedule keeps about 900 of the 1000 bots online, so "all bots logged in" never happens;
+    // start once AiPlayerbot.WoV.BgMinBots (default 400) are online instead.
+    if (sPlayerbotAIConfig.randomBotAutoJoinBG &&
+        playerBots.size() >= std::min<uint32>(GetMaxAllowedBotCount(),
+                                               sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.BgMinBots", 400)))
     {
         uint32 randomBotAutoJoinArenaBracket = sPlayerbotAIConfig.randomBotAutoJoinArenaBracket;
         uint32 randomBotAutoJoinBGRatedArena2v2Count = sPlayerbotAIConfig.randomBotAutoJoinBGRatedArena2v2Count;
