@@ -1873,6 +1873,513 @@ void WovTogether_OnChannel(Player* player, std::string const& msg)
 }
 // ---- end wov: play together ----------------------------------------------------------------------------
 
+// ---- wov: crafting orders -----------------------------------------------------------------------------
+// A real player links an item and asks for it ("can u make [Heavy Linen Bandage]?" in a whisper, or
+// "LF tailor [Red Linen Shirt]" in Trade). A bot that knows a recipe for it whispers back what mats it needs and
+// asks for them by mail. When the mail arrives the bot crafts (reagents consumed, real skill-up), mails the
+// result and any leftovers back and keeps the money as a tip. Item mail from real players that no order covers
+// is sent back. Open orders are kept in wov_craft_order and expire after three days.
+#include "CharacterCache.h"
+#include "ChatHelper.h"
+#include "DBCStores.h"
+#include "Mail.h"
+#include "SpellMgr.h"
+#include "World.h"
+#include <atomic>
+#include <mutex>
+namespace
+{
+struct WovCraftOrder
+{
+    uint32 item = 0, spell = 0;
+    time_t t = 0;
+};
+struct WovCraftAsk
+{
+    uint32 player = 0, bot = 0;
+    std::string msg;
+};
+struct WovCraftSay
+{
+    time_t due = 0;
+    uint32 bot = 0, player = 0;
+    std::string text;
+};
+std::mutex g_wovCraftMutex;
+std::vector<WovCraftAsk> g_wovCraftAsks;
+std::vector<WovCraftSay> g_wovCraftSays;
+std::map<std::pair<uint32, uint32>, WovCraftOrder> g_wovCraftOrders;  // (bot, player)
+std::unordered_map<uint32, time_t> g_wovCraftLastAsk;
+std::once_flag g_wovCraftOnce;
+std::unordered_map<uint32, std::vector<uint32>> g_wovCraftRecipes;  // crafted item -> recipe spells
+std::atomic<bool> g_wovCraftEnable{false};
+time_t const kWovCraftOrderSec = 3 * DAY;
+
+char const* const kWovCraftYes[] = {"i can make {item}. mail me {mats} and ill send it back",
+                                     "sure, mail me {mats} and ill craft {item} for u",
+                                     "got the recipe for {item}. mats are {mats}, just mail em to me",
+                                     "yeah i can do {item}. send {mats} in the mail, tips welcome"};
+char const* const kWovCraftNo[] = {"dont have that recipe sry", "cant make that one", "nah not my profession sry",
+                                    "no recipe for that, sry"};
+char const* const kWovCraftDone[] = {"sent u {item}, enjoy", "{item} done, its in ur mailbox", "done, check ur mail",
+                                      "made it, sent it back to u"};
+char const* const kWovCraftMiss[] = {"got ur mail but im missing {mats}, sent it all back",
+                                      "u forgot {mats}, mailed ur stuff back"};
+
+void WovCraftBuild()
+{
+    std::call_once(g_wovCraftOnce, [] {
+        static uint32 const kSkills[] = {SKILL_ALCHEMY,      SKILL_BLACKSMITHING, SKILL_COOKING,   SKILL_ENGINEERING,
+                                         SKILL_FIRST_AID,    SKILL_LEATHERWORKING, SKILL_TAILORING, SKILL_ENCHANTING,
+                                         SKILL_MINING};
+        for (uint32 i = 0; i < sSkillLineAbilityStore.GetNumRows(); ++i)
+        {
+            SkillLineAbilityEntry const* e = sSkillLineAbilityStore.LookupEntry(i);
+            if (!e || std::find(std::begin(kSkills), std::end(kSkills), e->SkillLine) == std::end(kSkills))
+                continue;
+            SpellInfo const* s = sSpellMgr->GetSpellInfo(e->Spell);
+            if (!s)
+                continue;
+            for (uint8 k = 0; k < MAX_SPELL_EFFECTS; ++k)
+                if (s->Effects[k].Effect == SPELL_EFFECT_CREATE_ITEM && s->Effects[k].ItemType)
+                {
+                    std::vector<uint32>& v = g_wovCraftRecipes[s->Effects[k].ItemType];
+                    if (std::find(v.begin(), v.end(), e->Spell) == v.end())
+                        v.push_back(e->Spell);
+                }
+        }
+    });
+}
+
+uint32 WovCraftItemOf(std::string const& msg)
+{
+    size_t p = msg.find("|Hitem:");
+    if (p == std::string::npos)
+        return 0;
+    return uint32(strtoul(msg.c_str() + p + 7, nullptr, 10));
+}
+
+bool WovCraftWords(std::string const& msg, bool whisper)
+{
+    std::string m;
+    // drop the item links so item names cannot count as words
+    for (size_t i = 0; i < msg.size(); ++i)
+    {
+        if (msg[i] == '|' && i + 1 < msg.size() && msg[i + 1] == 'H')
+        {
+            size_t e = msg.find("|h|r", i);
+            if (e == std::string::npos)
+                break;
+            i = e + 3;
+            m += ' ';
+            continue;
+        }
+        m += char(std::tolower((unsigned char)msg[i]));
+    }
+    m = " " + m + " ";
+    if (m.find("wts") != std::string::npos || m.find("selling") != std::string::npos)
+        return false;
+    static char const* const kW[] = {"make", "craft", "cook", "forge", "smelt", "sew", "brew", "can u", "can you",
+                                     "could you", "recipe", "do u ", "do you "};
+    static char const* const kC[] = {"craft", "make", "maker", "cook", "smelt", " lf ", " lf1", " lfw", "wtb",
+                                     "anyone", "someone", "who can", " need"};
+    if (whisper)
+    {
+        for (char const* w : kW)
+            if (m.find(w) != std::string::npos)
+                return true;
+        return false;
+    }
+    for (char const* w : kC)
+        if (m.find(w) != std::string::npos)
+            return true;
+    return false;
+}
+
+std::string WovCraftMats(SpellInfo const* si, uint32 times)
+{
+    std::string out;
+    for (uint8 x = 0; x < MAX_SPELL_REAGENTS; ++x)
+    {
+        if (si->Reagent[x] <= 0)
+            continue;
+        ItemTemplate const* r = sObjectMgr->GetItemTemplate(uint32(si->Reagent[x]));
+        if (!r)
+            continue;
+        if (!out.empty())
+            out += ", ";
+        out += ChatHelper::FormatItem(r, si->ReagentCount[x] * times);
+    }
+    return out;
+}
+
+void WovCraftAskHandle(WovCraftAsk const& ask, time_t now)
+{
+    Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(ask.player));
+    if (!p)
+        return;
+    time_t& lastAsk = g_wovCraftLastAsk[ask.player];
+    if (now < lastAsk + (ask.bot ? 5 : 60))
+        return;
+    lastAsk = now;
+    uint32 item = WovCraftItemOf(ask.msg);
+    auto rit = g_wovCraftRecipes.find(item);
+    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(item);
+    if (rit == g_wovCraftRecipes.end() || !proto)
+        return;
+    auto knows = [&](Player* b) -> uint32 {
+        for (uint32 s : rit->second)
+            if (b->HasSpell(s))
+                return s;
+        return 0;
+    };
+    Player* bot = nullptr;
+    uint32 spell = 0;
+    if (ask.bot)
+    {
+        bot = ObjectAccessor::FindPlayerByLowGUID(ask.bot);
+        if (!bot || !bot->IsInWorld())
+            return;
+        spell = knows(bot);
+        if (!spell)
+        {
+            g_wovCraftSays.push_back({now + urand(4, 10), ask.bot, ask.player, WovPick(kWovCraftNo)});
+            return;
+        }
+    }
+    else
+    {
+        std::unordered_map<uint32, uint32> open;
+        for (auto const& [k, o] : g_wovCraftOrders)
+            ++open[k.first];
+        int best = -1;
+        for (auto const& [guid, b] : sRandomPlayerbotMgr.GetAllBots())
+        {
+            if (!b || !b->IsInWorld() || !b->IsAlive() || b->IsInCombat() || b->InBattleground() ||
+                b->GetTeamId() != p->GetTeamId())
+                continue;
+            if (b->GetMap() && b->GetMap()->Instanceable())
+                continue;
+            if (open[b->GetGUID().GetCounter()] >= 3)
+                continue;
+            uint32 s = knows(b);
+            if (!s)
+                continue;
+            int score = (b->GetZoneId() == p->GetZoneId() ? 100 : 0) + (b->GetMapId() == p->GetMapId() ? 20 : 0) +
+                        int(urand(0, 30));
+            if (score > best)
+            {
+                best = score;
+                bot = b;
+                spell = s;
+            }
+        }
+        if (!bot)
+            return;  // nobody online can make it: the channel stays quiet, like a real one
+    }
+    SpellInfo const* si = sSpellMgr->GetSpellInfo(spell);
+    if (!si)
+        return;
+    std::string mats = WovCraftMats(si, 1);
+    if (mats.empty())
+        return;
+    uint32 blow = bot->GetGUID().GetCounter();
+    std::string text = WovRep(WovRep(WovPick(kWovCraftYes), "{item}", ChatHelper::FormatItem(proto)), "{mats}", mats);
+    g_wovCraftSays.push_back({now + (ask.bot ? time_t(urand(5, 12)) : time_t(urand(20, 60))), blow, ask.player, text});
+    g_wovCraftOrders[{blow, ask.player}] = {item, spell, now};
+    CharacterDatabase.Execute("UPDATE wov_craft_order SET status='cancelled', updated=NOW() WHERE bot={} AND player={} AND "
+                              "status='open'",
+                              blow, ask.player);
+    CharacterDatabase.Execute("INSERT INTO wov_craft_order (player, bot, item, spell, status) VALUES ({}, {}, {}, {}, 'open')",
+                              ask.player, blow, item, spell);
+    LOG_INFO("playerbots", "WoV craft: {} offers item {} (spell {}) to {}", bot->GetName(), item, spell, p->GetName());
+}
+
+void WovCraftOneMail(Player* bot, Mail* m, time_t now)
+{
+    uint32 blow = bot->GetGUID().GetCounter(), plow = m->sender;
+    ObjectGuid pguid = ObjectGuid::Create<HighGuid::Player>(plow);
+    Player* p = ObjectAccessor::FindConnectedPlayer(pguid);
+    auto oit = g_wovCraftOrders.find({blow, plow});
+    bool order = oit != g_wovCraftOrders.end() && now < oit->second.t + kWovCraftOrderSec && bot->HasSpell(oit->second.spell);
+    SpellInfo const* si = order ? sSpellMgr->GetSpellInfo(oit->second.spell) : nullptr;
+    std::vector<Item*> items;
+    for (MailItemInfo const& mi : m->items)
+        if (Item* it = bot->GetMItem(mi.item_guid))
+            items.push_back(it);
+    uint32 n = 0;
+    std::string missing;
+    if (si)
+    {
+        n = 5;
+        for (uint8 x = 0; x < MAX_SPELL_REAGENTS; ++x)
+        {
+            if (si->Reagent[x] <= 0 || !si->ReagentCount[x])
+                continue;
+            uint32 have = 0;
+            for (Item* it : items)
+                if (it->GetEntry() == uint32(si->Reagent[x]))
+                    have += it->GetCount();
+            n = std::min(n, have / si->ReagentCount[x]);
+            if (have < si->ReagentCount[x])
+                if (ItemTemplate const* r = sObjectMgr->GetItemTemplate(uint32(si->Reagent[x])))
+                    missing += (missing.empty() ? "" : ", ") + ChatHelper::FormatItem(r, si->ReagentCount[x] - have);
+        }
+    }
+    CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+    std::vector<Item*> back;
+    uint32 money = m->money, crafted = 0, itemId = order ? oit->second.item : 0;
+    if (n > 0)
+    {
+        for (uint8 x = 0; x < MAX_SPELL_REAGENTS; ++x)
+        {
+            if (si->Reagent[x] <= 0)
+                continue;
+            uint32 need = si->ReagentCount[x] * n;
+            for (Item*& it : items)
+            {
+                if (!it || !need || it->GetEntry() != uint32(si->Reagent[x]))
+                    continue;
+                uint32 c = it->GetCount();
+                if (c <= need)
+                {
+                    need -= c;
+                    bot->RemoveMItem(it->GetGUID().GetCounter());
+                    CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_ITEM_INSTANCE);
+                    stmt->SetData(0, it->GetGUID().GetCounter());
+                    trans->Append(stmt);
+                    delete it;
+                    it = nullptr;
+                }
+                else
+                {
+                    it->SetCount(c - need);
+                    need = 0;
+                }
+            }
+        }
+        int32 per = 1;
+        for (uint8 k = 0; k < MAX_SPELL_EFFECTS; ++k)
+            if (si->Effects[k].Effect == SPELL_EFFECT_CREATE_ITEM && si->Effects[k].ItemType == itemId)
+                per = std::max<int32>(1, si->Effects[k].CalcValue(bot));
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId);
+        uint32 total = uint32(per) * n, stack = proto ? std::max<uint32>(1, proto->GetMaxStackSize()) : 1;
+        while (total)
+        {
+            uint32 c = std::min(stack, total);
+            Item* ni = Item::CreateItem(itemId, c, bot);
+            if (!ni)
+                break;
+            back.push_back(ni);
+            crafted += c;
+            total -= c;
+        }
+        for (uint32 k = 0; k < n; ++k)
+            bot->UpdateCraftSkill(oit->second.spell);
+        if (money)
+        {
+            bot->ModifyMoney(money);  // the tip
+            money = 0;
+        }
+    }
+    for (Item* it : items)
+        if (it)
+        {
+            bot->RemoveMItem(it->GetGUID().GetCounter());
+            back.push_back(it);
+        }
+    std::string subject, body;
+    if (n > 0)
+    {
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId);
+        subject = proto ? proto->Name1 : "Your order";
+        body = "here u go\n\n" + bot->GetName();
+    }
+    else if (order)
+    {
+        subject = "Missing mats";
+        body = "missing some mats, sending it all back\n\n" + bot->GetName();
+    }
+    else
+    {
+        subject = "Returned";
+        body = "think u sent this to the wrong person?\n\n" + bot->GetName();
+    }
+    size_t i = 0;
+    bool first = true;
+    while (i < back.size() || (first && money))
+    {
+        MailDraft draft(subject, body);
+        if (first && money)
+            draft.AddMoney(money);
+        for (uint32 k = 0; k < MAX_MAIL_ITEMS && i < back.size(); ++k, ++i)
+        {
+            Item* it = back[i];
+            if (it->GetState() == ITEM_UNCHANGED)
+                it->FSetState(ITEM_CHANGED);
+            it->SetOwnerGUID(pguid);
+            it->SaveToDB(trans);
+            draft.AddItem(it);
+        }
+        draft.SendMailTo(trans, MailReceiver(p, plow), MailSender(bot), MAIL_CHECK_MASK_HAS_BODY, 0);
+        first = false;
+    }
+    CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_MAIL_BY_ID);
+    stmt->SetData(0, m->messageID);
+    trans->Append(stmt);
+    stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_MAIL_ITEM_BY_ID);
+    stmt->SetData(0, m->messageID);
+    trans->Append(stmt);
+    if (n > 0)
+        bot->SaveInventoryAndGoldToDB(trans);
+    bot->RemoveMail(m->messageID);
+    delete m;
+    CharacterDatabase.CommitTransaction(trans);
+    if (n > 0)
+    {
+        if (ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId))
+            if (p)
+                g_wovCraftSays.push_back({now + urand(2, 6), blow, plow, WovRep(WovPick(kWovCraftDone), "{item}", ChatHelper::FormatItem(proto))});
+        CharacterDatabase.Execute("UPDATE wov_craft_order SET status='done', crafted={}, updated=NOW() WHERE bot={} AND "
+                                  "player={} AND status='open'",
+                                  crafted, blow, plow);
+        g_wovCraftOrders.erase(oit);
+        LOG_INFO("playerbots", "WoV craft: {} crafted {}x item {} for guid {}", bot->GetName(), crafted, itemId, plow);
+    }
+    else if (order && p)
+        g_wovCraftSays.push_back({now + urand(2, 6), blow, plow, WovRep(WovPick(kWovCraftMiss), "{mats}", missing.empty() ? "some mats" : missing)});
+    else
+        LOG_INFO("playerbots", "WoV craft: {} returned unrequested mail from guid {}", bot->GetName(), plow);
+}
+
+void WovCraftMail(time_t now)
+{
+    time_t delay = time_t(sWorld->getIntConfig(CONFIG_MAIL_DELIVERY_DELAY));
+    for (auto const& [guid, bot] : sRandomPlayerbotMgr.GetAllBots())
+    {
+        if (!bot || !bot->IsInWorld() || !bot->GetMailSize())
+            continue;
+        std::vector<Mail*> todo;
+        for (Mail* m : bot->GetMails())
+        {
+            if (!m || m->state == MAIL_STATE_DELETED || m->messageType != MAIL_NORMAL || m->COD)
+                continue;
+            if (m->items.empty() && !m->money)
+                continue;
+            // item mail between accounts is held for an hour; the bot "checks its mail" a minute after it was sent
+            if (now + delay < m->deliver_time + 60)
+                continue;
+            uint32 acc = sCharacterCache->GetCharacterAccountIdByGuid(ObjectGuid::Create<HighGuid::Player>(m->sender));
+            if (!acc || PlayerbotAIConfig::instance().IsInRandomAccountList(acc))
+                continue;
+            todo.push_back(m);
+        }
+        for (Mail* m : todo)
+            WovCraftOneMail(bot, m, now);
+    }
+}
+
+void WovCraft_Tick(time_t now)
+{
+    static time_t last = 0, cfgT = 0, mailT = 0;
+    static bool loaded = false;
+    if (now >= cfgT + 60)
+    {
+        cfgT = now;
+        g_wovCraftEnable = sConfigMgr->GetOption<bool>("AiPlayerbot.WoV.Craft.Enable", false);
+    }
+    if (!g_wovCraftEnable || now < last + 3)
+        return;
+    last = now;
+    if (!loaded)
+    {
+        loaded = true;
+        WovCraftBuild();
+        if (QueryResult r = CharacterDatabase.Query("SELECT bot, player, item, spell, UNIX_TIMESTAMP(created) FROM wov_craft_order "
+                                                    "WHERE status='open' AND created > NOW() - INTERVAL 3 DAY"))
+            do
+            {
+                Field* f = r->Fetch();
+                g_wovCraftOrders[{f[0].Get<uint32>(), f[1].Get<uint32>()}] = {f[2].Get<uint32>(), f[3].Get<uint32>(),
+                                                                               time_t(f[4].Get<uint64>())};
+            } while (r->NextRow());
+        LOG_INFO("playerbots", "WoV craft: {} craftable items, {} open orders", g_wovCraftRecipes.size(), g_wovCraftOrders.size());
+    }
+    std::vector<WovCraftAsk> asks;
+    {
+        std::lock_guard<std::mutex> lock(g_wovCraftMutex);
+        asks.swap(g_wovCraftAsks);
+    }
+    for (WovCraftAsk const& a : asks)
+        WovCraftAskHandle(a, now);
+    for (auto it = g_wovCraftSays.begin(); it != g_wovCraftSays.end();)
+    {
+        if (now < it->due)
+        {
+            ++it;
+            continue;
+        }
+        Player* b = ObjectAccessor::FindPlayerByLowGUID(it->bot);
+        Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(it->player));
+        if (b && p && b->IsInWorld())
+            b->Whisper(it->text, LANG_UNIVERSAL, p);
+        it = g_wovCraftSays.erase(it);
+    }
+    if (now >= mailT + 20)
+    {
+        mailT = now;
+        WovCraftMail(now);
+        for (auto it = g_wovCraftOrders.begin(); it != g_wovCraftOrders.end();)
+        {
+            if (now >= it->second.t + kWovCraftOrderSec)
+            {
+                CharacterDatabase.Execute("UPDATE wov_craft_order SET status='expired', updated=NOW() WHERE bot={} AND "
+                                          "player={} AND status='open'",
+                                          it->first.first, it->first.second);
+                it = g_wovCraftOrders.erase(it);
+            }
+            else
+                ++it;
+        }
+    }
+}
+}  // namespace
+
+// Used by mod-ollama-chat too: such a message is answered by the craft code, not by the language model.
+bool WovCraft_Claims(std::string const& msg, bool whisper)
+{
+    if (!g_wovCraftEnable || msg.size() > 255)
+        return false;
+    uint32 item = WovCraftItemOf(msg);
+    if (!item)
+        return false;
+    WovCraftBuild();
+    if (!g_wovCraftRecipes.count(item))
+        return false;
+    return WovCraftWords(msg, whisper);
+}
+
+// Whisper hook (Playerbots.cpp). True when the whisper is a crafting request; it is then not a bot command.
+bool WovCraft_OnWhisper(Player* from, Player* to, std::string const& msg)
+{
+    if (!from || !to || sRandomPlayerbotMgr.IsRandomBot(from) || !sRandomPlayerbotMgr.IsRandomBot(to))
+        return false;
+    if (!WovCraft_Claims(msg, true))
+        return false;
+    std::lock_guard<std::mutex> lock(g_wovCraftMutex);
+    g_wovCraftAsks.push_back({from->GetGUID().GetCounter(), to->GetGUID().GetCounter(), msg});
+    return true;
+}
+
+void WovCraft_OnChannel(Player* player, std::string const& msg)
+{
+    if (!player || sRandomPlayerbotMgr.IsRandomBot(player) || !WovCraft_Claims(msg, false))
+        return;
+    std::lock_guard<std::mutex> lock(g_wovCraftMutex);
+    g_wovCraftAsks.push_back({player->GetGUID().GetCounter(), 0, msg});
+}
+// ---- end wov: crafting orders -------------------------------------------------------------------------
+
 // ---- wov: regear once ----------------------------------------------------------------------------------
 // Bots used to get a fresh set of blues at every level. Each random bot is re-geared ONCE with ordinary
 // leveling gear (greens at most, often worse; RandomGearLoweringChance) a few at a time; after that, gear
@@ -2874,6 +3381,7 @@ void RandomPlayerbotMgr::UpdateAIInternal(uint32 /*elapsed*/, bool /*minimal*/)
     WovRegear_Tick(time(nullptr));  // wov: regear once
     WovRegearBracket_Tick(time(nullptr));  // wov: one fresh set per level bracket
     WovMarket_Tick(time(nullptr));  // wov: market
+    WovCraft_Tick(time(nullptr));  // wov: crafting orders
 
     /*if (sPlayerbotAIConfig.enablePrototypePerformanceDiff)
     {

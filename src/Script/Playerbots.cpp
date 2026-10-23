@@ -137,6 +137,8 @@ public:
 
 void WovInit_OnWhisper(Player* from, Player* to);  // wov (RandomPlayerbotMgr.cpp)
 void WovTogether_OnChannel(Player* player, std::string const& msg);  // wov
+bool WovCraft_OnWhisper(Player* from, Player* to, std::string const& msg);  // wov
+void WovCraft_OnChannel(Player* player, std::string const& msg);  // wov
 
 class PlayerbotsPlayerScript : public PlayerScript
 {
@@ -397,6 +399,9 @@ public:
             return true;
         }
 
+        if (WovCraft_OnWhisper(player, receiver, msg))  // wov: a crafting request, answered by the craft code
+            return true;
+
         WovInit_OnWhisper(player, receiver);  // wov: answering an LFG/LFM post gets an invite
 
         botAI->HandleCommand(type, msg, player);
@@ -466,6 +471,7 @@ public:
         sRandomPlayerbotMgr.HandleCommand(type, msg, player);
 
         WovTogether_OnChannel(player, msg);  // wov: LFM/LFG from real players
+        WovCraft_OnChannel(player, msg);  // wov: crafting requests
 
         return true;
     }
