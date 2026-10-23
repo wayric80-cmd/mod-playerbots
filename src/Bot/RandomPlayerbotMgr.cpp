@@ -1923,6 +1923,71 @@ void WovRegear_Tick(time_t now)
         ++n;
     }
 }
+// wov: bracket regear. Regear-once left many 50+ bots in grey/white items, which no real player wears.
+// Each random bot now gets ONE fresh set per level bracket (30-39, 40-49, 50-59, 60) at the quality a real
+// player of that level typically has: mostly greens with some blues while levelling, blues (some epics) at 60.
+// Between brackets gear still only comes from loot and quests. Done brackets are listed in wov_regear_bracket.
+void WovRegearBracket_Tick(time_t now)
+{
+    static time_t last = 0, cfgT = 0;
+    static bool enable = false;
+    static uint32 perTick = 3, minLevel = 30;
+    static std::set<std::pair<uint32, uint32>> done;
+    static bool loaded = false;
+    if (now >= cfgT + 60)
+    {
+        cfgT = now;
+        enable = sConfigMgr->GetOption<bool>("AiPlayerbot.WoV.RegearBracket.Enable", false);
+        perTick = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.RegearBracket.PerTick", 3);
+        minLevel = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.RegearBracket.MinLevel", 30);
+    }
+    if (!enable || now < last + 10)
+        return;
+    last = now;
+    if (!loaded)
+    {
+        loaded = true;
+        if (QueryResult r = CharacterDatabase.Query("SELECT guid, bracket FROM wov_regear_bracket"))
+            do
+            {
+                Field* f = r->Fetch();
+                done.insert({f[0].Get<uint32>(), uint32(f[1].Get<uint8>())});
+            } while (r->NextRow());
+    }
+    uint32 n = 0;
+    for (auto const& [guid, bot] : sRandomPlayerbotMgr.GetAllBots())
+    {
+        if (n >= perTick)
+            break;
+        if (!bot || !bot->IsInWorld() || !bot->IsAlive() || bot->IsInCombat() || bot->GetGroup() || bot->IsInFlight())
+            continue;
+        if (bot->GetMap() && bot->GetMap()->Instanceable())
+            continue;
+        uint32 level = bot->GetLevel();
+        if (level < minLevel)
+            continue;
+        uint32 bracket = std::min<uint32>(level, 60) / 10;
+        uint32 low = bot->GetGUID().GetCounter();
+        if (done.count({low, bracket}))
+            continue;
+        done.insert({low, bracket});
+        uint32 roll = urand(0, 99);
+        uint32 quality = ITEM_QUALITY_UNCOMMON;
+        if (level >= 60)
+            quality = roll < 15 ? ITEM_QUALITY_EPIC : ITEM_QUALITY_RARE;
+        else if (bracket == 5)
+            quality = roll < 70 ? ITEM_QUALITY_RARE : ITEM_QUALITY_UNCOMMON;
+        else if (bracket == 4)
+            quality = roll < 40 ? ITEM_QUALITY_RARE : ITEM_QUALITY_UNCOMMON;
+        else if (roll < 15)
+            quality = ITEM_QUALITY_RARE;
+        PlayerbotFactory factory(bot, level, quality);
+        factory.InitEquipment(false);
+        CharacterDatabase.Execute("INSERT IGNORE INTO wov_regear_bracket (guid, bracket, quality) VALUES ({}, {}, {})", low, bracket,
+                                  quality);
+        ++n;
+    }
+}
 }  // namespace
 // ---- end wov: regear once ------------------------------------------------------------------------------
 // ---- wov: market ---------------------------------------------------------------------------------------
@@ -2805,6 +2870,7 @@ void RandomPlayerbotMgr::UpdateAIInternal(uint32 /*elapsed*/, bool /*minimal*/)
     WovInit_Tick(time(nullptr));  // wov: initiative
     WovTogether_Tick(time(nullptr));  // wov: play together
     WovRegear_Tick(time(nullptr));  // wov: regear once
+    WovRegearBracket_Tick(time(nullptr));  // wov: one fresh set per level bracket
     WovMarket_Tick(time(nullptr));  // wov: market
 
     /*if (sPlayerbotAIConfig.enablePrototypePerformanceDiff)
