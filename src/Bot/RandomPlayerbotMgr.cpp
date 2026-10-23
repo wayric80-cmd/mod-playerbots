@@ -1982,7 +1982,9 @@ void WovRegearBracket_Tick(time_t now)
         else if (roll < 15)
             quality = ITEM_QUALITY_RARE;
         PlayerbotFactory factory(bot, level, quality);
-        factory.InitEquipment(false);
+        // second_chance: clear each slot first, otherwise the old grey/white item can stay when the new one
+        // cannot be equipped over it (measured: 25-45 % grey/white right after a plain InitEquipment).
+        factory.InitEquipment(false, true);
         CharacterDatabase.Execute("INSERT IGNORE INTO wov_regear_bracket (guid, bracket, quality) VALUES ({}, {}, {})", low, bracket,
                                   quality);
         ++n;
