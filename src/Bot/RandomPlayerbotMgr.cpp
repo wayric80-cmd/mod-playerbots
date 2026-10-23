@@ -763,6 +763,26 @@ void WovEnd(WovSkirmish& s)
     g_wovCool.erase(std::remove_if(g_wovCool.begin(), g_wovCool.end(),
                                    [](WovCool const& c) { return c.until < time(nullptr); }),
                     g_wovCool.end());
+    {   // wov: record the battle for the web portal (acore_characters.wov_battle)
+        uint32 zone = 0;
+        for (int t = 0; t < 2 && !zone; ++t)
+            for (uint32 low : s.members[t])
+                if (Player* p = ObjectAccessor::FindPlayerByLowGUID(low))
+                    if (p->GetMapId() == s.map && WovDist(p, s) < 300.0f)
+                    {
+                        zone = p->GetZoneId();
+                        break;
+                    }
+        std::string place = s.place;
+        CharacterDatabase.EscapeString(place);
+        char const* winner = s.kills[0] > s.kills[1] ? "alliance" : (s.kills[1] > s.kills[0] ? "horde" : "draw");
+        std::string raidTeam = s.raid ? (s.raidTeam == TEAM_ALLIANCE ? "0" : "1") : "NULL";
+        CharacterDatabase.Execute(
+            "INSERT INTO wov_battle (started, ended, map, zone, place, kind, raid_team, alliance_size, horde_size, alliance_kills, horde_kills, winner) "
+            "VALUES (FROM_UNIXTIME({}), NOW(), {}, {}, '{}', '{}', {}, {}, {}, {}, {}, '{}')",
+            uint64(s.start), s.map, zone, place, s.raid ? "raid" : "skirmish", raidTeam, uint32(s.members[0].size()),
+            uint32(s.members[1].size()), s.kills[0], s.kills[1], winner);
+    }
     LOG_INFO("playerbots", "WoV war #{} at {} over ({} vs {})", s.id, s.place, s.members[0].size(), s.members[1].size());
 }
 
