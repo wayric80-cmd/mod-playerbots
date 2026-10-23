@@ -1216,11 +1216,18 @@ bool WovSellable(ItemTemplate const* p)
            (p->Quality >= ITEM_QUALITY_UNCOMMON || p->Class == ITEM_CLASS_TRADE_GOODS);
 }
 
+bool WovCraftTradeAsk(Player* asker);  // wov: crafting orders (below)
+
 void WovPostTrade(Player* bot)
 {
     PlayerbotAI* ai = GET_PLAYERBOT_AI(bot);
     if (!ai)
         return;
+    if (urand(0, 99) < 22 && WovCraftTradeAsk(bot))  // wov: "LF tailor to make [item]", a crafter answers
+    {
+        g_wovLastPost[bot->GetGUID().GetCounter()] = time(nullptr);
+        return;
+    }
     std::string text;
     if (urand(0, 99) < 55)
     {
@@ -2485,6 +2492,112 @@ void WovCraftMail(time_t now)
     }
 }
 
+// wov: bots ask each other for crafts in Trade. The asker posts "LF tailor to make [item], have mats"; a bot in a
+// capital that really knows the recipe answers in Trade a little later. Only items the asker could use soon.
+struct WovCraftPub
+{
+    time_t due = 0;
+    uint32 bot = 0;
+    std::string text;
+};
+std::vector<WovCraftPub> g_wovCraftPub;
+char const* const kWovCraftLf[] = {"LF {prof} to make {item}, have mats", "any {prof} can craft {item}? got mats",
+                                   "LF {prof} for {item}, will tip", "need {item} made, have mats, tipping",
+                                   "LF {prof} {item} pst", "anyone make {item}? have the mats"};
+char const* const kWovCraftCan[] = {"{prof} here, can do {item}, w me", "i can make {item}, pst", "can craft {item}, w me w mats",
+                                    "{asker} i can make that, w me", "i got {item}, whisper me", "can do it, w me"};
+
+char const* WovProfName(uint32 spell)
+{
+    auto bounds = sSpellMgr->GetSkillLineAbilityMapBounds(spell);
+    for (auto it = bounds.first; it != bounds.second; ++it)
+        switch (it->second->SkillLine)
+        {
+            case SKILL_ALCHEMY: return "alch";
+            case SKILL_BLACKSMITHING: return "bs";
+            case SKILL_COOKING: return "cook";
+            case SKILL_ENGINEERING: return "engi";
+            case SKILL_FIRST_AID: return "first aid";
+            case SKILL_LEATHERWORKING: return "lw";
+            case SKILL_TAILORING: return "tailor";
+            default: break;
+        }
+    return nullptr;
+}
+
+bool WovCraftTradeAsk(Player* asker)
+{
+    if (!g_wovCraftEnable || !asker || asker->GetLevel() < 12)
+        return false;
+    WovCraftBuild();
+    std::vector<Player*> crafters;
+    for (auto const& [guid, b] : sRandomPlayerbotMgr.GetAllBots())
+        if (b && b != asker && b->IsInWorld() && b->GetTeamId() == asker->GetTeamId() && WovInCapital(b) && !b->GetGroup() &&
+            b->GetLevel() >= 10)
+            crafters.push_back(b);
+    std::shuffle(crafters.begin(), crafters.end(), std::mt19937(std::random_device{}()));
+    if (crafters.size() > 12)
+        crafters.resize(12);
+    uint8 lvl = asker->GetLevel();
+    for (Player* c : crafters)
+    {
+        std::vector<std::pair<uint32, uint32>> opts;  // (item, spell)
+        for (auto const& [item, spells] : g_wovCraftRecipes)
+        {
+            ItemTemplate const* p = sObjectMgr->GetItemTemplate(item);
+            if (!p || p->Bonding == BIND_WHEN_PICKED_UP || p->RequiredLevel > lvl || p->RequiredLevel + 12 < lvl)
+                continue;
+            bool gear = (p->Class == ITEM_CLASS_WEAPON || p->Class == ITEM_CLASS_ARMOR) && p->Quality >= ITEM_QUALITY_UNCOMMON &&
+                        p->RequiredLevel >= 5;
+            bool use = p->Class == ITEM_CLASS_CONSUMABLE && p->RequiredLevel >= 5;
+            if (!gear && !use)
+                continue;
+            for (uint32 sp : spells)
+                if (c->HasSpell(sp) && WovProfName(sp))
+                {
+                    opts.push_back({item, sp});
+                    break;
+                }
+        }
+        if (opts.empty())
+            continue;
+        auto [item, sp] = opts[urand(0, opts.size() - 1)];
+        ItemTemplate const* p = sObjectMgr->GetItemTemplate(item);
+        PlayerbotAI* ai = GET_PLAYERBOT_AI(asker);
+        if (!ai)
+            return false;
+        std::string link = ChatHelper::FormatItem(p);
+        std::string prof = WovProfName(sp);
+        ai->SayToChannel(WovRep(WovRep(WovPick(kWovCraftLf), "{prof}", prof), "{item}", link), ChatChannelId::TRADE);
+        if (urand(0, 99) < 70)
+        {
+            std::string t = WovRep(WovRep(WovRep(WovPick(kWovCraftCan), "{prof}", prof), "{item}", link), "{asker}", asker->GetName());
+            g_wovCraftPub.push_back({time(nullptr) + time_t(urand(15, 70)), c->GetGUID().GetCounter(), t});
+        }
+        LOG_INFO("playerbots", "WoV craft: {} asks Trade for {} ({} {} can make it)", asker->GetName(), p->Name1, prof, c->GetName());
+        return true;
+    }
+    return false;
+}
+
+void WovCraftPubTick(time_t now)
+{
+    for (size_t i = 0; i < g_wovCraftPub.size();)
+    {
+        if (now < g_wovCraftPub[i].due)
+        {
+            ++i;
+            continue;
+        }
+        WovCraftPub e = g_wovCraftPub[i];
+        g_wovCraftPub.erase(g_wovCraftPub.begin() + i);
+        Player* b = ObjectAccessor::FindPlayerByLowGUID(e.bot);
+        PlayerbotAI* ai = b ? GET_PLAYERBOT_AI(b) : nullptr;
+        if (ai && b->IsInWorld() && WovInCapital(b))
+            ai->SayToChannel(e.text, ChatChannelId::TRADE);
+    }
+}
+
 void WovCraft_Tick(time_t now)
 {
     static time_t last = 0, cfgT = 0, mailT = 0;
@@ -2497,6 +2610,7 @@ void WovCraft_Tick(time_t now)
     if (!g_wovCraftEnable || now < last + 3)
         return;
     last = now;
+    WovCraftPubTick(now);
     if (!loaded)
     {
         loaded = true;
