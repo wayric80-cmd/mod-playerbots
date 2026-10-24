@@ -111,8 +111,14 @@ bool LeaveFarAwayAction::Execute(Event /*event*/)
     return Leave();
 }
 
+bool WovBotReserved(uint32 low);  // wov: RandomPlayerbotMgr.cpp
+
 bool LeaveFarAwayAction::isUseful()
 {
+    // wov: a dungeon-run party stays together until the run is over; the coordinator breaks it up
+    if (WovBotReserved(bot->GetGUID().GetCounter()))
+        return false;
+
     if (bot->InBattleground())
         return false;
 
