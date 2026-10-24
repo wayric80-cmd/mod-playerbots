@@ -5182,6 +5182,9 @@ void RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation>&
         if (bot->HasUnitMovementFlag(MOVEMENTFLAG_ONTRANSPORT) && bot->HasUnitState(UNIT_STATE_IGNORE_PATHFINDING) &&
             botAI->HasPlayerNearby())
             return;
+        // wov: a player never vanishes in front of someone (level-up and periodic teleports); it walks or flies on
+        if (!hearth && botAI->HasPlayerNearby(200.0f))
+            return;
     }
 
     // if (sPlayerbotAIConfig.randomBotRpgChance < 0)
