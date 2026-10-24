@@ -2170,6 +2170,9 @@ struct WovDgSpot
     WovDgDef const* def = nullptr;
     uint32 map = 0, dmap = 0;
     float x = 0, y = 0, z = 0, dx = 0, dy = 0, dz = 0, dO = 0;
+    // where the party meets: the stone itself, or dry land next to it when the entrance is under water (BFD)
+    mutable float mx = 0, my = 0, mz = 0;
+    mutable bool meetSet = false;
 };
 enum WovDgPhase : uint8 { DG_GATHER, DG_ENTER, DG_RUN, DG_DONE };
 struct WovDgMember
@@ -2181,6 +2184,7 @@ struct WovDgMember
     float px = 0, py = 0;  // last position that counted as progress
     time_t joined = 0;
     time_t closerT = 0;  // last time it got 30 yd closer to the stone
+    time_t deadT = 0;    // dead since (on the way)
 };
 struct WovDgRunState
 {
@@ -2190,6 +2194,10 @@ struct WovDgRunState
     WovDgPhase phase = DG_GATHER;
     time_t start = 0, phaseT = 0, tankThere = 0;
     bool finalKilled = false;
+    float tx = 0, ty = 0;               // tank position the stall watchdog compares with
+    time_t moveT = 0, logT = 0, rezT = 0;
+    uint8 stalls = 0, retries = 0;
+    bool swum = false;
 };
 std::vector<WovDgSpot> g_wovDgSpots;
 std::vector<WovDgRunState> g_wovDgRuns;
@@ -2248,6 +2256,9 @@ void WovDgConfig(time_t now)
             s.dy = tp->target_Y;
             s.dz = tp->target_Z;
             s.dO = tp->target_Orientation;
+            s.mx = s.x;
+            s.my = s.y;
+            s.mz = s.z;
             g_wovDgSpots.push_back(s);
         }
         if (QueryResult r = WorldDatabase.Query("SELECT creditEntry FROM instance_encounters WHERE creditType=0 AND lastEncounterDungeon>0"))
@@ -2284,16 +2295,60 @@ bool WovDgFits(Player* b, WovDgDef const* d, uint8 around)
     return l >= d->minL && l <= d->maxL && std::abs(int(l) - int(around)) <= 5;
 }
 
+// an entrance under water: the party waits on the nearest dry ground and swims in together (waiting at the stone
+// itself drowns them). Needs the grid loaded, so it is worked out when the first member is close.
+void WovDgMeetFix(WovDgSpot const* s, Player* near)
+{
+    s->meetSet = true;
+    Map* m = near->GetMap();
+    uint32 ph = near->GetPhaseMask();
+    float wl = m->GetWaterLevel(s->x, s->y);
+    bool wet = m->IsInWater(ph, s->x, s->y, s->z + 0.5f, 2.0f) || (wl > INVALID_HEIGHT && wl > s->z + 1.0f);
+    if (!wet)
+        return;
+    for (float rad = 15.0f; rad <= 220.0f; rad += 5.0f)
+    {
+        float bestZ = INVALID_HEIGHT, bx = 0, by = 0;
+        for (int a = 0; a < 32; ++a)
+        {
+            float ang = float(a) * float(M_PI) / 16.0f;
+            float x = s->x + rad * std::cos(ang), y = s->y + rad * std::sin(ang);
+            float gz = m->GetHeight(ph, x, y, s->z + 80.0f, true, 120.0f);
+            if (gz <= INVALID_HEIGHT || std::fabs(gz - s->z) > 60.0f || m->IsInWater(ph, x, y, gz + 0.5f, 2.0f))
+                continue;
+            float lw = m->GetWaterLevel(x, y);
+            if (lw > INVALID_HEIGHT && lw > gz + 0.3f)
+                continue;
+            if (bestZ <= INVALID_HEIGHT || gz < bestZ)  // the lowest dry spot: the shore, not a hill top
+            {
+                bestZ = gz;
+                bx = x;
+                by = y;
+            }
+        }
+        if (bestZ > INVALID_HEIGHT)
+        {
+            s->mx = bx;
+            s->my = by;
+            s->mz = bestZ;
+            LOG_INFO("playerbots", "WoV dungeon runs: {} entrance is under water, the party meets on the shore {:.0f} yd away ({:.0f},{:.0f},{:.0f})",
+                     s->def->name, rad, bx, by, bestZ);
+            return;
+        }
+    }
+    LOG_INFO("playerbots", "WoV dungeon runs: {} entrance is under water and no dry ground was found near it", s->def->name);
+}
+
 void WovDgGoTo(Player* b, PlayerbotAI* ai, WovDgSpot const* s, WovDgMember& mm, time_t now)
 {
-    float d = b->GetExactDist(s->x, s->y, s->z);
+    float d = b->GetExactDist(s->mx, s->my, s->mz);
     if (b->GetMapId() != s->map)
         return;
     if (false && d > 900.0f && !mm.flew && !b->IsInFlight())  // wov: walking proved more reliable than the taxi flow
     {
         mm.flew = true;
         TravelMgr::FlightMasterInfo const* fm = sTravelMgr.GetNearestFlightMasterInfo(b);
-        uint32 to = sObjectMgr->GetNearestTaxiNode(s->x, s->y, s->z, s->map, b->GetTeamId());
+        uint32 to = sObjectMgr->GetNearestTaxiNode(s->mx, s->my, s->mz, s->map, b->GetTeamId());
         if (fm && fm->taxiNodeId && to && fm->taxiNodeId != to)
         {
             std::vector<uint32> path = sTravelNodeMap.FindTaxiPath(fm->taxiNodeId, to);
@@ -2313,8 +2368,8 @@ void WovDgGoTo(Player* b, PlayerbotAI* ai, WovDgSpot const* s, WovDgMember& mm, 
         return;
     }
     auto* gc = std::get_if<NewRpgInfo::GoCamp>(&ai->rpgInfo.data);
-    if (!gc || gc->pos.distance(WorldPosition(s->map, s->x, s->y, s->z)) > 5.0f)
-        ai->rpgInfo.ChangeToGoCamp(WorldPosition(s->map, s->x, s->y, s->z));
+    if (!gc || gc->pos.distance(WorldPosition(s->map, s->mx, s->my, s->mz)) > 5.0f)
+        ai->rpgInfo.ChangeToGoCamp(WorldPosition(s->map, s->mx, s->my, s->mz));
 }
 
 void WovDgRelease(WovDgRunState& r, char const* why, bool sayBye)
@@ -2524,6 +2579,13 @@ bool WovDgStep(WovDgRunState& r, time_t now)
     if (r.phase == DG_GATHER)
     {
         uint32 here = 0;
+        if (!r.spot->meetSet)
+            for (Player* b : ps)
+                if (b->GetMapId() == r.spot->map && b->GetExactDist(r.spot->x, r.spot->y, r.spot->z) < 250.0f)
+                {
+                    WovDgMeetFix(r.spot, b);
+                    break;
+                }
         for (size_t i = 0; i < ps.size(); ++i)
         {
             Player* b = ps[i];
@@ -2533,7 +2595,24 @@ bool WovDgStep(WovDgRunState& r, time_t now)
                 WovDgRelease(r, std::string(b->GetName() + (b->InBattlegroundQueue() || b->InBattleground() ? " queued for a battleground" : " left the continent")).c_str(), false);
                 return false;
             }
-            float d = b->GetExactDist(r.spot->x, r.spot->y, r.spot->z);
+            // dead on the way (a mob, a fall, drowning): it runs back like anyone, but not for ever
+            if (!b->IsAlive())
+            {
+                if (!mm.deadT)
+                    mm.deadT = now;
+                if (now > mm.deadT + 4 * MINUTE)
+                {
+                    if (i == 0 || !WovDgReplace(r, i, tank, now))
+                    {
+                        WovDgRelease(r, std::string(b->GetName() + " kept dying on the way").c_str(), false);
+                        return false;
+                    }
+                    return true;
+                }
+            }
+            else
+                mm.deadT = 0;
+            float d = b->GetExactDist(r.spot->mx, r.spot->my, r.spot->mz);
             // progress = it is moving (walking to a flight master counts) or fighting or already there
             float moved = std::hypot(b->GetPositionX() - mm.px, b->GetPositionY() - mm.py);
             if (moved > 15.0f || b->IsInFlight() || b->IsInCombat() || d <= 30.0f)
@@ -2552,9 +2631,9 @@ bool WovDgStep(WovDgRunState& r, time_t now)
             if (d > 60.0f && !mm.flew && now > mm.closerT + 4 * MINUTE && !b->IsInCombat() && !b->IsInFlight())
             {
                 float k = std::min(1.0f, 400.0f / d);  // a stretch of the way, at most 400 yd at a time
-                float tx = b->GetPositionX() + (r.spot->x - b->GetPositionX()) * k;
-                float ty = b->GetPositionY() + (r.spot->y - b->GetPositionY()) * k;
-                float tz = k >= 1.0f ? r.spot->z : b->GetMap()->GetHeight(b->GetPhaseMask(), tx, ty, MAX_HEIGHT);
+                float tx = b->GetPositionX() + (r.spot->mx - b->GetPositionX()) * k;
+                float ty = b->GetPositionY() + (r.spot->my - b->GetPositionY()) * k;
+                float tz = k >= 1.0f ? r.spot->mz : b->GetMap()->GetHeight(b->GetPhaseMask(), tx, ty, MAX_HEIGHT);
                 if (tz > INVALID_HEIGHT)
                     WovUnstick(b, GET_PLAYERBOT_AI(b), WorldPosition(r.spot->map, tx, ty, tz), "dungeon run");
                 mm.closerT = now;
@@ -2571,9 +2650,9 @@ bool WovDgStep(WovDgRunState& r, time_t now)
                 }
                 return true;  // the new member is picked up next tick
             }
-            if (d <= 60.0f && mm.flew)
+            if (d <= 60.0f && mm.flew && b->IsAlive())
                 ++here;
-            if (!b->IsInCombat())
+            if (!b->IsInCombat() && b->IsAlive())
                 WovDgGoTo(b, GET_PLAYERBOT_AI(b), r.spot, mm, now);
             // in someone else's group (picked up on the way): it leaves it for the run
             if (Group* og = b->GetGroup())
@@ -2585,18 +2664,18 @@ bool WovDgStep(WovDgRunState& r, time_t now)
             r.phaseT = now;
             std::string st;
             for (size_t i = 0; i < ps.size(); ++i)
-                st += " " + ps[i]->GetName() + ":" + std::to_string(int(ps[i]->GetExactDist(r.spot->x, r.spot->y, r.spot->z))) +
+                st += " " + ps[i]->GetName() + ":" + std::to_string(int(ps[i]->GetExactDist(r.spot->mx, r.spot->my, r.spot->mz))) +
                       (ps[i]->IsInFlight() ? "f" : "") + "/" + std::to_string(uint32(GET_PLAYERBOT_AI(ps[i])->rpgInfo.GetStatus()));
             LOG_INFO("playerbots", "WoV dungeon run #{} {} gathering:{}", r.id, r.spot->def->name, st);
         }
         // the party forms at the stone as people arrive
-        if (!r.tankThere && tank->GetExactDist(r.spot->x, r.spot->y, r.spot->z) <= 40.0f)
+        if (!r.tankThere && tank->GetExactDist(r.spot->mx, r.spot->my, r.spot->mz) <= 40.0f)
             r.tankThere = now;
-        if (tank->GetExactDist(r.spot->x, r.spot->y, r.spot->z) <= 60.0f)
+        if (tank->GetExactDist(r.spot->mx, r.spot->my, r.spot->mz) <= 60.0f)
             for (size_t i = 1; i < ps.size(); ++i)
             {
                 Player* b = ps[i];
-                if (b->GetExactDist(r.spot->x, r.spot->y, r.spot->z) <= 60.0f && !b->GetGroup() &&
+                if (b->GetExactDist(r.spot->mx, r.spot->my, r.spot->mz) <= 60.0f && !b->GetGroup() &&
                     (!tank->GetGroup() || (tank->GetGroup()->IsLeader(tank->GetGUID()) && !tank->GetGroup()->IsFull())))
                     WovInviteFrom(tank, b);
             }
@@ -2638,6 +2717,24 @@ bool WovDgStep(WovDgRunState& r, time_t now)
     {
         if (now < r.phaseT + 4)
             return true;
+        if (!r.swum)  // meeting point on the shore: swim to the entrance together first
+        {
+            bool shore = std::hypot(r.spot->mx - r.spot->x, r.spot->my - r.spot->y) > 8.0f;
+            if (shore && now < r.phaseT + 100 && tank->GetExactDist(r.spot->x, r.spot->y, r.spot->z) > 12.0f)
+            {
+                WorldPosition stone(r.spot->map, r.spot->x, r.spot->y, r.spot->z);
+                for (Player* b : ps)
+                    if (PlayerbotAI* ai = GET_PLAYERBOT_AI(b))
+                    {
+                        auto* gc = std::get_if<NewRpgInfo::GoCamp>(&ai->rpgInfo.data);
+                        if (!gc || gc->pos.distance(stone) > 5.0f)
+                            ai->rpgInfo.ChangeToGoCamp(stone);
+                    }
+                return true;
+            }
+            r.swum = true;
+            r.phaseT = now - 4;
+        }
         // the portal: everyone steps through together
         for (Player* b : ps)
             if (b->GetMapId() == r.spot->map && !b->IsBeingTeleported())
@@ -2698,16 +2795,87 @@ bool WovDgStep(WovDgRunState& r, time_t now)
             WovDgRelease(r, anyAlive ? "the party broke up" : "wiped, the party broke up", true);
             return false;
         }
+        if (r.rezT && now >= r.rezT + 25)  // back on their feet, ate and drank: second try
+        {
+            r.rezT = 0;
+            for (Player* b : ps)
+                if (b->IsAlive())
+                {
+                    b->SetFullHealth();
+                    if (b->getPowerType() == POWER_MANA)
+                        b->SetPower(POWER_MANA, b->GetMaxPower(POWER_MANA));
+                }
+            tai->DoSpecificAction("dc on", Event("wov", "", nullptr), true);
+            r.moveT = 0;
+            LOG_INFO("playerbots", "WoV dungeon run #{} {}: second try after the wipe", r.id, r.spot->def->name);
+        }
         if (!anyAlive)
         {
-            if (!r.phaseT || now > r.phaseT + 4 * MINUTE)
+            if (r.retries == 0 && now > r.phaseT + 3 * MINUTE)  // the corpse run took its time
             {
-                WovDgRelease(r, "wiped and gave up", true);
+                r.retries = 1;
+                for (Player* b : ps)
+                {
+                    b->ResurrectPlayer(0.5f);
+                    b->SpawnCorpseBones();
+                }
+                r.rezT = now;
+                r.phaseT = now;
+                static char const* const again[] = {"ok again, slower this time", "my bad, again?", "lets try that again",
+                                                    "wait for mana before pulls pls", "one more go"};
+                if (urand(0, 99) < 70)
+                    GET_PLAYERBOT_AI(ps[urand(0, ps.size() - 1)])->SayToParty(again[urand(0, 4)]);
+                LOG_INFO("playerbots", "WoV dungeon run #{} {}: wiped, they run back and try again", r.id, r.spot->def->name);
+            }
+            else if (now > r.phaseT + 4 * MINUTE)
+            {
+                WovDgRelease(r, r.retries ? "wiped twice and gave up" : "wiped and gave up", true);
                 return false;
             }
+            return true;
         }
-        else
-            r.phaseT = now;
+        r.phaseT = now;
+        if (now >= r.logT + 10 * MINUTE)
+        {
+            r.logT = now;
+            uint32 alive = 0;
+            for (Player* b : ps)
+                alive += b->IsAlive() ? 1 : 0;
+            LOG_INFO("playerbots", "WoV dungeon run #{} {} inside: tank at {:.0f},{:.0f},{:.0f}, {} alive, {} min", r.id,
+                     r.spot->def->name, tank->GetPositionX(), tank->GetPositionY(), tank->GetPositionZ(), alive, (now - r.start) / 60);
+        }
+        // stall watchdog: the tank has not moved 20 yd in 7 minutes out of combat (no path, an event it cannot do)
+        if (!r.rezT)
+        {
+            float mv = std::hypot(tank->GetPositionX() - r.tx, tank->GetPositionY() - r.ty);
+            if (!r.moveT || mv > 20.0f || tank->IsInCombat() || !tank->IsAlive())
+            {
+                r.tx = tank->GetPositionX();
+                r.ty = tank->GetPositionY();
+                r.moveT = now;
+            }
+            else if (now > r.moveT + 7 * MINUTE)
+            {
+                r.moveT = now;
+                ++r.stalls;
+                LOG_INFO("playerbots", "WoV dungeon run #{} {}: stalled at {:.0f},{:.0f},{:.0f} (stall {})", r.id, r.spot->def->name,
+                         tank->GetPositionX(), tank->GetPositionY(), tank->GetPositionZ(), r.stalls);
+                if (r.stalls == 1)
+                    tai->DoSpecificAction("dc on", Event("wov", "", nullptr), true);  // fresh plan from here
+                else if (r.stalls <= 3)
+                {
+                    tai->DoSpecificAction("dc skip", Event("wov", "", nullptr), true);
+                    tai->DoSpecificAction("dc on", Event("wov", "", nullptr), true);
+                    if (urand(0, 99) < 50)
+                        tai->SayToParty(urand(0, 1) ? "cant get there, skip it" : "eh stuck, lets skip that one");
+                }
+                else
+                {
+                    WovDgRelease(r, "got stuck inside", true);
+                    return false;
+                }
+            }
+        }
         return true;
     }
     // DG_DONE: loot a minute, then thanks and part ways
