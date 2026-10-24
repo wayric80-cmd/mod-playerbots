@@ -14,6 +14,8 @@
 #include "Playerbots.h"
 #include "WorldPacket.h"
 
+uint32 WovDgLeaderOf(uint32 low);  // wov: RandomPlayerbotMgr.cpp
+
 bool AcceptInvitationAction::Execute(Event event)
 {
     Group* grp = bot->GetGroupInvite();
@@ -27,6 +29,17 @@ bool AcceptInvitationAction::Execute(Event event)
     Player* inviter = ObjectAccessor::FindPlayer(grp->GetLeaderGUID());
     if (!inviter)
         return false;
+
+    // wov: a bot on its way to a dungeon run only joins that run's tank
+    if (uint32 lead = WovDgLeaderOf(bot->GetGUID().GetCounter()))
+        if (inviter->GetGUID().GetCounter() != lead)
+        {
+            WorldPacket data(SMSG_GROUP_DECLINE, 10);
+            data << bot->GetName();
+            inviter->SendDirectMessage(&data);
+            bot->UninviteFromGroup();
+            return false;
+        }
 
     if (!botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_INVITE, false, inviter))
     {

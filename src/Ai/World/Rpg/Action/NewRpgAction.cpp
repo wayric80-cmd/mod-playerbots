@@ -234,10 +234,15 @@ bool StartRpgDoQuestAction::Execute(Event event)
     return false;
 }
 
+bool WovBotReserved(uint32 low);  // wov: RandomPlayerbotMgr.cpp
+
 bool NewRpgStatusUpdateAction::Execute(Event /*event*/)
 {
     NewRpgInfo& info = botAI->rpgInfo;
     NewRpgStatus status = info.GetStatus();
+    // wov: a bot walking to (or waiting at) a dungeon meeting point keeps doing that; the coordinator owns it
+    if ((status == RPG_GO_CAMP || status == RPG_REST) && WovBotReserved(bot->GetGUID().GetCounter()))
+        return false;
     switch (status)
     {
         case RPG_IDLE:
@@ -354,7 +359,8 @@ bool NewRpgGoGrindAction::Execute(Event /*event*/)
 
 bool NewRpgGoCampAction::Execute(Event /*event*/)
 {
-    if (SearchQuestGiverAndAcceptOrReward())
+    // wov: a bot heading to a meeting point (dungeon run) does not stop at every quest giver on the way
+    if (!WovBotReserved(bot->GetGUID().GetCounter()) && SearchQuestGiverAndAcceptOrReward())
         return true;
 
     if (auto* data = std::get_if<NewRpgInfo::GoCamp>(&botAI->rpgInfo.data))

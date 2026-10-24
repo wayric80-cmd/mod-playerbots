@@ -2143,6 +2143,645 @@ void WovDungeon_Tick(time_t now)
 }
 // ---- end wov: dungeon talk ----------------------------------------------------------------------------
 
+// ---- wov: dungeon runs ----------------------------------------------------------------------------------
+// Bots run dungeons on their own, the way a pug does: a tank picks a dungeon that fits its level near where it
+// plays, a healer and three dps of the right level and faction who are around answer, everyone walks (or flies)
+// to the entrance, the party forms at the stone, walks through the portal and the tank leads the clear
+// (mod-dungeon-clear). When the last boss is dead they say thanks and go their own way. No teleports except the
+// instance portal itself, no summons, nothing a player could not do.
+#include "MapMgr.h"
+namespace
+{
+struct WovDgDef
+{
+    char const* name;
+    uint32 trigger;  // areatrigger_teleport id of the outdoor entrance
+    uint8 minL, maxL;
+    int team;  // -1 both, 0 alliance, 1 horde
+};
+WovDgDef const kWovDgDefs[] = {
+    {"RFC", 2230, 13, 18, 1},       {"WC", 228, 17, 25, -1},     {"deadmines", 78, 17, 26, 0},
+    {"SFK", 145, 22, 30, -1},       {"BFD", 257, 24, 32, -1},    {"stockades", 101, 24, 32, 0},
+    {"RFK", 244, 29, 38, -1},       {"gnomer", 324, 29, 38, -1}, {"RFD", 442, 37, 46, -1},
+    {"mara", 3134, 46, 55, -1},     {"ST", 446, 50, 56, -1},     {"scholo", 2567, 58, 60, -1},
+    {"strat", 2214, 58, 60, -1}};
+struct WovDgSpot
+{
+    WovDgDef const* def = nullptr;
+    uint32 map = 0, dmap = 0;
+    float x = 0, y = 0, z = 0, dx = 0, dy = 0, dz = 0, dO = 0;
+};
+enum WovDgPhase : uint8 { DG_GATHER, DG_ENTER, DG_RUN, DG_DONE };
+struct WovDgMember
+{
+    uint32 low = 0;
+    float lastDist = 1e9f;  // unused (kept for layout)
+    time_t lastProgress = 0;
+    bool flew = false;
+    float px = 0, py = 0;  // last position that counted as progress
+    time_t joined = 0;
+    time_t closerT = 0;  // last time it got 30 yd closer to the stone
+};
+struct WovDgRunState
+{
+    uint32 id = 0;
+    WovDgSpot const* spot = nullptr;
+    std::vector<WovDgMember> m;  // m[0] is the tank
+    WovDgPhase phase = DG_GATHER;
+    time_t start = 0, phaseT = 0, tankThere = 0;
+    bool finalKilled = false;
+};
+std::vector<WovDgSpot> g_wovDgSpots;
+std::vector<WovDgRunState> g_wovDgRuns;
+std::unordered_set<uint32> g_wovDgFinal;  // creature entries of last bosses
+std::unordered_set<uint32> g_wovDgEnabled;  // enabled entrance triggers (config)
+std::mutex g_wovDgKillMutex;
+std::vector<std::pair<uint32, uint32>> g_wovDgKills;  // (killer low, creature entry), from the kill hook
+bool g_wovDgEnable = false;
+uint32 g_wovDgMax = 6, g_wovDgEvery = 120, g_wovDgNextId = 1;
+float g_wovDgTankRange = 2600.0f, g_wovDgMemberRange = 2300.0f;
+time_t g_wovDgNextStart = 0, g_wovDgCfgT = 0;
+
+char const* const kWovDgOmw[] = {"omw", "coming", "on my way", "otw", "omw, 2 min", "k coming"};
+char const* const kWovDgBye[] = {"ty for group", "gg ty", "ty all", "thx for the run", "gg", "ty gl", "nice run ty", "cya"};
+char const* const kWovDgThanks[] = {"gj all", "ez", "gg", "nice", "that went well", "gz on loot"};
+
+bool WovOnMarketTrip(uint32 low);  // wov: market (below)
+
+void WovDgConfig(time_t now)
+{
+    if (now < g_wovDgCfgT + 60)
+        return;
+    g_wovDgCfgT = now;
+    g_wovDgEnable = sConfigMgr->GetOption<bool>("AiPlayerbot.WoV.DgRuns.Enable", false);
+    g_wovDgMax = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.DgRuns.MaxActive", 6);
+    g_wovDgEvery = std::max<uint32>(30, sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.DgRuns.StartEverySec", 120));
+    g_wovDgTankRange = sConfigMgr->GetOption<float>("AiPlayerbot.WoV.DgRuns.TankRange", 2600.0f);
+    g_wovDgMemberRange = sConfigMgr->GetOption<float>("AiPlayerbot.WoV.DgRuns.MemberRange", 2300.0f);
+    std::string list = sConfigMgr->GetOption<std::string>("AiPlayerbot.WoV.DgRuns.Triggers", "2230,228,78,145,257,101,244,324,442");
+    g_wovDgEnabled.clear();
+    std::string cur;
+    for (char ch : list + ",")
+        if (std::isdigit(static_cast<unsigned char>(ch)))
+            cur += ch;
+        else if (!cur.empty())
+        {
+            g_wovDgEnabled.insert(uint32(std::strtoul(cur.c_str(), nullptr, 10)));
+            cur.clear();
+        }
+    if (g_wovDgSpots.empty())
+    {
+        for (WovDgDef const& d : kWovDgDefs)
+        {
+            AreaTrigger const* at = sObjectMgr->GetAreaTrigger(d.trigger);
+            AreaTriggerTeleport const* tp = sObjectMgr->GetAreaTriggerTeleport(d.trigger);
+            if (!at || !tp)
+                continue;
+            WovDgSpot s;
+            s.def = &d;
+            s.map = at->map;
+            s.x = at->x;
+            s.y = at->y;
+            s.z = at->z;
+            s.dmap = tp->target_mapId;
+            s.dx = tp->target_X;
+            s.dy = tp->target_Y;
+            s.dz = tp->target_Z;
+            s.dO = tp->target_Orientation;
+            g_wovDgSpots.push_back(s);
+        }
+        if (QueryResult r = WorldDatabase.Query("SELECT creditEntry FROM instance_encounters WHERE creditType=0 AND lastEncounterDungeon>0"))
+            do
+                g_wovDgFinal.insert(r->Fetch()[0].Get<uint32>());
+            while (r->NextRow());
+        LOG_INFO("playerbots", "WoV dungeon runs: {} entrances, {} last bosses", g_wovDgSpots.size(), g_wovDgFinal.size());
+    }
+}
+
+bool WovDgBusy(uint32 low)
+{
+    for (WovDgRunState const& r : g_wovDgRuns)
+        for (WovDgMember const& mm : r.m)
+            if (mm.low == low)
+                return true;
+    return false;
+}
+
+bool WovDgFree(Player* b, TeamId team, time_t now)
+{
+    if (!WovFreeBot(b, team, now) || b->InBattlegroundQueue() || b->IsInCombat() || b->IsInFlight())
+        return false;
+    if (!b->GetMap() || b->GetMap()->Instanceable() || WovOnMarketTrip(b->GetGUID().GetCounter()) ||
+        WovDgBusy(b->GetGUID().GetCounter()))
+        return false;
+    PlayerbotAI* ai = GET_PLAYERBOT_AI(b);
+    return ai && !ai->GetMaster();
+}
+
+bool WovDgFits(Player* b, WovDgDef const* d, uint8 around)
+{
+    uint8 l = b->GetLevel();
+    return l >= d->minL && l <= d->maxL && std::abs(int(l) - int(around)) <= 5;
+}
+
+void WovDgGoTo(Player* b, PlayerbotAI* ai, WovDgSpot const* s, WovDgMember& mm, time_t now)
+{
+    float d = b->GetExactDist(s->x, s->y, s->z);
+    if (b->GetMapId() != s->map)
+        return;
+    if (false && d > 900.0f && !mm.flew && !b->IsInFlight())  // wov: walking proved more reliable than the taxi flow
+    {
+        mm.flew = true;
+        TravelMgr::FlightMasterInfo const* fm = sTravelMgr.GetNearestFlightMasterInfo(b);
+        uint32 to = sObjectMgr->GetNearestTaxiNode(s->x, s->y, s->z, s->map, b->GetTeamId());
+        if (fm && fm->taxiNodeId && to && fm->taxiNodeId != to)
+        {
+            std::vector<uint32> path = sTravelNodeMap.FindTaxiPath(fm->taxiNodeId, to);
+            if (!path.empty())
+            {
+                ai->rpgInfo.ChangeToTravelFlight(fm->templateEntry, fm->pos, path);
+                return;
+            }
+        }
+    }
+    if (b->IsInFlight())
+        return;  // already on a taxi: let it land
+    if (d <= 12.0f)
+    {
+        if (ai->rpgInfo.GetStatus() != RPG_REST)
+            ai->rpgInfo.ChangeToRest();
+        return;
+    }
+    auto* gc = std::get_if<NewRpgInfo::GoCamp>(&ai->rpgInfo.data);
+    if (!gc || gc->pos.distance(WorldPosition(s->map, s->x, s->y, s->z)) > 5.0f)
+        ai->rpgInfo.ChangeToGoCamp(WorldPosition(s->map, s->x, s->y, s->z));
+}
+
+void WovDgRelease(WovDgRunState& r, char const* why, bool sayBye)
+{
+    uint32 said = 0;
+    for (WovDgMember const& mm : r.m)
+    {
+        Player* b = ObjectAccessor::FindPlayerByLowGUID(mm.low);
+        PlayerbotAI* ai = b ? GET_PLAYERBOT_AI(b) : nullptr;
+        if (!ai)
+            continue;
+        if (sayBye && b->GetGroup() && said < 2 && urand(0, 99) < 60)
+        {
+            ai->SayToParty(WovPick(kWovDgBye));
+            ++said;
+        }
+        if (b->GetGroup())
+            ai->LeaveOrDisbandGroup();
+        ai->ResetStrategies();  // back to its own spec and normal life
+        ai->rpgInfo.ChangeToIdle();
+    }
+    LOG_INFO("playerbots", "WoV dungeon run #{} {}: {}", r.id, r.spot->def->name, why);
+}
+
+// in a levelling pug any warrior tanks and any priest heals, whatever the talents
+bool WovDgCanTank(Player* b) { return b->getClass() == CLASS_WARRIOR || PlayerbotAI::IsTank(b, true); }
+bool WovDgCanHeal(Player* b) { return b->getClass() == CLASS_PRIEST || PlayerbotAI::IsHeal(b, true); }
+
+// the pug roles for this run: a warrior tanks in defensive stance whatever its talents, a priest heals
+void WovDgRoles(std::vector<Player*> const& ps)
+{
+    if (PlayerbotAI* ai = GET_PLAYERBOT_AI(ps[0]))
+        if (!PlayerbotAI::IsTank(ps[0]) && ps[0]->getClass() == CLASS_WARRIOR)
+            ai->ChangeStrategy("-arms,-fury,-dps assist,+tank,+tank assist,+pull,+pull back", BOT_STATE_COMBAT);
+    if (PlayerbotAI* ai = GET_PLAYERBOT_AI(ps[1]))
+        if (!PlayerbotAI::IsHeal(ps[1]))
+            switch (ps[1]->getClass())
+            {
+                case CLASS_PRIEST: ai->ChangeStrategy("-dps,-shadow debuff,-shadow aoe,-dps assist,+heal", BOT_STATE_COMBAT); break;
+                case CLASS_PALADIN: ai->ChangeStrategy("-dps,-tank,-tank assist,-bthreat,+heal,+bcast", BOT_STATE_COMBAT); break;
+                case CLASS_SHAMAN: ai->ChangeStrategy("-ele,-enh,+resto", BOT_STATE_COMBAT); break;
+                case CLASS_DRUID: ai->ChangeStrategy("-cat,-bear,-balance,-tank assist,+resto", BOT_STATE_COMBAT); break;
+                default: break;
+            }
+}
+
+bool WovDgStart(time_t now)
+{
+    std::vector<Player*> tanks;
+    for (auto const& [g, b] : sRandomPlayerbotMgr.GetAllBots())
+        if (b && b->IsInWorld() && b->GetLevel() >= 13 && WovDgFree(b, b->GetTeamId(), now) && WovDgCanTank(b))
+            tanks.push_back(b);
+    std::shuffle(tanks.begin(), tanks.end(), std::mt19937(std::random_device{}()));
+    uint32 nSpot = 0, nHeal = 0, nDps = 0;
+    for (Player* t : tanks)
+    {
+        // nearest enabled entrance that fits the tank, on its continent, within reach
+        WovDgSpot const* best = nullptr;
+        float bestD = g_wovDgTankRange;
+        for (WovDgSpot const& s : g_wovDgSpots)
+        {
+            if (!g_wovDgEnabled.count(s.def->trigger) || s.map != t->GetMapId() || !WovDgFits(t, s.def, t->GetLevel()))
+                continue;
+            bool taken = false;  // one party at a stone at a time
+            for (WovDgRunState const& o : g_wovDgRuns)
+                taken = taken || o.spot == &s;
+            if (taken)
+                continue;
+            if (s.def->team >= 0 && int(t->GetTeamId()) != s.def->team)
+                continue;
+            float d = t->GetExactDist(s.x, s.y, s.z);
+            if (d < bestD)
+            {
+                bestD = d;
+                best = &s;
+            }
+        }
+        if (!best)
+            continue;
+        ++nSpot;
+        Player* heal = nullptr;
+        std::vector<Player*> dps;
+        std::vector<std::pair<float, Player*>> cands;
+        for (auto const& [g, b] : sRandomPlayerbotMgr.GetAllBots())
+        {
+            if (!b || b == t || !b->IsInWorld() || b->GetMapId() != best->map || !WovDgFits(b, best->def, t->GetLevel()) ||
+                !WovDgFree(b, t->GetTeamId(), now))
+                continue;
+            float d = b->GetExactDist(best->x, best->y, best->z);
+            if (d > g_wovDgMemberRange)
+                continue;
+            if (b->GetGuildId() && b->GetGuildId() == t->GetGuildId())
+                d *= 0.5f;  // guildmates answer first
+            cands.push_back({d, b});
+        }
+        std::sort(cands.begin(), cands.end(), [](auto const& a, auto const& b) { return a.first < b.first; });
+        for (auto const& [d, b] : cands)
+        {
+            if (PlayerbotAI::IsTank(b, true))
+                continue;
+            if (!heal && WovDgCanHeal(b))
+                heal = b;
+            else if (!PlayerbotAI::IsHeal(b, true) && b->getClass() != CLASS_PRIEST && dps.size() < 3)
+                dps.push_back(b);
+            if (heal && dps.size() == 3)
+                break;
+        }
+        // no healer by spec or priest around: a paladin, shaman or druid heals this one
+        if (!heal)
+            for (auto const& [d, b] : cands)
+            {
+                uint8 c = b->getClass();
+                if ((c == CLASS_PALADIN || c == CLASS_SHAMAN || c == CLASS_DRUID) &&
+                    std::find(dps.begin(), dps.end(), b) == dps.end() && !PlayerbotAI::IsTank(b, true))
+                {
+                    heal = b;
+                    break;
+                }
+            }
+        if (heal)
+            ++nHeal;
+        if (dps.size() >= 3)
+            ++nDps;
+        if (!heal || dps.size() < 3)
+            continue;
+        WovDgRunState r;
+        r.id = g_wovDgNextId++;
+        r.spot = best;
+        r.start = r.phaseT = now;
+        for (Player* p : std::vector<Player*>{t, heal, dps[0], dps[1], dps[2]})
+        {
+            r.m.push_back({p->GetGUID().GetCounter(), 1e9f, now, false, 0.0f, 0.0f, now});
+            g_wovBusyBot[p->GetGUID().GetCounter()] = uint32(now + 3 * HOUR);
+            if (p != t && urand(0, 99) < 35)
+                p->Whisper(WovPick(kWovDgOmw), LANG_UNIVERSAL, t);
+        }
+        LOG_INFO("playerbots", "WoV dungeon run #{} {}: tank {} (lvl {}), heal {}, dps {} {} {}, {:.0f} yd to the stone", r.id,
+                 best->def->name, t->GetName(), t->GetLevel(), heal->GetName(), dps[0]->GetName(), dps[1]->GetName(),
+                 dps[2]->GetName(), bestD);
+        g_wovDgRuns.push_back(r);
+        return true;
+    }
+    LOG_INFO("playerbots", "WoV dungeon runs: no party this time ({} free tanks, {} near an entrance, {} with a healer, {} with 3 dps)",
+             tanks.size(), nSpot, nHeal, nDps);
+    return false;
+}
+
+// a member who does not show up is replaced by someone of the same role close to the stone ("anyone else?")
+bool WovDgReplace(WovDgRunState& r, size_t idx, Player* tank, time_t now)
+{
+    if (idx == 0)
+        return false;
+    Player* best = nullptr;
+    float bestD = g_wovDgMemberRange;
+    for (auto const& [g, b] : sRandomPlayerbotMgr.GetAllBots())
+    {
+        if (!b || !b->IsInWorld() || b->GetMapId() != r.spot->map || !WovDgFits(b, r.spot->def, tank->GetLevel()) ||
+            !WovDgFree(b, tank->GetTeamId(), now) || PlayerbotAI::IsTank(b, true))
+            continue;
+        bool healer = WovDgCanHeal(b) || b->getClass() == CLASS_PALADIN || b->getClass() == CLASS_SHAMAN || b->getClass() == CLASS_DRUID;
+        if (idx == 1 ? !healer : (PlayerbotAI::IsHeal(b, true) || b->getClass() == CLASS_PRIEST))
+            continue;
+        float d = b->GetExactDist(r.spot->x, r.spot->y, r.spot->z);
+        if (d < bestD)
+        {
+            bestD = d;
+            best = b;
+        }
+    }
+    if (!best)
+        return false;
+    uint32 old = r.m[idx].low;
+    if (Player* o = ObjectAccessor::FindPlayerByLowGUID(old))
+        if (PlayerbotAI* oai = GET_PLAYERBOT_AI(o))
+            oai->rpgInfo.ChangeToIdle();
+    g_wovBusyBot.erase(old);
+    r.m[idx] = {best->GetGUID().GetCounter(), 1e9f, now, false, best->GetPositionX(), best->GetPositionY(), now};
+    g_wovBusyBot[best->GetGUID().GetCounter()] = uint32(now + 3 * HOUR);
+    if (urand(0, 99) < 35)
+        best->Whisper(WovPick(kWovDgOmw), LANG_UNIVERSAL, tank);
+    LOG_INFO("playerbots", "WoV dungeon run #{} {}: {} replaces a member who did not show up ({:.0f} yd away)", r.id,
+             r.spot->def->name, best->GetName(), bestD);
+    return true;
+}
+
+// returns false when the run is over and should be removed
+bool WovDgStep(WovDgRunState& r, time_t now)
+{
+    std::vector<Player*> ps;
+    for (WovDgMember const& mm : r.m)
+    {
+        Player* b = ObjectAccessor::FindPlayerByLowGUID(mm.low);
+        if (!b || !b->IsInWorld() || !GET_PLAYERBOT_AI(b))
+        {
+            WovDgRelease(r, "a member logged off", r.phase == DG_RUN);
+            return false;
+        }
+        ps.push_back(b);
+    }
+    Player* tank = ps[0];
+    PlayerbotAI* tai = GET_PLAYERBOT_AI(tank);
+    if (now > r.start + 150 * MINUTE)
+    {
+        WovDgRelease(r, "timed out", true);
+        return false;
+    }
+    if (r.phase == DG_GATHER)
+    {
+        uint32 here = 0;
+        for (size_t i = 0; i < ps.size(); ++i)
+        {
+            Player* b = ps[i];
+            WovDgMember& mm = r.m[i];
+            if (b->GetMapId() != r.spot->map || b->InBattleground() || b->InBattlegroundQueue())
+            {
+                WovDgRelease(r, std::string(b->GetName() + (b->InBattlegroundQueue() || b->InBattleground() ? " queued for a battleground" : " left the continent")).c_str(), false);
+                return false;
+            }
+            float d = b->GetExactDist(r.spot->x, r.spot->y, r.spot->z);
+            // progress = it is moving (walking to a flight master counts) or fighting or already there
+            float moved = std::hypot(b->GetPositionX() - mm.px, b->GetPositionY() - mm.py);
+            if (moved > 15.0f || b->IsInFlight() || b->IsInCombat() || d <= 30.0f)
+            {
+                mm.px = b->GetPositionX();
+                mm.py = b->GetPositionY();
+                mm.lastProgress = now;
+            }
+            if (d < mm.lastDist - 30.0f || !mm.closerT)
+            {
+                mm.lastDist = d;
+                mm.closerT = now;
+            }
+            // walking in circles for 4 minutes without getting closer (no path, a wall, a river): it is
+            // placed further along the way, never where a real player could see it (WovUnstick checks)
+            if (d > 60.0f && !mm.flew && now > mm.closerT + 4 * MINUTE && !b->IsInCombat() && !b->IsInFlight())
+            {
+                float k = std::min(1.0f, 400.0f / d);  // a stretch of the way, at most 400 yd at a time
+                float tx = b->GetPositionX() + (r.spot->x - b->GetPositionX()) * k;
+                float ty = b->GetPositionY() + (r.spot->y - b->GetPositionY()) * k;
+                float tz = k >= 1.0f ? r.spot->z : b->GetMap()->GetHeight(b->GetPhaseMask(), tx, ty, MAX_HEIGHT);
+                if (tz > INVALID_HEIGHT)
+                    WovUnstick(b, GET_PLAYERBOT_AI(b), WorldPosition(r.spot->map, tx, ty, tz), "dungeon run");
+                mm.closerT = now;
+            }
+            if (d <= 40.0f)
+                mm.flew = true;  // reused as "has arrived at the stone"
+            bool late = i > 0 && !mm.flew && r.tankThere && now > std::max(r.tankThere, mm.joined) + 8 * MINUTE;
+            if (now > mm.lastProgress + 5 * MINUTE || late)
+            {
+                if (i == 0 || !WovDgReplace(r, i, tank, now))
+                {
+                    WovDgRelease(r, std::string(b->GetName() + (late ? " never showed up" : " got stuck on the way")).c_str(), false);
+                    return false;
+                }
+                return true;  // the new member is picked up next tick
+            }
+            if (d <= 60.0f && mm.flew)
+                ++here;
+            if (!b->IsInCombat())
+                WovDgGoTo(b, GET_PLAYERBOT_AI(b), r.spot, mm, now);
+            // in someone else's group (picked up on the way): it leaves it for the run
+            if (Group* og = b->GetGroup())
+                if (!og->IsMember(tank->GetGUID()) || (i == 0 && !og->IsLeader(tank->GetGUID())))
+                    GET_PLAYERBOT_AI(b)->LeaveOrDisbandGroup();
+        }
+        if (now >= r.phaseT + 60)
+        {
+            r.phaseT = now;
+            std::string st;
+            for (size_t i = 0; i < ps.size(); ++i)
+                st += " " + ps[i]->GetName() + ":" + std::to_string(int(ps[i]->GetExactDist(r.spot->x, r.spot->y, r.spot->z))) +
+                      (ps[i]->IsInFlight() ? "f" : "") + "/" + std::to_string(uint32(GET_PLAYERBOT_AI(ps[i])->rpgInfo.GetStatus()));
+            LOG_INFO("playerbots", "WoV dungeon run #{} {} gathering:{}", r.id, r.spot->def->name, st);
+        }
+        // the party forms at the stone as people arrive
+        if (!r.tankThere && tank->GetExactDist(r.spot->x, r.spot->y, r.spot->z) <= 40.0f)
+            r.tankThere = now;
+        if (tank->GetExactDist(r.spot->x, r.spot->y, r.spot->z) <= 60.0f)
+            for (size_t i = 1; i < ps.size(); ++i)
+            {
+                Player* b = ps[i];
+                if (b->GetExactDist(r.spot->x, r.spot->y, r.spot->z) <= 60.0f && !b->GetGroup() &&
+                    (!tank->GetGroup() || (tank->GetGroup()->IsLeader(tank->GetGUID()) && !tank->GetGroup()->IsFull())))
+                    WovInviteFrom(tank, b);
+            }
+        Group* g = tank->GetGroup();
+        if (g && g->IsLeader(tank->GetGUID()))  // someone else got in: the run's own people come first
+        {
+            std::vector<ObjectGuid> extra;
+            for (GroupReference* ref = g->GetFirstMember(); ref; ref = ref->next())
+                if (Player* m = ref->GetSource())
+                {
+                    bool ours = false;
+                    for (Player* b : ps)
+                        ours = ours || b == m;
+                    if (!ours)
+                        extra.push_back(m->GetGUID());
+                }
+            for (ObjectGuid const& x : extra)
+                g->RemoveMember(x, GROUP_REMOVEMETHOD_KICK);
+            g = tank->GetGroup();
+        }
+        bool all = g && g->IsLeader(tank->GetGUID());
+        for (Player* b : ps)
+            all = all && g && g->IsMember(b->GetGUID());
+        if (all && here == ps.size())
+        {
+            r.phase = DG_ENTER;
+            r.phaseT = now;
+            if (urand(0, 99) < 60)
+                tai->SayToParty(urand(0, 1) ? "ok everyone here, lets go" : "all here? going in");
+        }
+        else if (now > r.start + 40 * MINUTE)
+        {
+            WovDgRelease(r, "never got the party together", false);
+            return false;
+        }
+        return true;
+    }
+    if (r.phase == DG_ENTER)
+    {
+        if (now < r.phaseT + 4)
+            return true;
+        // the portal: everyone steps through together
+        for (Player* b : ps)
+            if (b->GetMapId() == r.spot->map && !b->IsBeingTeleported())
+            {
+                if (sMapMgr->PlayerCannotEnter(r.spot->dmap, b, false) != Map::CAN_ENTER)
+                {
+                    WovDgRelease(r, std::string(b->GetName() + " cannot enter the instance").c_str(), true);
+                    return false;
+                }
+                b->TeleportTo(r.spot->dmap, r.spot->dx + frand(-1.5f, 1.5f), r.spot->dy + frand(-1.5f, 1.5f), r.spot->dz,
+                              r.spot->dO);
+            }
+        bool inside = true;
+        for (Player* b : ps)
+            inside = inside && b->GetMapId() == r.spot->dmap && b->IsInWorld() && !b->IsBeingTeleported() &&
+                     b->GetInstanceId() == tank->GetInstanceId();
+        if (inside && now >= r.phaseT + 10)
+        {
+            WovDgRoles(ps);
+            tai->DoSpecificAction("dc on", Event("wov", "", nullptr), true);
+            r.phase = DG_RUN;
+            r.phaseT = now;
+            LOG_INFO("playerbots", "WoV dungeon run #{} {}: inside (instance {}), clear started", r.id, r.spot->def->name,
+                     tank->GetInstanceId());
+        }
+        else if (now > r.phaseT + 3 * MINUTE)
+        {
+            std::string who;
+            for (Player* b : ps)
+                who += " " + b->GetName() + ":" + std::to_string(b->GetMapId()) + "/" + std::to_string(b->GetInstanceId()) +
+                       (b->IsAlive() ? "" : "(dead)") + (b->IsBeingTeleported() ? "(tp)" : "") +
+                       ":" + std::to_string(uint32(sMapMgr->PlayerCannotEnter(r.spot->dmap, b, false)));
+            WovDgRelease(r, std::string("could not get everyone inside:" + who).c_str(), true);
+            return false;
+        }
+        return true;
+    }
+    if (r.phase == DG_RUN)
+    {
+        WovDgRoles(ps);  // a strategy reset (group or talent change) must not take the roles away mid-run
+        bool anyAlive = false, left = false;
+        for (Player* b : ps)
+        {
+            anyAlive = anyAlive || b->IsAlive();
+            left = left || b->GetMapId() != r.spot->dmap || !b->GetGroup() || b->GetGroup() != tank->GetGroup();
+        }
+        if (r.finalKilled)
+        {
+            r.phase = DG_DONE;
+            r.phaseT = now;
+            if (urand(0, 99) < 70)
+                GET_PLAYERBOT_AI(ps[urand(0, ps.size() - 1)])->SayToParty(WovPick(kWovDgThanks));
+            LOG_INFO("playerbots", "WoV dungeon run #{} {}: cleared in {} min", r.id, r.spot->def->name, (now - r.start) / 60);
+            return true;
+        }
+        if (left)
+        {
+            WovDgRelease(r, anyAlive ? "the party broke up" : "wiped, the party broke up", true);
+            return false;
+        }
+        if (!anyAlive)
+        {
+            if (!r.phaseT || now > r.phaseT + 4 * MINUTE)
+            {
+                WovDgRelease(r, "wiped and gave up", true);
+                return false;
+            }
+        }
+        else
+            r.phaseT = now;
+        return true;
+    }
+    // DG_DONE: loot a minute, then thanks and part ways
+    if (now >= r.phaseT + 70)
+    {
+        WovDgRelease(r, "done", true);
+        return false;
+    }
+    return true;
+}
+}  // namespace
+
+// wov: the tank a dungeon-run member waits for (0 when it is in no run). World thread.
+uint32 WovDgLeaderOf(uint32 low)
+{
+    for (WovDgRunState const& r : g_wovDgRuns)
+        for (size_t i = 1; i < r.m.size(); ++i)
+            if (r.m[i].low == low)
+                return r.m[0].low;
+    return 0;
+}
+
+// wov: true while a bot is taken by a planned activity (dungeon run, group forming, ...)
+bool WovBotReserved(uint32 low)
+{
+    auto it = g_wovBusyBot.find(low);
+    return it != g_wovBusyBot.end() && time(nullptr) < time_t(it->second);
+}
+
+void WovDungeonRun_OnKill(Player* killer, Creature* killed)
+{
+    if (!g_wovDgEnable || !killer || !killed || !g_wovDgFinal.count(killed->GetEntry()) || !killer->GetMap() ||
+        !killer->GetMap()->IsDungeon())
+        return;
+    std::lock_guard<std::mutex> lock(g_wovDgKillMutex);
+    g_wovDgKills.push_back({killer->GetGUID().GetCounter(), killed->GetEntry()});
+}
+
+void WovDungeonRun_Tick(time_t now)
+{
+    WovDgConfig(now);
+    static time_t last = 0;
+    if (now < last + 5)
+        return;
+    last = now;
+    std::vector<std::pair<uint32, uint32>> kills;
+    {
+        std::lock_guard<std::mutex> lock(g_wovDgKillMutex);
+        kills.swap(g_wovDgKills);
+    }
+    for (auto const& [k, e] : kills)
+        for (WovDgRunState& r : g_wovDgRuns)
+            for (WovDgMember const& mm : r.m)
+                if (mm.low == k)
+                    r.finalKilled = true;
+    for (size_t i = 0; i < g_wovDgRuns.size();)
+    {
+        if (WovDgStep(g_wovDgRuns[i], now))
+            ++i;
+        else
+        {
+            for (WovDgMember const& mm : g_wovDgRuns[i].m)
+                g_wovBusyBot.erase(mm.low);
+            g_wovDgRuns.erase(g_wovDgRuns.begin() + i);
+        }
+    }
+    if (g_wovDgEnable && g_wovDgRuns.size() < g_wovDgMax && now >= g_wovDgNextStart)
+    {
+        g_wovDgNextStart = now + g_wovDgEvery;
+        WovDgStart(now);
+    }
+}
+// ---- end wov: dungeon runs ------------------------------------------------------------------------------
+
 // ---- wov: crafting orders -----------------------------------------------------------------------------
 // A real player links an item and asks for it ("can u make [Heavy Linen Bandage]?" in a whisper, or
 // "LF tailor [Red Linen Shirt]" in Trade). A bot that knows a recipe for it whispers back what mats it needs and
@@ -2920,6 +3559,7 @@ std::unordered_map<AuctionHouseObject const*, std::vector<WovAhLot>> g_wovAhLots
 std::unordered_map<uint32, time_t> g_wovAhBought;  // bot -> last purchase (under g_wovAhMutex)
 std::unordered_map<uint32, uint32> g_wovAhBoughtEntry;  // bot -> item entry it bought (under g_wovAhMutex)
 std::unordered_map<uint32, WovTrip> g_wovTrips;     // world thread only
+bool WovOnMarketTrip(uint32 low) { return g_wovTrips.count(low) != 0; }  // wov: dungeon runs
 std::mutex g_wovReachMutex;
 std::vector<WovReach> g_wovReached;
 std::vector<std::tuple<uint32, uint32, time_t>> g_wovEquipLater;  // (bot, item low guid, when): world thread
@@ -3188,6 +3828,9 @@ void WovMarket_Tick(time_t now)
             force.insert(low);
         for (auto const& [low, sk] : g_wovBotSk)
             force.insert(low);
+        for (auto const& [low, until] : g_wovBusyBot)  // wov: dungeon runs and groups being formed
+            if (now < time_t(until))
+                force.insert(low);
         std::lock_guard<std::mutex> lock(g_wovForceMutex);
         g_wovForce.swap(force);
     }
@@ -3756,6 +4399,7 @@ void RandomPlayerbotMgr::UpdateAIInternal(uint32 /*elapsed*/, bool /*minimal*/)
     WovInit_Tick(time(nullptr));  // wov: initiative
     WovTogether_Tick(time(nullptr));  // wov: play together
     WovDungeon_Tick(time(nullptr));  // wov: dungeon talk
+    WovDungeonRun_Tick(time(nullptr));  // wov: dungeon runs
     WovRegear_Tick(time(nullptr));  // wov: regear once
     WovRegearBracket_Tick(time(nullptr));  // wov: one fresh set per level bracket
     WovMarket_Tick(time(nullptr));  // wov: market
@@ -5168,6 +5812,8 @@ void RandomPlayerbotMgr::Revive(Player* player)
     RandomTeleportGrindForLevel(player);
 }
 
+bool WovBotReserved(uint32 low);  // fwd
+
 void RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation>& locs, bool hearth)
 {
     // ignore when alrdy teleported or not in the world yet.
@@ -5199,6 +5845,9 @@ void RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation>&
             return;
         // wov: a player never vanishes in front of someone (level-up and periodic teleports); it walks or flies on
         if (!hearth && botAI->HasPlayerNearby(200.0f))
+            return;
+        // wov: nor while it is on its way to a dungeon run or in one
+        if (WovBotReserved(bot->GetGUID().GetCounter()))
             return;
     }
 

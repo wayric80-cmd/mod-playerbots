@@ -308,6 +308,8 @@ bool BGJoinAction::shouldJoinBg(BattlegroundQueueTypeId queueTypeId, Battlegroun
     return false;
 }
 
+bool WovBotReserved(uint32 low);  // wov: RandomPlayerbotMgr.cpp
+
 bool BGJoinAction::isUseful()
 {
     // do not try if BG bots disabled
@@ -328,6 +330,10 @@ bool BGJoinAction::isUseful()
 
     // check level
     if (bot->GetLevel() < 10)
+        return false;
+
+    // wov: a bot on its way to (or in) a dungeon run or another planned activity does not queue
+    if (WovBotReserved(bot->GetGUID().GetCounter()))
         return false;
 
     // do not try if with player master

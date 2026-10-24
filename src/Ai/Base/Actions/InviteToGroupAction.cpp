@@ -52,6 +52,8 @@ bool InviteToGroupAction::Invite(Player* inviter, Player* player)
     return true;
 }
 
+bool WovBotReserved(uint32 low);  // wov: RandomPlayerbotMgr.cpp
+
 bool InviteNearbyToGroupAction::Execute(Event /*event*/)
 {
     GuidVector nearGuids = botAI->GetAiObjectContext()->GetValue<GuidVector>("nearest friendly players")->Get();
@@ -68,6 +70,9 @@ bool InviteNearbyToGroupAction::Execute(Event /*event*/)
             continue;
 
         if (player->GetGroup())
+            continue;
+
+        if (WovBotReserved(player->GetGUID().GetCounter()))  // wov: on its way to a planned run
             continue;
 
         if (!PlayerbotAIConfig::instance().randomBotInvitePlayer && IsSelfBot(player))
@@ -131,6 +136,9 @@ bool InviteNearbyToGroupAction::isUseful()
     if (!PlayerbotAIConfig::instance().randomBotGroupNearby)
         return false;
 
+    if (WovBotReserved(bot->GetGUID().GetCounter()))  // wov: its group is made by the run coordinator
+        return false;
+
     if (bot->InBattleground())
         return false;
 
@@ -187,6 +195,9 @@ bool InviteGuildToGroupAction::Execute(Event /*event*/)
             continue;
 
         if (player->GetGroup())
+            continue;
+
+        if (WovBotReserved(player->GetGUID().GetCounter()))  // wov: on its way to a planned run
             continue;
 
         if (player->isDND())

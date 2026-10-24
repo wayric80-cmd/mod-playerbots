@@ -140,6 +140,7 @@ void WovTogether_OnChannel(Player* player, std::string const& msg);  // wov
 bool WovCraft_OnWhisper(Player* from, Player* to, std::string const& msg);  // wov
 void WovCraft_OnChannel(Player* player, std::string const& msg);  // wov
 void WovDungeon_OnRoll(Player* winner, uint32 item, uint8 vote, Roll* roll);  // wov
+void WovDungeonRun_OnKill(Player* killer, Creature* killed);  // wov
 
 class PlayerbotsPlayerScript : public PlayerScript
 {
@@ -159,7 +160,9 @@ public:
         PLAYERHOOK_ON_BEFORE_TELEPORT,
         PLAYERHOOK_CAN_GROUP_INVITE,
         PLAYERHOOK_ON_SEND_LIST_INVENTORY,
-        PLAYERHOOK_ON_GROUP_ROLL_REWARD_ITEM
+        PLAYERHOOK_ON_GROUP_ROLL_REWARD_ITEM,
+        PLAYERHOOK_ON_CREATURE_KILL,
+        PLAYERHOOK_ON_CREATURE_KILLED_BY_PET
     }) {}
 
     // WoV: opt-in test telemetry only, never sends chat or changes a skill.
@@ -477,6 +480,9 @@ public:
 
         return true;
     }
+
+    void OnPlayerCreatureKill(Player* killer, Creature* killed) override { WovDungeonRun_OnKill(killer, killed); }  // wov
+    void OnPlayerCreatureKilledByPet(Player* owner, Creature* killed) override { WovDungeonRun_OnKill(owner, killed); }  // wov
 
     void OnPlayerGroupRollRewardItem(Player* player, Item* item, uint32 /*count*/, RollVote voteType, Roll* roll) override
     {
