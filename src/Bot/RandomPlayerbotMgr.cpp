@@ -2201,6 +2201,7 @@ struct WovDgRunState
 };
 std::vector<WovDgSpot> g_wovDgSpots;
 std::vector<WovDgRunState> g_wovDgRuns;
+std::unordered_map<uint32, time_t> g_wovDgDropped;  // replaced for not showing up: not picked again for a while
 std::unordered_set<uint32> g_wovDgFinal;  // creature entries of last bosses
 std::unordered_set<uint32> g_wovDgEnabled;  // enabled entrance triggers (config)
 std::mutex g_wovDgKillMutex;
@@ -2284,6 +2285,9 @@ bool WovDgFree(Player* b, TeamId team, time_t now)
         return false;
     if (!b->GetMap() || b->GetMap()->Instanceable() || WovOnMarketTrip(b->GetGUID().GetCounter()) ||
         WovDgBusy(b->GetGUID().GetCounter()))
+        return false;
+    auto dr = g_wovDgDropped.find(b->GetGUID().GetCounter());
+    if (dr != g_wovDgDropped.end() && now < dr->second)
         return false;
     PlayerbotAI* ai = GET_PLAYERBOT_AI(b);
     return ai && !ai->GetMaster();
@@ -2546,6 +2550,7 @@ bool WovDgReplace(WovDgRunState& r, size_t idx, Player* tank, time_t now)
         if (PlayerbotAI* oai = GET_PLAYERBOT_AI(o))
             oai->rpgInfo.ChangeToIdle();
     g_wovBusyBot.erase(old);
+    g_wovDgDropped[old] = now + 20 * MINUTE;
     r.m[idx] = {best->GetGUID().GetCounter(), 1e9f, now, false, best->GetPositionX(), best->GetPositionY(), now};
     g_wovBusyBot[best->GetGUID().GetCounter()] = uint32(now + 3 * HOUR);
     if (urand(0, 99) < 35)
