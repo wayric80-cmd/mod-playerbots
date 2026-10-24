@@ -36,6 +36,7 @@
 // and simulator: wov/wov_schedule.py -- keep the two in sync.
 #include "Config.h"
 #include <unordered_map>
+#include "CharacterCache.h"
 namespace
 {
 struct WovSched { uint8 kind; uint8 startHour; uint16 mins; uint8 drive; };
@@ -91,6 +92,8 @@ uint32 WovPlayProb(uint8 kind, int64 weekday)  // weekday 0=Sun .. 6=Sat
     }
 }
 
+void WovLoadBands();
+
 void WovLoadSchedules()
 {
     time_t now = time(nullptr);
@@ -101,6 +104,7 @@ void WovLoadSchedules()
     g_wovSessionPct = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.Schedule.SessionPercent", 100);
     g_wovMinOnline = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.Schedule.MinOnline", 0);
     g_wovLogoutsPerMinute = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.Schedule.LogoutsPerMinute", 10);
+    WovLoadBands();
     if (!g_wovSchedEnable)
         return;
     QueryResult r = CharacterDatabase.Query(
@@ -146,6 +150,62 @@ bool WovScheduledOnline(uint32 guid)
             return true;
     }
     return false;
+}
+
+// wov: level bands. Levels are never changed by the server; the mix of who is ONLINE is steered instead,
+// by which characters log in to keep the floor and which end their session. Bands: 1-10, 11-20, 21-30,
+// 31-40, 41-50, 51-59, 60. Shares from AiPlayerbot.WoV.Bands ("12,12,12,12,12,12,28"); empty = off.
+uint32 g_wovBandPct[7] = {0, 0, 0, 0, 0, 0, 0};
+bool g_wovBands = false;
+
+uint8 WovBandOf(uint32 level)
+{
+    if (level >= 60)
+        return 6;
+    if (level >= 51)
+        return 5;
+    return uint8((std::max<uint32>(level, 1) - 1) / 10);
+}
+
+void WovLoadBands()
+{
+    std::string v = sConfigMgr->GetOption<std::string>("AiPlayerbot.WoV.Bands", "");
+    uint32 vals[7] = {0, 0, 0, 0, 0, 0, 0}, n = 0, sum = 0;
+    std::string cur;
+    for (char ch : v + ",")
+    {
+        if (ch == ',')
+        {
+            if (!cur.empty() && n < 7)
+            {
+                vals[n] = uint32(std::strtoul(cur.c_str(), nullptr, 10));
+                sum += vals[n++];
+            }
+            cur.clear();
+        }
+        else if (std::isdigit(static_cast<unsigned char>(ch)))
+            cur += ch;
+    }
+    g_wovBands = n == 7 && sum > 0;
+    for (uint32 i = 0; i < 7; ++i)
+        g_wovBandPct[i] = g_wovBands ? vals[i] * 100 / sum : 0;
+}
+
+uint8 WovBandOfGuid(uint32 guid)
+{
+    if (Player* p = ObjectAccessor::FindPlayerByLowGUID(guid))
+        return WovBandOf(p->GetLevel());
+    return WovBandOf(sCharacterCache->GetCharacterLevelByGuid(ObjectGuid::Create<HighGuid::Player>(guid)));
+}
+
+// online count per band for the given set of bot guids
+template <class Set>
+void WovBandCounts(Set const& bots, uint32 (&out)[7])
+{
+    for (uint32& o : out)
+        o = 0;
+    for (uint32 g : bots)
+        ++out[WovBandOfGuid(g)];
 }
 
 bool WovLogoutBudget()
@@ -1563,15 +1623,12 @@ char const* const kWovHand[] = {"u lead pls, havent done {dg} in ages", "ok we'r
 
 int WovRoleOf(Player* p)
 {
-    switch (p->getClass())
-    {
-        case CLASS_WARRIOR: return 0;
-        case CLASS_PRIEST: return 1;
-        case CLASS_DRUID:
-        case CLASS_SHAMAN:
-        case CLASS_PALADIN: return (p->GetGUID().GetCounter() % 2) ? 1 : 2;
-        default: return 2;
-    }
+    // wov: the role its talents actually give it (a holy paladin heals, a fury warrior is dps)
+    if (PlayerbotAI::IsTank(p, true))
+        return 0;
+    if (PlayerbotAI::IsHeal(p, true))
+        return 1;
+    return 2;
 }
 
 char const* WovClassName(Player* p)
@@ -4157,6 +4214,41 @@ uint32 RandomPlayerbotMgr::AddRandomBots()
         // Shuffle for class balance
         std::shuffle(allCharacters.begin(), allCharacters.end(), rng);
 
+        // wov: fill the bands that are short of their share first (levels are never changed, only who logs in)
+        if (g_wovSchedEnable && g_wovBands)
+        {
+            uint32 online[7];
+            WovBandCounts(currentBots, online);
+            uint32 target = uint32(currentBots.size()) + maxAllowedBotCount;
+            std::vector<CharacterInfo> byBand[7];
+            for (auto const& ci : allCharacters)
+                byBand[WovBandOfGuid(ci.guid)].push_back(ci);
+            std::vector<CharacterInfo> ordered;
+            ordered.reserve(allCharacters.size());
+            size_t idx[7] = {0, 0, 0, 0, 0, 0, 0};
+            while (ordered.size() < allCharacters.size())
+            {
+                int best = -1;
+                double bestGap = -1e18;
+                for (int b = 0; b < 7; ++b)
+                {
+                    if (idx[b] >= byBand[b].size())
+                        continue;
+                    double gap = double(g_wovBandPct[b]) * target / 100.0 - double(online[b]);
+                    if (gap > bestGap)
+                    {
+                        bestGap = gap;
+                        best = b;
+                    }
+                }
+                if (best < 0)
+                    break;
+                ordered.push_back(byBand[best][idx[best]++]);
+                ++online[best];  // as if it logged in; scheduled-off characters later in the list still fill in
+            }
+            allCharacters.swap(ordered);
+        }
+
         // Separate characters by faction for phased login
         std::vector<CharacterInfo> allianceChars;
         std::vector<CharacterInfo> hordeChars;
@@ -4810,8 +4902,22 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
     }
 
     // wov: session over -> log out, a few per minute, never in a group or next to a real player
+    int wovBandSide = 0;  // -1 short of its share, +1 well over it
+    if (g_wovSchedEnable && g_wovBands && player)
+    {
+        static time_t bandT = 0;
+        static uint32 bandOnline[7] = {0, 0, 0, 0, 0, 0, 0};
+        if (time(nullptr) >= bandT + 30)
+        {
+            bandT = time(nullptr);
+            WovBandCounts(currentBots, bandOnline);
+        }
+        uint8 b = WovBandOf(player->GetLevel());
+        double want = double(g_wovBandPct[b]) * double(currentBots.size()) / 100.0;
+        wovBandSide = bandOnline[b] < want * 0.9 ? -1 : (bandOnline[b] > want * 1.3 ? 1 : 0);
+    }
     if (g_wovSchedEnable && player && player->IsInWorld() && !player->GetGroup() &&
-        currentBots.size() > g_wovMinOnline && !WovScheduledOnline(bot) &&
+        currentBots.size() > g_wovMinOnline && wovBandSide >= 0 && (!WovScheduledOnline(bot) || wovBandSide > 0) &&
         !(botAI && botAI->HasPlayerNearby(40.0f)) && WovLogoutBudget())
     {
         LOG_DEBUG("playerbots", "WoV: {} logs off (session over)", player->GetName());

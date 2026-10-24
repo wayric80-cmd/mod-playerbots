@@ -5,6 +5,7 @@
  */
 
 #include "AutoMaintenanceOnLevelupAction.h"
+#include "Config.h"
 #include "BroadcastHelper.h"
 #include "PlayerbotAIConfig.h"
 #include "PlayerbotFactory.h"
@@ -43,7 +44,16 @@ void AutoMaintenanceOnLevelupAction::AutoPickTalents()
         return;
 
     PlayerbotFactory factory(bot, bot->GetLevel());
-    factory.InitTalentsTree(true, true, true);
+    // wov: while levelling a player may try another spec now and then; at 60 the spec is settled
+    uint32 respec = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.RespecChancePct", 0);
+    if (respec && bot->GetLevel() >= 10 && bot->GetLevel() < 60 && urand(0, 99) < respec)
+    {
+        uint32 spec = factory.InitTalentsTree(false, true, true);
+        sRandomPlayerbotMgr.SetValue(bot->GetGUID().GetCounter(), "specNo", spec + 1);
+        LOG_INFO("playerbots", "WoV respec: {} (level {}) tries spec {}", bot->GetName(), bot->GetLevel(), spec);
+    }
+    else
+        factory.InitTalentsTree(true, true, true);
     factory.InitPetTalents();
 }
 
