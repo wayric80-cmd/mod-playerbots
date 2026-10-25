@@ -2910,7 +2910,11 @@ bool WovDgStep(WovDgRunState& r, time_t now)
         }
         if (left)
         {
-            WovDgRelease(r, anyAlive ? "the party broke up" : "wiped, the party broke up", true);
+            std::string who;
+            for (Player* b : ps)
+                if ((b->IsAlive() && b->GetMapId() != r.spot->dmap) || !b->GetGroup() || b->GetGroup() != tank->GetGroup())
+                    who += " " + b->GetName() + (b->GetMapId() != r.spot->dmap ? "(outside)" : !b->GetGroup() ? "(no group)" : "(other group)");
+            WovDgRelease(r, std::string(anyAlive ? "the party broke up:" : "wiped, the party broke up:").append(who).c_str(), true);
             return false;
         }
         if (r.rezT && now >= r.rezT + 25)  // back on their feet, ate and drank: second try
@@ -6014,6 +6018,11 @@ bool RandomPlayerbotMgr::ProcessBot(Player* bot)
         return false;
 
      uint32 botId = bot->GetGUID().GetCounter();
+
+    // wov: a bot on a planned activity (dungeon run) is the coordinator's: no revive-teleport, no refresh that drops
+    // its group, no "leader is a random bot" leave
+    if (WovBotReserved(botId))
+        return false;
 
     // if death revive
     if (bot->isDead())
