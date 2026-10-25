@@ -15,6 +15,8 @@
 #include "RandomPlayerbotMgr.h"
 #include "ServerFacade.h"
 
+bool WovBotReserved(uint32 low);  // wov: RandomPlayerbotMgr.cpp
+
 bool ReviveFromCorpseAction::Execute(Event event)
 {
     // BG ghosts are revived by spirit healer waves; teleporting to a world graveyard removes them from the BG.
@@ -97,7 +99,9 @@ bool FindCorpseAction::Execute(Event /*event*/)
 
     if (!botAI->HasGameClientMaster())
     {
-        if (dCount >= 5)
+        if (dCount >= 5 && WovBotReserved(bot->GetGUID().GetCounter()))
+            context->GetValue<uint32>("death count")->Set(0);  // wov: a dungeon run handles its own dead
+        else if (dCount >= 5)
         {
             // LOG_INFO("playerbots", "Bot {} {}:{} <{}>: died too many times, was revived and teleported",
             //     bot->GetGUID().ToString().c_str(), bot->GetTeamId() == TEAM_ALLIANCE ? "A" : "H", bot->GetLevel(),

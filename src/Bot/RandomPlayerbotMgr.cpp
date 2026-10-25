@@ -5899,7 +5899,7 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
     uint32 isValid = GetEventValue(bot, "add");
     if (!isValid)
     {
-        if (!player || !player->GetGroup())
+        if (!player || (!player->GetGroup() && !WovBotReserved(bot)))  // wov: not while on its way to a dungeon run
         {
             if (player)
                 LOG_DEBUG("playerbots", "Bot #{} {}:{} <{}>: log out", bot, IsAlliance(player->getRace()) ? "A" : "H",
@@ -5932,7 +5932,7 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
         double want = double(g_wovBandPct[b]) * double(currentBots.size()) / 100.0;
         wovBandSide = bandOnline[b] < want * 0.9 ? -1 : (bandOnline[b] > want * 1.3 ? 1 : 0);
     }
-    if (g_wovSchedEnable && player && player->IsInWorld() && !player->GetGroup() &&
+    if (g_wovSchedEnable && player && player->IsInWorld() && !player->GetGroup() && !WovBotReserved(bot) &&
         currentBots.size() > g_wovMinOnline && wovBandSide >= 0 && (!WovScheduledOnline(bot) || wovBandSide > 0) &&
         !(botAI && botAI->HasPlayerNearby(40.0f)) && WovLogoutBudget())
     {
