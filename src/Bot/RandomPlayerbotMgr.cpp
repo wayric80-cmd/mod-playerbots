@@ -6044,6 +6044,53 @@ bool RandomPlayerbotMgr::ProcessBot(Player* bot)
     if (WovBotReserved(botId))
         return false;
 
+    // wov: fresh start (launch day, wov/fresh_start.py). With AiPlayerbot.WoV.FreshStart = N every random bot that has
+    // not had launch N yet is provisioned once more at level 1 (death knights at the heroic start level) by the factory
+    // (spells, skills, talents, gear, bags) and put in its race's starting area with its hearth there. Done once per
+    // bot per N; 0 = off.
+    {
+        static uint32 freshId = 0;
+        static time_t freshCfgT = 0;
+        static std::unordered_set<uint32> freshOnly;  // test: only these bots (empty = all)
+        if (time(nullptr) > freshCfgT + 60)
+        {
+            freshCfgT = time(nullptr);
+            freshId = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.FreshStart", 0);
+            freshOnly.clear();
+            std::string cur;
+            for (char ch : sConfigMgr->GetOption<std::string>("AiPlayerbot.WoV.FreshStart.Only", "") + ",")
+                if (std::isdigit(static_cast<unsigned char>(ch)))
+                    cur += ch;
+                else if (!cur.empty())
+                {
+                    freshOnly.insert(uint32(std::strtoul(cur.c_str(), nullptr, 10)));
+                    cur.clear();
+                }
+        }
+        if (freshId && (freshOnly.empty() || freshOnly.count(botId)) && bot->IsInWorld() && !bot->IsInCombat() && !bot->IsBeingTeleported() &&
+            GetEventValue(botId, "wov_fresh") != freshId)
+        {
+            uint32 level = bot->getClass() == CLASS_DEATH_KNIGHT
+                               ? std::max<uint32>(1, sWorld->getIntConfig(CONFIG_START_HEROIC_PLAYER_LEVEL))
+                               : 1;
+            if (bot->GetGroup())
+                botAI->LeaveOrDisbandGroup();
+            SetValue(bot, "level", level);
+            PlayerbotFactory factory(bot, level);
+            factory.Randomize(false);
+            MarkFactoryInitialized(bot);
+            if (PlayerInfo const* info = sObjectMgr->GetPlayerInfo(bot->getRace(), bot->getClass()))
+            {
+                WorldLocation start(info->mapId, info->positionX, info->positionY, info->positionZ, info->orientation);
+                bot->SetHomebind(start, info->areaId);
+                bot->TeleportTo(start);
+            }
+            SetEventValue(botId, "wov_fresh", freshId, 0);
+            LOG_INFO("playerbots", "WoV fresh start {}: {} is level {} in its starting area", freshId, bot->GetName(), level);
+            return true;
+        }
+    }
+
     // if death revive
     if (bot->isDead())
     {
