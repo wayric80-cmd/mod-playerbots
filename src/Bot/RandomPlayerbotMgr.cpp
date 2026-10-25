@@ -2689,6 +2689,7 @@ bool WovDgStep(WovDgRunState& r, time_t now)
                 {
                     if (i == 0 || !WovDgReplace(r, i, tank, now))
                     {
+                        g_wovDgDropped[mm.low] = now + 20 * MINUTE;
                         WovDgRelease(r, std::string(b->GetName() + " kept dying on the way").c_str(), false);
                         return false;
                     }
@@ -2730,6 +2731,7 @@ bool WovDgStep(WovDgRunState& r, time_t now)
             {
                 if (i == 0 || !WovDgReplace(r, i, tank, now))
                 {
+                    g_wovDgDropped[mm.low] = now + 20 * MINUTE;  // not picked again right away for the next party
                     WovDgRelease(r, std::string(b->GetName() + (late ? " never showed up" : " got stuck on the way")).c_str(), false);
                     return false;
                 }
