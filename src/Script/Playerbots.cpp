@@ -136,6 +136,7 @@ public:
 };
 
 void WovInit_OnWhisper(Player* from, Player* to);  // wov (RandomPlayerbotMgr.cpp)
+void WovDungeonRun_OnWhisper(Player* from, Player* to);  // wov (RandomPlayerbotMgr.cpp)
 void WovTogether_OnChannel(Player* player, std::string const& msg);  // wov
 bool WovCraft_OnWhisper(Player* from, Player* to, std::string const& msg);  // wov
 void WovCraft_OnChannel(Player* player, std::string const& msg);  // wov
@@ -408,6 +409,7 @@ public:
             return true;
 
         WovInit_OnWhisper(player, receiver);  // wov: answering an LFG/LFM post gets an invite
+        WovDungeonRun_OnWhisper(player, receiver);  // wov: answering a dungeon run's LFM
 
         botAI->HandleCommand(type, msg, player);
 

@@ -2160,7 +2160,7 @@ struct WovDgDef
     int team;  // -1 both, 0 alliance, 1 horde
 };
 WovDgDef const kWovDgDefs[] = {
-    {"RFC", 2230, 13, 18, 1},       {"WC", 228, 17, 25, -1},     {"deadmines", 78, 17, 26, 0},
+    {"RFC", 2230, 13, 18, 1},       {"WC", 228, 18, 25, -1},     {"deadmines", 78, 19, 26, 0},
     {"SFK", 145, 22, 30, -1},       {"BFD", 257, 24, 32, -1},    {"stockades", 101, 24, 32, 0},
     {"RFK", 244, 29, 38, -1},       {"gnomer", 324, 29, 38, -1}, {"RFD", 442, 37, 46, -1},
     {"mara", 3134, 46, 55, -1},     {"ST", 446, 50, 56, -1},     {"scholo", 2567, 58, 60, -1},
@@ -2198,6 +2198,9 @@ struct WovDgRunState
     time_t moveT = 0, logT = 0, rezT = 0;
     uint8 stalls = 0, retries = 0;
     bool swum = false;
+    uint32 real = 0;          // a real player who answered the tank's LFM (takes the last dps spot)
+    time_t realT = 0, lfmT = 0, limboT = 0;
+    uint8 lfmN = 0;
 };
 std::vector<WovDgSpot> g_wovDgSpots;
 std::vector<WovDgRunState> g_wovDgRuns;
@@ -2206,6 +2209,7 @@ std::unordered_set<uint32> g_wovDgFinal;  // creature entries of last bosses
 std::unordered_set<uint32> g_wovDgEnabled;  // enabled entrance triggers (config)
 std::mutex g_wovDgKillMutex;
 std::vector<std::pair<uint32, uint32>> g_wovDgKills;  // (killer low, creature entry), from the kill hook
+std::vector<std::pair<uint32, uint32>> g_wovDgJoins;  // (bot low, real player low): whispers to bots, same mutex
 bool g_wovDgEnable = false;
 uint32 g_wovDgMax = 6, g_wovDgEvery = 120, g_wovDgNextId = 1;
 float g_wovDgTankRange = 2600.0f, g_wovDgMemberRange = 2300.0f;
@@ -2560,6 +2564,54 @@ bool WovDgReplace(WovDgRunState& r, size_t idx, Player* tank, time_t now)
     return true;
 }
 
+// a dead member gets back like anyone: a released ghost zones in again, a corpse inside gets up (after the run back)
+void WovDgRunBack(WovDgRunState const& r, Player* b)
+{
+    if (b->IsAlive() || b->IsBeingTeleported())
+        return;
+    if (b->GetMapId() != r.spot->dmap)
+    {
+        b->TeleportTo(r.spot->dmap, r.spot->dx + frand(-1.5f, 1.5f), r.spot->dy + frand(-1.5f, 1.5f), r.spot->dz, r.spot->dO);
+        return;
+    }
+    b->ResurrectPlayer(0.5f);
+    b->SpawnCorpseBones();
+}
+
+// LFM for the run: only when a real player who could come is in the tank's zone (same side, level fits, no group).
+// Whoever whispers the tank within 10 minutes gets the last dps spot (WovDungeonRun_OnWhisper).
+void WovDgPostLfm(WovDgRunState& r, Player* tank, time_t now)
+{
+    if (r.real || r.lfmN >= 2 || now < r.start + 20 || now > r.start + 12 * MINUTE || (r.lfmT && now < r.lfmT + 4 * MINUTE))
+        return;
+    static time_t lastScan = 0;
+    if (now < lastScan + 1 && r.lfmT)
+        return;
+    lastScan = now;
+    bool any = false;
+    for (auto const& [id, session] : sWorldSessionMgr->GetAllSessions())
+    {
+        Player* p = session ? session->GetPlayer() : nullptr;
+        if (!p || !WovIsReal(p) || !p->IsInWorld() || p->GetGroup() || p->GetTeamId() != tank->GetTeamId() ||
+            p->GetZoneId() != tank->GetZoneId())
+            continue;
+        if (p->GetLevel() < r.spot->def->minL || p->GetLevel() > r.spot->def->maxL ||
+            std::abs(int(p->GetLevel()) - int(tank->GetLevel())) > 5)
+            continue;
+        any = true;
+        break;
+    }
+    if (!any)
+        return;
+    static char const* const lfm[] = {"LF1M {dg}, meet at the stone", "LF1M {dg} pst", "{dg} LF1M then go",
+                                      "need 1 more for {dg}, w/ me", "LF1M {dg}, any dps", "LF1M {dg} /w me"};
+    if (PlayerbotAI* ai = GET_PLAYERBOT_AI(tank))
+        ai->SayToChannel(WovRep(lfm[urand(0, 5)], "{dg}", r.spot->def->name), ChatChannelId::GENERAL);
+    r.lfmT = now;
+    ++r.lfmN;
+    LOG_INFO("playerbots", "WoV dungeon run #{} {}: LFM posted in General (a real player is in the zone)", r.id, r.spot->def->name);
+}
+
 // returns false when the run is over and should be removed
 bool WovDgStep(WovDgRunState& r, time_t now)
 {
@@ -2567,15 +2619,42 @@ bool WovDgStep(WovDgRunState& r, time_t now)
     for (WovDgMember const& mm : r.m)
     {
         Player* b = ObjectAccessor::FindPlayerByLowGUID(mm.low);
-        if (!b || !b->IsInWorld() || !GET_PLAYERBOT_AI(b))
+        if (!b || !GET_PLAYERBOT_AI(b))
         {
             WovDgRelease(r, "a member logged off", r.phase == DG_RUN);
             return false;
         }
+        if (!b->IsInWorld() || b->IsBeingTeleportedFar())
+        {
+            // between maps (portal, a ghost zoning in): look again next tick, but not for ever
+            if (!r.limboT)
+                r.limboT = now;
+            if (now > r.limboT + 2 * MINUTE)
+            {
+                WovDgRelease(r, std::string(b->GetName() + " vanished between maps").c_str(), r.phase == DG_RUN);
+                return false;
+            }
+            return true;
+        }
         ps.push_back(b);
     }
+    r.limboT = 0;
     Player* tank = ps[0];
     PlayerbotAI* tai = GET_PLAYERBOT_AI(tank);
+    Player* real = nullptr;
+    bool realIn = false;  // in the tank's group
+    if (r.real)
+    {
+        real = ObjectAccessor::FindPlayerByLowGUID(r.real);
+        realIn = real && tank->GetGroup() && tank->GetGroup()->IsMember(real->GetGUID());
+        if (!real || (!realIn && (r.phase != DG_GATHER || now > r.realT + 2 * MINUTE || real->GetGroup())))
+        {
+            LOG_INFO("playerbots", "WoV dungeon run #{} {}: the real player is no longer with the run", r.id, r.spot->def->name);
+            r.real = 0;
+            real = nullptr;
+            realIn = false;
+        }
+    }
     if (now > r.start + 150 * MINUTE)
     {
         WovDgRelease(r, "timed out", true);
@@ -2673,6 +2752,21 @@ bool WovDgStep(WovDgRunState& r, time_t now)
                       (ps[i]->IsInFlight() ? "f" : "") + "/" + std::to_string(uint32(GET_PLAYERBOT_AI(ps[i])->rpgInfo.GetStatus()));
             LOG_INFO("playerbots", "WoV dungeon run #{} {} gathering:{}", r.id, r.spot->def->name, st);
         }
+        WovDgPostLfm(r, tank, now);
+        if (real && realIn && real->IsInWorld() && real->IsAlive() && real->GetMapId() == r.spot->map &&
+            real->GetExactDist(r.spot->mx, r.spot->my, r.spot->mz) <= 60.0f)
+            ++here;
+        else if (real && r.tankThere && now > std::max(r.tankThere, r.realT) + 12 * MINUTE)
+        {
+            // the real player does not come: the run goes on with four
+            tank->Whisper(urand(0, 1) ? "sry we cant wait any longer, maybe next time" : "gotta go, sry. next time", LANG_UNIVERSAL, real);
+            if (realIn && tank->GetGroup()->IsLeader(tank->GetGUID()))
+                tank->GetGroup()->RemoveMember(real->GetGUID(), GROUP_REMOVEMETHOD_KICK);
+            LOG_INFO("playerbots", "WoV dungeon run #{} {}: {} did not come, going with four", r.id, r.spot->def->name, real->GetName());
+            r.real = 0;
+            real = nullptr;
+            realIn = false;
+        }
         // the party forms at the stone as people arrive
         if (!r.tankThere && tank->GetExactDist(r.spot->mx, r.spot->my, r.spot->mz) <= 40.0f)
             r.tankThere = now;
@@ -2691,7 +2785,7 @@ bool WovDgStep(WovDgRunState& r, time_t now)
             for (GroupReference* ref = g->GetFirstMember(); ref; ref = ref->next())
                 if (Player* m = ref->GetSource())
                 {
-                    bool ours = false;
+                    bool ours = r.real && m->GetGUID().GetCounter() == r.real;
                     for (Player* b : ps)
                         ours = ours || b == m;
                     if (!ours)
@@ -2704,11 +2798,14 @@ bool WovDgStep(WovDgRunState& r, time_t now)
         bool all = g && g->IsLeader(tank->GetGUID());
         for (Player* b : ps)
             all = all && g && g->IsMember(b->GetGUID());
-        if (all && here == ps.size())
+        all = all && (!real || realIn);
+        if (all && here == ps.size() + (real ? 1 : 0))
         {
             r.phase = DG_ENTER;
             r.phaseT = now;
-            if (urand(0, 99) < 60)
+            if (real)
+                tai->SayToParty(urand(0, 1) ? "ok all here, zone in" : "going in, zone in");
+            else if (urand(0, 99) < 60)
                 tai->SayToParty(urand(0, 1) ? "ok everyone here, lets go" : "all here? going in");
         }
         else if (now > r.start + 40 * MINUTE)
@@ -2756,7 +2853,8 @@ bool WovDgStep(WovDgRunState& r, time_t now)
         for (Player* b : ps)
             inside = inside && b->GetMapId() == r.spot->dmap && b->IsInWorld() && !b->IsBeingTeleported() &&
                      b->GetInstanceId() == tank->GetInstanceId();
-        if (inside && now >= r.phaseT + 10)
+        bool realInside = !real || (real->IsInWorld() && real->GetMapId() == r.spot->dmap && real->GetInstanceId() == tank->GetInstanceId());
+        if (inside && now >= r.phaseT + 10 && (realInside || now > r.phaseT + 150))
         {
             WovDgRoles(ps);
             tai->DoSpecificAction("dc on", Event("wov", "", nullptr), true);
@@ -2784,7 +2882,22 @@ bool WovDgStep(WovDgRunState& r, time_t now)
         for (Player* b : ps)
         {
             anyAlive = anyAlive || b->IsAlive();
-            left = left || b->GetMapId() != r.spot->dmap || !b->GetGroup() || b->GetGroup() != tank->GetGroup();
+            left = left || (b->IsAlive() && b->GetMapId() != r.spot->dmap) || !b->GetGroup() || b->GetGroup() != tank->GetGroup();
+        }
+        for (size_t i = 0; i < ps.size(); ++i)
+        {
+            Player* b = ps[i];
+            WovDgMember& mm = r.m[i];
+            if (b->IsAlive())
+            {
+                mm.deadT = 0;
+                continue;
+            }
+            if (!mm.deadT)
+                mm.deadT = now;
+            // released and outside: it runs back as a ghost and zones in; a corpse nobody rezzed gets up after the run back
+            if (anyAlive && now > mm.deadT + (b->GetMapId() != r.spot->dmap ? 90 : 180))
+                WovDgRunBack(r, b);
         }
         if (r.finalKilled)
         {
@@ -2804,6 +2917,8 @@ bool WovDgStep(WovDgRunState& r, time_t now)
         {
             r.rezT = 0;
             for (Player* b : ps)
+                WovDgRunBack(r, b);  // the ghosts that zoned in meanwhile
+            for (Player* b : ps)
                 if (b->IsAlive())
                 {
                     b->SetFullHealth();
@@ -2820,10 +2935,7 @@ bool WovDgStep(WovDgRunState& r, time_t now)
             {
                 r.retries = 1;
                 for (Player* b : ps)
-                {
-                    b->ResurrectPlayer(0.5f);
-                    b->SpawnCorpseBones();
-                }
+                    WovDgRunBack(r, b);
                 r.rezT = now;
                 r.phaseT = now;
                 static char const* const again[] = {"ok again, slower this time", "my bad, again?", "lets try that again",
@@ -2919,6 +3031,16 @@ void WovDungeonRun_OnKill(Player* killer, Creature* killed)
     g_wovDgKills.push_back({killer->GetGUID().GetCounter(), killed->GetEntry()});
 }
 
+// whisper hook (Playerbots.cpp): a real player answering a run's LFM. Filtered on the world thread.
+void WovDungeonRun_OnWhisper(Player* from, Player* to)
+{
+    if (!g_wovDgEnable || !from || !to || sRandomPlayerbotMgr.IsRandomBot(from) || !sRandomPlayerbotMgr.IsRandomBot(to))
+        return;
+    std::lock_guard<std::mutex> lock(g_wovDgKillMutex);
+    if (g_wovDgJoins.size() < 64)
+        g_wovDgJoins.push_back({to->GetGUID().GetCounter(), from->GetGUID().GetCounter()});
+}
+
 void WovDungeonRun_Tick(time_t now)
 {
     WovDgConfig(now);
@@ -2931,6 +3053,44 @@ void WovDungeonRun_Tick(time_t now)
         std::lock_guard<std::mutex> lock(g_wovDgKillMutex);
         kills.swap(g_wovDgKills);
     }
+    std::vector<std::pair<uint32, uint32>> joins;
+    {
+        std::lock_guard<std::mutex> lock(g_wovDgKillMutex);
+        joins.swap(g_wovDgJoins);
+    }
+    for (auto const& [bl, pl] : joins)
+        for (WovDgRunState& r : g_wovDgRuns)
+        {
+            if (r.phase != DG_GATHER || r.real || !r.lfmT || now > r.lfmT + 10 * MINUTE || r.m.empty() || r.m[0].low != bl ||
+                r.m.size() < 5)
+                continue;
+            Player* tank = ObjectAccessor::FindPlayerByLowGUID(bl);
+            Player* p = ObjectAccessor::FindPlayerByLowGUID(pl);
+            if (!tank || !p || p->GetGroup() || p->GetTeamId() != tank->GetTeamId() || p->GetLevel() < r.spot->def->minL ||
+                p->GetLevel() > r.spot->def->maxL)
+                break;
+            if (tank->GetGroup() && (!tank->GetGroup()->IsLeader(tank->GetGUID()) || tank->GetGroup()->IsFull()))
+                break;
+            // the last dps steps aside before the group is made; it goes back to its own business
+            uint32 drop = r.m.back().low;
+            r.m.pop_back();
+            g_wovBusyBot.erase(drop);
+            g_wovDgDropped[drop] = now + 20 * MINUTE;
+            if (Player* d = ObjectAccessor::FindPlayerByLowGUID(drop))
+                if (PlayerbotAI* dai = GET_PLAYERBOT_AI(d))
+                {
+                    if (d->GetGroup() && d->GetGroup()->IsMember(tank->GetGUID()))
+                        dai->LeaveOrDisbandGroup();
+                    dai->rpgInfo.ChangeToIdle();
+                }
+            r.real = pl;
+            r.realT = now;
+            static char const* const ok[] = {"sure, inv", "inv sent, meet at the stone", "k inv", "invited, come to the stone", "sure, sent"};
+            tank->Whisper(ok[urand(0, 4)], LANG_UNIVERSAL, p);
+            WovInviteFrom(tank, p);
+            LOG_INFO("playerbots", "WoV dungeon run #{} {}: real player {} joins (lvl {})", r.id, r.spot->def->name, p->GetName(), p->GetLevel());
+            break;
+        }
     for (auto const& [k, e] : kills)
         for (WovDgRunState& r : g_wovDgRuns)
             for (WovDgMember const& mm : r.m)
