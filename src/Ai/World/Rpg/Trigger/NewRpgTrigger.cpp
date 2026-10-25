@@ -7,4 +7,13 @@
 #include "NewRpgTriggers.h"
 #include "PlayerbotAI.h"
 
-bool NewRpgStatusTrigger::IsActive() { return status == botAI->rpgInfo.GetStatus(); }
+#include "Map.h"
+#include "Player.h"
+
+// wov: no open-world RPG inside a dungeon (it walked and "unstuck"-teleported bots out of instances mid-run)
+bool NewRpgStatusTrigger::IsActive()
+{
+    if (bot->GetMap() && bot->GetMap()->Instanceable() && !bot->InBattleground() && !bot->InArena())
+        return false;
+    return status == botAI->rpgInfo.GetStatus();
+}
