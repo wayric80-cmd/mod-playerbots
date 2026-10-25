@@ -2185,6 +2185,7 @@ struct WovDgMember
     time_t joined = 0;
     time_t closerT = 0;  // last time it got 30 yd closer to the stone
     time_t deadT = 0;    // dead since (on the way)
+    time_t outT = 0;     // alive but outside the instance since (revived at the graveyard or at the portal)
 };
 struct WovDgRunState
 {
@@ -2882,7 +2883,7 @@ bool WovDgStep(WovDgRunState& r, time_t now)
         for (Player* b : ps)
         {
             anyAlive = anyAlive || b->IsAlive();
-            left = left || (b->IsAlive() && b->GetMapId() != r.spot->dmap) || !b->GetGroup() || b->GetGroup() != tank->GetGroup();
+            left = left || !b->GetGroup() || b->GetGroup() != tank->GetGroup();
         }
         for (size_t i = 0; i < ps.size(); ++i)
         {
@@ -2891,6 +2892,25 @@ bool WovDgStep(WovDgRunState& r, time_t now)
             if (b->IsAlive())
             {
                 mm.deadT = 0;
+                // up again but outside (graveyard, or got up at the portal): it walks back in like anyone
+                if (b->GetMapId() != r.spot->dmap)
+                {
+                    if (!mm.outT)
+                        mm.outT = now;
+                    bool atPortal = b->GetMapId() == r.spot->map && b->GetExactDist(r.spot->x, r.spot->y, r.spot->z) < 200.0f;
+                    if (!b->IsBeingTeleported() && !b->IsInCombat() && (atPortal ? now > mm.outT + 15 : now > mm.outT + 3 * MINUTE))
+                    {
+                        b->TeleportTo(r.spot->dmap, r.spot->dx + frand(-1.5f, 1.5f), r.spot->dy + frand(-1.5f, 1.5f), r.spot->dz, r.spot->dO);
+                        mm.outT = 0;
+                    }
+                    else if (now > mm.outT + 10 * MINUTE)
+                    {
+                        WovDgRelease(r, std::string(b->GetName() + " did not come back in").c_str(), true);
+                        return false;
+                    }
+                }
+                else
+                    mm.outT = 0;
                 continue;
             }
             if (!mm.deadT)
@@ -2912,8 +2932,8 @@ bool WovDgStep(WovDgRunState& r, time_t now)
         {
             std::string who;
             for (Player* b : ps)
-                if ((b->IsAlive() && b->GetMapId() != r.spot->dmap) || !b->GetGroup() || b->GetGroup() != tank->GetGroup())
-                    who += " " + b->GetName() + (b->GetMapId() != r.spot->dmap ? "(outside)" : !b->GetGroup() ? "(no group)" : "(other group)");
+                if (!b->GetGroup() || b->GetGroup() != tank->GetGroup())
+                    who += " " + b->GetName() + (!b->GetGroup() ? "(no group)" : "(other group)");
             WovDgRelease(r, std::string(anyAlive ? "the party broke up:" : "wiped, the party broke up:").append(who).c_str(), true);
             return false;
         }
