@@ -3215,7 +3215,7 @@ void WovRaidRunBack(Player* b)
 // free for raid night: in the world, not busy elsewhere; a group of bots is left for the raid, one with a real player is not
 bool WovRaidAvail(Player* b, time_t now)
 {
-    if (!b->IsInWorld() || !b->IsAlive() || b->IsInCombat() || b->IsInFlight() || b->InBattleground() || b->InBattlegroundQueue())
+    if (!b->IsInWorld() || !b->IsAlive() || b->IsInFlight() || b->InBattleground())  // a battleground queue is left for the raid
         return false;
     if (!b->GetMap() || b->GetMap()->Instanceable() || WovOnMarketTrip(b->GetGUID().GetCounter()) || WovDgBusy(b->GetGUID().GetCounter()))
         return false;
@@ -3226,6 +3226,18 @@ bool WovRaidAvail(Player* b, time_t now)
         return false;
     PlayerbotAI* ai = GET_PLAYERBOT_AI(b);
     return ai && !ai->GetMaster();
+}
+
+void WovLeaveBgQueues(Player* b)
+{
+    for (uint32 i = 0; i < PLAYER_MAX_BATTLEGROUND_QUEUES; ++i)
+    {
+        BattlegroundQueueTypeId q = b->GetBattlegroundQueueTypeId(i);
+        if (q == BATTLEGROUND_QUEUE_NONE)
+            continue;
+        sBattlegroundMgr->GetBattlegroundQueue(q).RemovePlayer(b->GetGUID(), true);
+        b->RemoveBattlegroundQueueId(q);
+    }
 }
 
 bool WovRaidStart(uint32 guild, time_t now)
@@ -3273,6 +3285,8 @@ bool WovRaidStart(uint32 guild, time_t now)
         r.m.push_back({p->GetGUID().GetCounter(), 1e9f, now, false, p->GetPositionX(), p->GetPositionY(), now});
         r.role.push_back(role);
         g_wovBusyBot[p->GetGUID().GetCounter()] = uint32(now + 5 * HOUR);
+        if (p->InBattlegroundQueue())
+            WovLeaveBgQueues(p);
     };
     for (uint32 i = 0; i < wantTank; ++i)
         add(tanks[i], 0);
