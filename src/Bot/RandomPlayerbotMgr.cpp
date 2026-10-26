@@ -265,6 +265,8 @@ uint32 WovRpgWeightPct(Player* bot, int status)
     }
 }
 
+bool WovBotReserved(uint32 low);  // wov: below (dungeon runs, raid nights)
+
 // ---- wov: Call to Arms (world PvP) -------------------------------------------------------------------
 // A PvP kill in the open world can grow into a skirmish: the side that is losing people calls for help in
 // General/LocalDefense, bots of the right level fly in on flight paths and the other side answers in kind.
@@ -592,7 +594,7 @@ uint32 WovRecruit(WovSkirmish& s, TeamId team, uint32 want)
             continue;
         if (bot->GetLevel() < s.minL || bot->GetLevel() > s.maxL)
             continue;
-        if (g_wovBotSk.count(bot->GetGUID().GetCounter()) || bot->IsBeingTeleported())
+        if (g_wovBotSk.count(bot->GetGUID().GetCounter()) || bot->IsBeingTeleported() || WovBotReserved(bot->GetGUID().GetCounter()))
             continue;
         auto nr = g_wovNoRecruit.find(bot->GetGUID().GetCounter());
         if (nr != g_wovNoRecruit.end() && time(nullptr) < nr->second)
@@ -869,6 +871,11 @@ void WovWar_Tick(time_t now)
     {
         Player* p = ObjectAccessor::FindPlayerByLowGUID(*it);
         if (!p || !p->IsInWorld())
+        {
+            it = g_wovHearth.erase(it);
+            continue;
+        }
+        if (WovBotReserved(*it))  // on a dungeon run or raid night: it runs back to its group instead
         {
             it = g_wovHearth.erase(it);
             continue;
@@ -3444,8 +3451,15 @@ bool WovRaidStep(WovRaid& r, time_t now)
             uint32 grouped = 0;
             for (Player* b : ps)
                 grouped += b->GetGroup() && b->GetGroup() == mt->GetGroup() ? 1 : 0;
-            LOG_INFO("playerbots", "WoV raid #{} <{}> MC gathering: {} of {} at the window, {} in the raid, warlock there: {}", r.id,
-                     r.gname, here, ps.size(), grouped, lock ? "yes" : "no");
+            std::string st;
+            for (Player* b : ps)
+            {
+                bool onMap = b->GetMapId() == s.map;
+                st += " " + b->GetName() + ":" + (onMap ? std::to_string(int(b->GetExactDist(s.x, s.y, s.z))) : "m" + std::to_string(b->GetMapId())) +
+                      (b->IsAlive() ? "" : "d") + (b->IsInCombat() ? "c" : "") + "/" + std::to_string(uint32(GET_PLAYERBOT_AI(b)->rpgInfo.GetStatus()));
+            }
+            LOG_INFO("playerbots", "WoV raid #{} <{}> MC gathering: {} of {} at the window, {} in the raid, warlock there: {} |{}", r.id,
+                     r.gname, here, ps.size(), grouped, lock ? "yes" : "no", st);
         }
         Group* g = mt->GetGroup();
         uint32 ready = 0;
