@@ -309,6 +309,7 @@ bool BGJoinAction::shouldJoinBg(BattlegroundQueueTypeId queueTypeId, Battlegroun
 }
 
 bool WovBotReserved(uint32 low);  // wov: RandomPlayerbotMgr.cpp
+bool WovRaidNightFor(uint32 guid);  // wov: raid nights, RandomPlayerbotMgr.cpp
 
 bool BGJoinAction::isUseful()
 {
@@ -333,7 +334,7 @@ bool BGJoinAction::isUseful()
         return false;
 
     // wov: a bot on its way to (or in) a dungeon run or another planned activity does not queue
-    if (WovBotReserved(bot->GetGUID().GetCounter()))
+    if (WovBotReserved(bot->GetGUID().GetCounter()) || WovRaidNightFor(bot->GetGUID().GetCounter()))  // raid night: no BGs
         return false;
 
     // do not try if with player master

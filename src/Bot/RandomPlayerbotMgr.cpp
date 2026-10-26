@@ -2302,7 +2302,7 @@ bool WovDgFree(Player* b, TeamId team, time_t now)
     if (!WovFreeBot(b, team, now) || b->InBattlegroundQueue() || b->IsInCombat() || b->IsInFlight())
         return false;
     if (!b->GetMap() || b->GetMap()->Instanceable() || WovOnMarketTrip(b->GetGUID().GetCounter()) ||
-        WovDgBusy(b->GetGUID().GetCounter()))
+        WovDgBusy(b->GetGUID().GetCounter()) || WovRaidNightFor(b->GetGUID().GetCounter()))  // raid night: not now
         return false;
     auto dr = g_wovDgDropped.find(b->GetGUID().GetCounter());
     if (dr != g_wovDgDropped.end() && now < dr->second)
@@ -3726,8 +3726,17 @@ void WovRaid_Tick(time_t now)
         bool night = at && now >= at && now <= at + 20 * MINUTE && last < at;
         if (!test && !night)
             continue;
+        static std::unordered_map<uint32, time_t> retryAt;
+        if (night && now < retryAt[guild])
+            continue;
         if (!WovRaidStart(guild, now))
-            g_wovRaidLast[guild] = night ? at : now;  // not enough people: no raid tonight (test: try again in 30 min)
+        {
+            // not enough yet: people still finishing a battleground or a dungeon. Ask again every 5 minutes while the
+            // start window is open, then no raid tonight (test: again in 30 min)
+            retryAt[guild] = now + 5 * MINUTE;
+            if (!night || now > at + 15 * MINUTE)
+                g_wovRaidLast[guild] = night ? at : now;
+        }
     }
 }
 }  // namespace
