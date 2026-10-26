@@ -3103,9 +3103,10 @@ void WovRaidConfig(time_t now)
         {
             g_wovMcSpot.def = &kWovMcDef;
             g_wovMcSpot.map = at->map;
-            g_wovMcSpot.x = g_wovMcSpot.mx = at->x;
-            g_wovMcSpot.y = g_wovMcSpot.my = at->y;
-            g_wovMcSpot.z = g_wovMcSpot.mz = at->z;
+            // the raid meets at Lothos Riftwaker, beside the window on solid floor (the window ledge drops into the lava)
+            g_wovMcSpot.x = g_wovMcSpot.mx = -7506.0f;
+            g_wovMcSpot.y = g_wovMcSpot.my = -1042.0f;
+            g_wovMcSpot.z = g_wovMcSpot.mz = 180.9f;
             g_wovMcSpot.meetSet = true;
             g_wovMcSpot.dmap = tp->target_mapId;
             g_wovMcSpot.dx = tp->target_X;
@@ -3402,8 +3403,7 @@ bool WovRaidStep(WovRaid& r, time_t now)
                 continue;
             if (onMap && d <= 2500.0f)
                 WovDgGoTo(b, ai, &s, mm, now);  // close enough to walk (Searing Gorge, Burning Steppes)
-            else if (ai->rpgInfo.GetStatus() != RPG_REST)
-                ai->rpgInfo.ChangeToRest();  // waits for a summon
+            // further away: it goes on with its evening until the summon comes
             if (Group* og = b->GetGroup())  // someone else's group: leaves it for the raid
                 if (!og->IsMember(mt->GetGUID()) || (i == 0 && !og->IsLeader(mt->GetGUID())))
                     ai->LeaveOrDisbandGroup();
@@ -3422,7 +3422,7 @@ bool WovRaidStep(WovRaid& r, time_t now)
             Player* b = ps[i];
             if (urand(0, 99) < 40)
                 b->Whisper(WovPick(kWovRnSumAsk), LANG_UNIVERSAL, helper);
-            b->TeleportTo(s.map, s.x + frand(-4.0f, 4.0f), s.y + frand(-4.0f, 4.0f), s.z, frand(0.0f, 6.28f));
+            b->TeleportTo(s.map, s.x + frand(-1.5f, 1.5f), s.y + frand(-1.5f, 1.5f), s.z + 0.5f, frand(0.0f, 6.28f));
             if (urand(0, 99) < 30)
                 b->Whisper(WovPick(kWovRnSumThx), LANG_UNIVERSAL, helper);
             LOG_INFO("playerbots", "WoV raid #{} <{}> MC: {} summons {}", r.id, r.gname, lock ? lock->GetName() : "the meeting stone",
@@ -3552,9 +3552,9 @@ bool WovRaidStep(WovRaid& r, time_t now)
             WovRaidEnd(r, "too many left", true, kWovRnCallIt, 3);
             return false;
         }
-        bool anyAlive = false;
+        bool anyAlive = false;  // anywhere: one who got up at the graveyard is on the way back, not a wipe
         for (Player* b : ps)
-            anyAlive = anyAlive || (b->IsAlive() && b->GetMapId() == s.dmap);
+            anyAlive = anyAlive || b->IsAlive();
         if (r.rezT && now >= r.rezT + 30)  // back up after the run back: drink, buff, again
         {
             r.rezT = 0;
