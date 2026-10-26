@@ -2998,13 +2998,14 @@ bool WovDgStep(WovDgRunState& r, time_t now)
         if (!r.rezT)
         {
             float mv = std::hypot(tank->GetPositionX() - r.tx, tank->GetPositionY() - r.ty);
-            if (!r.moveT || mv > 20.0f || tank->IsInCombat() || !tank->IsAlive())
+            // in combat a tank may stand still for a boss, but not for a quarter of an hour (a fight that never ends)
+            if (!r.moveT || mv > 20.0f || !tank->IsAlive())
             {
                 r.tx = tank->GetPositionX();
                 r.ty = tank->GetPositionY();
                 r.moveT = now;
             }
-            else if (now > r.moveT + 7 * MINUTE)
+            else if (now > r.moveT + (tank->IsInCombat() ? 15 : 7) * MINUTE)
             {
                 r.moveT = now;
                 ++r.stalls;
@@ -3626,13 +3627,13 @@ bool WovRaidStep(WovRaid& r, time_t now)
         if (!r.rezT)  // stall watchdog, as in the dungeons
         {
             float mv = std::hypot(mt->GetPositionX() - r.tx, mt->GetPositionY() - r.ty);
-            if (!r.moveT || mv > 20.0f || mt->IsInCombat() || !mt->IsAlive())
+            if (!r.moveT || mv > 20.0f || !mt->IsAlive())
             {
                 r.tx = mt->GetPositionX();
                 r.ty = mt->GetPositionY();
                 r.moveT = now;
             }
-            else if (now > r.moveT + 8 * MINUTE)
+            else if (now > r.moveT + (mt->IsInCombat() ? 15 : 8) * MINUTE)
             {
                 r.moveT = now;
                 ++r.stalls;
