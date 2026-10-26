@@ -125,8 +125,14 @@ void WovLoadSchedules()
              g_wovSessionPct, g_wovMinOnline);
 }
 
+}  // namespace
+bool WovRaidNightFor(uint32 guid);  // wov: raid nights (below)
+namespace
+{
 bool WovScheduledOnline(uint32 guid)
 {
+    if (WovRaidNightFor(guid))  // raid night: the raiders come online for it and stay until it is over
+        return true;
     auto it = g_wovSched.find(guid);
     if (it == g_wovSched.end())
         return false;
@@ -3700,6 +3706,34 @@ void WovRaid_Tick(time_t now)
     }
 }
 }  // namespace
+
+// wov: level-60 members of a bot guild whose raid night is now (from half an hour before the start until three and
+// a half hours after it). They come online for it (play schedule) and log in first. Recomputed every 5 minutes.
+bool WovRaidNightFor(uint32 guid)
+{
+    static std::unordered_set<uint32> night;
+    static time_t calcT = 0;
+    time_t now = time(nullptr);
+    if (now >= calcT + 300)
+    {
+        calcT = now;
+        night.clear();
+        if (g_wovRaidEnable)
+            if (QueryResult r = CharacterDatabase.Query(
+                    "SELECT m.guildid, m.guid FROM guild_member m JOIN characters c ON c.guid=m.guid "
+                    "JOIN acore_auth.account a ON a.id=c.account WHERE a.username LIKE 'RNDBOT%' AND c.level>=60"))
+                do
+                {
+                    uint32 g = r->Fetch()[0].Get<uint32>();
+                    if (g_wovRaidRealGuilds.count(g))
+                        continue;
+                    time_t at = WovRaidStartToday(g, now);
+                    if (at && now >= at - 30 * MINUTE && now <= at + 210 * MINUTE)
+                        night.insert(r->Fetch()[1].Get<uint32>());
+                } while (r->NextRow());
+    }
+    return night.count(guid) != 0;
+}
 // ---- end wov: raid nights -------------------------------------------------------------------------------
 
 // wov: the tank a dungeon-run member (or the main tank a raider) waits for (0 when it is in no run). World thread.
@@ -5933,6 +5967,10 @@ uint32 RandomPlayerbotMgr::AddRandomBots()
             }
             allCharacters.swap(ordered);
         }
+
+        // wov: raid night: the guild's raiders log in first
+        std::stable_partition(allCharacters.begin(), allCharacters.end(),
+                              [](CharacterInfo const& ci) { return WovRaidNightFor(ci.guid); });
 
         // Separate characters by faction for phased login
         std::vector<CharacterInfo> allianceChars;
