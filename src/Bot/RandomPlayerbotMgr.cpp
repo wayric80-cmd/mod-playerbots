@@ -3066,10 +3066,12 @@ struct WovRaid
     float tx = 0, ty = 0;
     uint8 wipes = 0, stalls = 0;
     bool finalKilled = false;
+    std::vector<uint32> reals;  // real players of the guild who were asked along
+    time_t realInvT = 0;
 };
 std::vector<WovRaid> g_wovRaids;
 std::unordered_map<uint32, time_t> g_wovRaidLast;  // guild -> last raid start
-std::unordered_set<uint32> g_wovRaidRealGuilds;    // guilds with a real player: they plan their own raids
+std::unordered_set<uint32> g_wovRaidRealGuilds;    // guilds led by a real player: they plan their own raids
 bool g_wovRaidEnable = false;
 uint32 g_wovRaidMin = 20, g_wovRaidMax = 40, g_wovRaidMaxActive = 2, g_wovRaidHour = 20, g_wovRaidTest = 0, g_wovRaidNextId = 1;
 time_t g_wovRaidCfgT = 0, g_wovRaidRealT = 0;
@@ -3129,7 +3131,7 @@ void WovRaidConfig(time_t now)
         g_wovRaidRealT = now;
         g_wovRaidRealGuilds.clear();
         if (QueryResult r = CharacterDatabase.Query(
-                "SELECT DISTINCT m.guildid FROM guild_member m JOIN characters c ON c.guid=m.guid "
+                "SELECT g.guildid FROM guild g JOIN characters c ON c.guid=g.leaderguid "
                 "WHERE c.account NOT IN (SELECT id FROM acore_auth.account WHERE username LIKE 'RNDBOT%')"))
             do
                 g_wovRaidRealGuilds.insert(r->Fetch()[0].Get<uint32>());
@@ -3337,6 +3339,18 @@ bool WovRaidStart(uint32 guild, time_t now)
             add(p, 1);
     g_wovRaidLast[guild] = now;
     WovRaidSay(r, kWovRnCall[urand(0, 3)], true);
+    // real players in the guild are asked along (a whisper from the raid leader); they are invited at the window
+    for (auto const& [id, session] : sWorldSessionMgr->GetAllSessions())
+    {
+        Player* p = session ? session->GetPlayer() : nullptr;
+        if (!p || !WovIsReal(p) || !p->IsInWorld() || p->GetGuildId() != guild || p->GetLevel() < 55)
+            continue;
+        r.reals.push_back(p->GetGUID().GetCounter());
+        static char const* const ask[] = {"MC tonight, u coming? meet at the window in BRM, ill inv",
+                                          "raiding MC now, want in? come to blackrock mountain, lothos",
+                                          "hey we're doing MC, come to the BRM window and ill invite u"};
+        tanks[0]->Whisper(ask[urand(0, 2)], LANG_UNIVERSAL, p);
+    }
     LOG_INFO("playerbots", "WoV raid #{} <{}> MC: {} going ({} tanks, {} healers), main tank {}", r.id, gname, r.m.size(), wantTank, h,
              tanks[0]->GetName());
     g_wovRaids.push_back(r);
@@ -3451,6 +3465,17 @@ bool WovRaidStep(WovRaid& r, time_t now)
                     break;
                 WovInviteFrom(mt, b);
             }
+        }
+        // real guild members who came to the window get an invite (they are not waited for)
+        if (!r.reals.empty() && now >= r.realInvT + 20)
+        {
+            r.realInvT = now;
+            Group* g = mt->GetGroup();
+            for (uint32 rl : r.reals)
+                if (Player* p = ObjectAccessor::FindPlayerByLowGUID(rl))
+                    if (p->IsInWorld() && !p->GetGroup() && p->GetMapId() == s.map && p->GetExactDist(s.x, s.y, s.z) <= 60.0f &&
+                        g && g->IsLeader(mt->GetGUID()) && g->isRaidGroup() && !g->IsFull())
+                        WovInviteFrom(mt, p);
         }
         if (now >= r.phaseT + 60)
         {
