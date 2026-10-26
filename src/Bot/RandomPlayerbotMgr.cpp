@@ -3143,6 +3143,8 @@ void WovRaidRole(Player* b, uint8 role)
         return;
     if (role == 0 && b->getClass() == CLASS_WARRIOR && !PlayerbotAI::IsTank(b))
         ai->ChangeStrategy("-arms,-fury,-dps assist,+tank,+tank assist", BOT_STATE_COMBAT);
+    else if (role == 0 && b->getClass() == CLASS_DRUID && !PlayerbotAI::IsTank(b))
+        ai->ChangeStrategy("-cat,-balance,-resto,-dps assist,+bear,+tank assist", BOT_STATE_COMBAT);
     else if (role == 1 && !PlayerbotAI::IsHeal(b))
         switch (b->getClass())
         {
@@ -3261,9 +3263,20 @@ bool WovRaidStart(uint32 guild, time_t now)
         else
             dps.push_back(b);
     }
+    // too few warriors: a druid bear-tanks (an off-tank, rarely the main tank)
+    while (tanks.size() < 2)
+    {
+        auto it = std::find_if(hyb.begin(), hyb.end(), [](Player* p) { return p->getClass() == CLASS_DRUID && !PlayerbotAI::IsHeal(p, true); });
+        if (it == hyb.end())
+            it = std::find_if(hyb.begin(), hyb.end(), [](Player* p) { return p->getClass() == CLASS_DRUID; });
+        if (it == hyb.end())
+            break;
+        tanks.push_back(*it);
+        hyb.erase(it);
+    }
     // main tank first: a tank by spec, then the warrior with the most health
     std::sort(tanks.begin(), tanks.end(), [](Player* a, Player* b) {
-        bool ta = PlayerbotAI::IsTank(a, true), tb = PlayerbotAI::IsTank(b, true);
+        bool ta = PlayerbotAI::IsTank(a, true) || a->getClass() == CLASS_WARRIOR, tb = PlayerbotAI::IsTank(b, true) || b->getClass() == CLASS_WARRIOR;
         return ta != tb ? ta : a->GetMaxHealth() > b->GetMaxHealth();
     });
     uint32 total = tanks.size() + heals.size() + dps.size() + hyb.size();
@@ -3388,18 +3401,25 @@ bool WovRaidStep(WovRaid& r, time_t now)
                 if (!og->IsMember(mt->GetGUID()) || (i == 0 && !og->IsLeader(mt->GetGUID())))
                     ai->LeaveOrDisbandGroup();
         }
-        // the summoning: a warlock and two more at the window bring the others, one at a time
-        if (lock && here >= 3 && !away.empty() && now >= r.sumT + 12)
+        // the summoning: a warlock (or the meeting stone in Blackrock Mountain) and two more at the window bring the
+        // others, one at a time
+        Player* helper = lock;
+        if (!helper)
+            for (size_t i = 0; i < ps.size() && !helper; ++i)
+                if (ps[i]->IsAlive() && ps[i]->GetMapId() == s.map && ps[i]->GetExactDist(s.x, s.y, s.z) <= 60.0f)
+                    helper = ps[i];
+        if (helper && here >= 2 && !away.empty() && now >= r.sumT + 12)
         {
             r.sumT = now;
             size_t i = away[urand(0, away.size() - 1)];
             Player* b = ps[i];
             if (urand(0, 99) < 40)
-                b->Whisper(WovPick(kWovRnSumAsk), LANG_UNIVERSAL, lock);
+                b->Whisper(WovPick(kWovRnSumAsk), LANG_UNIVERSAL, helper);
             b->TeleportTo(s.map, s.x + frand(-4.0f, 4.0f), s.y + frand(-4.0f, 4.0f), s.z, frand(0.0f, 6.28f));
             if (urand(0, 99) < 30)
-                b->Whisper(WovPick(kWovRnSumThx), LANG_UNIVERSAL, lock);
-            LOG_INFO("playerbots", "WoV raid #{} <{}> MC: {} summons {}", r.id, r.gname, lock->GetName(), b->GetName());
+                b->Whisper(WovPick(kWovRnSumThx), LANG_UNIVERSAL, helper);
+            LOG_INFO("playerbots", "WoV raid #{} <{}> MC: {} summons {}", r.id, r.gname, lock ? lock->GetName() : "the meeting stone",
+                     b->GetName());
         }
         // the raid forms at the window: the main tank invites, and makes it a raid
         if (mt->IsAlive() && mt->GetMapId() == s.map && mt->GetExactDist(s.x, s.y, s.z) <= 60.0f)
@@ -6659,7 +6679,7 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
     }
 
     uint32 logout = GetEventValue(bot, "logout");
-    if (player && !logout && !isValid)
+    if (player && !logout && !isValid && !WovBotReserved(bot))  // wov: not in the middle of a dungeon run or raid
     {
         LOG_DEBUG("playerbots", "Bot #{} {}:{} <{}>: log out", bot, IsAlliance(player->getRace()) ? "A" : "H",
                   player->GetLevel(), player->GetName().c_str());
