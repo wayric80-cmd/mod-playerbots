@@ -3632,7 +3632,12 @@ bool WovRaidStep(WovRaid& r, time_t now)
                 WovRaidDrop(r, i, "cannot enter");
                 return true;
             }
-            b->TeleportTo(s.dmap, s.dx + frand(-3.0f, 3.0f), s.dy + frand(-3.0f, 3.0f), s.dz, s.dO);
+            if (!b->TeleportTo(s.dmap, s.dx + frand(-3.0f, 3.0f), s.dy + frand(-3.0f, 3.0f), s.dz, s.dO) && now >= r.sumT + 30)
+            {
+                r.sumT = now;
+                LOG_INFO("playerbots", "WoV raid #{} <{}> MC: {} could not step through the window (combat {}, alive {}, can enter {})", r.id,
+                         r.gname, b->GetName(), b->IsInCombat(), b->IsAlive(), uint32(sMapMgr->PlayerCannotEnter(s.dmap, b, false)));
+            }
         }
         bool inside = true;
         for (Player* b : ps)
@@ -3655,6 +3660,9 @@ bool WovRaidStep(WovRaid& r, time_t now)
                     WovRaidDrop(r, i, "did not get inside");
             if (mt->GetMapId() != s.dmap || r.m.size() < g_wovRaidMin / 2)
             {
+                LOG_INFO("playerbots", "WoV raid #{} <{}> MC: main tank {} is on map {} instance {} ({:.0f},{:.0f}), raid instance {}", r.id,
+                         r.gname, mt->GetName(), mt->GetMapId(), mt->GetInstanceId(), mt->GetPositionX(), mt->GetPositionY(),
+                         ps.size() > 1 ? ps[1]->GetInstanceId() : 0);
                 WovRaidEnd(r, "could not get the raid inside", true, kWovRnCallIt, 3);
                 return false;
             }
