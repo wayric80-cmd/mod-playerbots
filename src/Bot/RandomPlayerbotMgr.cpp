@@ -3303,7 +3303,7 @@ bool WovRaidStart(uint32 guild, time_t now)
         return false;
     }
     uint32 size = std::min(g_wovRaidMax, total);
-    uint32 wantHeal = std::max<uint32>(4, size / 4), wantTank = std::min<uint32>(3, tanks.size());
+    uint32 wantHeal = std::max<uint32>(4, size / 4), wantTank = std::min<uint32>(size >= 25 ? 4 : 3, tanks.size());
     WovRaid r;
     r.id = g_wovRaidNextId++;
     r.guild = guild;
@@ -3566,6 +3566,31 @@ bool WovRaidStep(WovRaid& r, time_t now)
             WovRaidEnd(r, "Ragnaros is dead, MC cleared", true, kWovRnEnd, 4);
             return false;
         }
+        // Garr: each warlock keeps one Firesworn banished (the classic way to take him with a small raid)
+        if (Creature* garr = mt->FindNearestCreature(12057, 120.0f))
+            if (garr->IsAlive() && garr->IsInCombat())
+            {
+                std::list<Creature*> adds;
+                mt->GetCreatureListWithEntryInGrid(adds, 12099, 120.0f);
+                auto banished = [](Creature* c) { return c->HasAura(710) || c->HasAura(18647); };
+                for (Player* b : ps)
+                {
+                    if (b->getClass() != CLASS_WARLOCK || !b->IsAlive() || b->GetMapId() != s.dmap || b->IsNonMeleeSpellCast(false))
+                        continue;
+                    bool mine = false;
+                    for (Creature* c : adds)
+                        mine = mine || (c->IsAlive() && (c->HasAura(710, b->GetGUID()) || c->HasAura(18647, b->GetGUID())));
+                    if (mine)
+                        continue;
+                    Creature* pick = nullptr;
+                    for (Creature* c : adds)
+                        if (c->IsAlive() && !banished(c) && b->GetExactDist(c) <= 30.0f && b->IsWithinLOSInMap(c) &&
+                            (!pick || b->GetExactDist(c) < b->GetExactDist(pick)))
+                            pick = c;
+                    if (pick && GET_PLAYERBOT_AI(b)->CastSpell("banish", pick))
+                        LOG_INFO("playerbots", "WoV raid #{} <{}> MC: {} banishes a Firesworn", r.id, r.gname, b->GetName());
+                }
+            }
         if (now >= r.roleT + 30)  // a strategy reset must not take the roles away mid-raid
         {
             r.roleT = now;
