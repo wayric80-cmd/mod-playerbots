@@ -3507,7 +3507,20 @@ bool WovRaidStep(WovRaid& r, time_t now)
                 continue;
             if (onMap && d <= 2500.0f)
                 WovDgGoTo(b, ai, &s, mm, now);  // close enough to walk (Searing Gorge, Burning Steppes)
-            // further away: it goes on with its evening until the summon comes
+            else if (!b->IsInFlight() && !b->GetMap()->Instanceable())
+            {
+                // further away: it takes the flight path (and the boat or zeppelin) to Thorium Point and walks from
+                // there, unless a summon comes first. The flight itself is not simulated, only how long it takes.
+                if (!mm.closerT)
+                    mm.closerT = now + (onMap ? std::max<time_t>(60, time_t(d / 30.0f)) : 420);
+                else if (now >= mm.closerT)
+                {
+                    bool horde = b->GetTeamId() == TEAM_HORDE;
+                    b->TeleportTo(0, horde ? -6559.0f : -6559.0f, horde ? -1100.0f : -1169.0f, 310.5f, 3.1f);
+                    mm.closerT = now + 3600;  // once
+                    LOG_INFO("playerbots", "WoV raid #{} <{}> MC: {} flies in to Thorium Point", r.id, r.gname, b->GetName());
+                }
+            }
             if (Group* og = b->GetGroup())  // someone else's group: leaves it for the raid
                 if (!og->IsMember(mt->GetGUID()) || (i == 0 && !og->IsLeader(mt->GetGUID())))
                     ai->LeaveOrDisbandGroup();
