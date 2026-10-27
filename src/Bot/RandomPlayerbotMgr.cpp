@@ -3617,10 +3617,14 @@ bool WovRaidStep(WovRaid& r, time_t now)
     {
         if (now < r.phaseT + 5)
             return true;
+        // the main tank goes first: the raid is then tied to his lockout, and the others (saved there or nowhere)
+        // follow him into the same instance. Someone unsaved going first would open a fresh instance that the
+        // saved members cannot enter.
+        bool mtIn = mt->GetMapId() == s.dmap && !mt->IsBeingTeleported();
         for (size_t i = ps.size(); i-- > 0;)
         {
             Player* b = ps[i];
-            if (b->GetMapId() != s.map || b->IsBeingTeleported())
+            if (b->GetMapId() != s.map || b->IsBeingTeleported() || (i > 0 && !mtIn))
                 continue;
             if (sMapMgr->PlayerCannotEnter(s.dmap, b, false) != Map::CAN_ENTER)
             {
