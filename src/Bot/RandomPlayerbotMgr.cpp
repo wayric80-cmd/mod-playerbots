@@ -3048,6 +3048,7 @@ bool WovDgStep(WovDgRunState& r, time_t now)
 
 
 #include "InstanceSaveMgr.h"
+#include "ScriptMgr.h"
 #include <map>
 #include <set>
 // ---- wov: raid nights -----------------------------------------------------------------------------------
@@ -3071,7 +3072,7 @@ struct WovRaid
     uint8 wipes = 0, stalls = 0;
     bool finalKilled = false;
     std::vector<uint32> reals;  // real players of the guild who were asked along
-    time_t realInvT = 0;
+    time_t realInvT = 0, runeT = 0;
 };
 std::vector<WovRaid> g_wovRaids;
 std::unordered_map<uint32, time_t> g_wovRaidLast;  // guild -> last raid start
@@ -3680,6 +3681,27 @@ bool WovRaidStep(WovRaid& r, time_t now)
         {
             WovRaidEnd(r, "Ragnaros is dead, MC cleared", true, kWovRnEnd, 4);
             return false;
+        }
+        // the Firelord runes: once a boss is down his rune can be doused with Aqual Quintessence; with all seven doused
+        // Majordomo Executus comes (progression rule ManualRuneHandling). Someone in the raid carries the quintessence.
+        if (now >= r.runeT + 10)
+        {
+            r.runeT = now;
+            static uint32 const runes[] = {176956, 176957, 176955, 176953, 176952, 176954, 176951};
+            for (uint32 entry : runes)
+                for (Player* b : ps)
+                {
+                    if (!b->IsAlive() || b->IsInCombat() || b->GetMapId() != s.dmap)
+                        continue;
+                    GameObject* go = b->FindNearestGameObject(entry, 60.0f);
+                    if (!go || go->HasFlag(GAMEOBJECT_FLAGS, GO_FLAG_NOT_SELECTABLE))
+                        continue;
+                    sScriptMgr->OnGossipHello(b, go);
+                    if (urand(0, 99) < 60)
+                        GET_PLAYERBOT_AI(b)->SayToRaid(urand(0, 1) ? "dousing the rune" : "rune down");
+                    LOG_INFO("playerbots", "WoV raid #{} <{}> MC: {} douses a Firelord rune ({})", r.id, r.gname, b->GetName(), entry);
+                    break;
+                }
         }
         // Garr: each warlock keeps one Firesworn banished (the classic way to take him with a small raid)
         if (Creature* garr = mt->FindNearestCreature(12057, 120.0f))
