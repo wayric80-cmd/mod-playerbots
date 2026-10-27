@@ -3322,7 +3322,7 @@ bool WovRaidStart(uint32 guild, time_t now)
     // short of people: the raid leader asks around ("LF5M MC, need lock and heals") and level 60s from outside the
     // guild of the same side fill up, the roles the raid lacks first (warlocks for banishes, healers, tanks)
     uint32 have = tanks.size() + heals.size() + dps.size() + hyb.size();
-    if (have >= g_wovRaidMin / 2 && have < g_wovRaidPug && !tanks.empty())
+    if (have >= std::max<uint32>(5, g_wovRaidMin / 3) && have < g_wovRaidPug && !tanks.empty())  // a small guild pugs the rest
     {
         TeamId team = tanks[0]->GetTeamId();
         std::vector<Player*> pool;
