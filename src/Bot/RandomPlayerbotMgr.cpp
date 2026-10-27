@@ -2632,7 +2632,8 @@ bool WovDgStep(WovDgRunState& r, time_t now)
     std::vector<Player*> ps;
     for (WovDgMember const& mm : r.m)
     {
-        Player* b = ObjectAccessor::FindPlayerByLowGUID(mm.low);
+        // connected, in the world or not (FindPlayerByLowGUID misses a bot that is between maps)
+        Player* b = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(mm.low));
         if (!b || !GET_PLAYERBOT_AI(b))
         {
             WovDgRelease(r, "a member logged off", r.phase == DG_RUN);
@@ -3407,7 +3408,7 @@ bool WovRaidStep(WovRaid& r, time_t now)
     std::vector<Player*> ps;
     for (size_t i = 0; i < r.m.size();)
     {
-        Player* b = ObjectAccessor::FindPlayerByLowGUID(r.m[i].low);
+        Player* b = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(r.m[i].low));
         if (!b || !GET_PLAYERBOT_AI(b))
         {
             if (i == 0)
@@ -3597,8 +3598,15 @@ bool WovRaidStep(WovRaid& r, time_t now)
         }
         else if (now > r.phaseT + 3 * MINUTE)
         {
-            WovRaidEnd(r, "could not get everyone inside", true, kWovRnCallIt, 3);
-            return false;
+            for (size_t i = ps.size(); i-- > 1;)
+                if (ps[i]->GetMapId() != s.dmap || ps[i]->GetInstanceId() != mt->GetInstanceId())
+                    WovRaidDrop(r, i, "did not get inside");
+            if (mt->GetMapId() != s.dmap || r.m.size() < g_wovRaidMin / 2)
+            {
+                WovRaidEnd(r, "could not get the raid inside", true, kWovRnCallIt, 3);
+                return false;
+            }
+            r.phaseT = now - 15;  // the rest are in: start
         }
         return true;
     }
