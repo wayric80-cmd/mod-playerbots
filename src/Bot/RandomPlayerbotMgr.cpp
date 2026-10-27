@@ -3547,6 +3547,22 @@ bool WovRaidStep(WovRaid& r, time_t now)
             LOG_INFO("playerbots", "WoV raid #{} <{}> MC: {} summons {}", r.id, r.gname, lock ? lock->GetName() : "the meeting stone",
                      b->GetName());
         }
+        // the main tank is not there after a quarter of an hour (held up, stuck in a fight): a tank who is there
+        // takes over and leads
+        bool mtHere = mt->IsAlive() && mt->GetMapId() == s.map && mt->GetExactDist(s.x, s.y, s.z) <= 60.0f;
+        if (!mtHere && now > r.start + 15 * MINUTE && !mt->GetGroup())
+            for (size_t i = 1; i < ps.size(); ++i)
+                if (r.role[i] == 0 && ps[i]->IsAlive() && ps[i]->GetMapId() == s.map && ps[i]->GetExactDist(s.x, s.y, s.z) <= 60.0f &&
+                    !ps[i]->GetGroup())
+                {
+                    LOG_INFO("playerbots", "WoV raid #{} <{}> MC: {} is not here, {} takes over as main tank", r.id, r.gname, mt->GetName(),
+                             ps[i]->GetName());
+                    std::swap(r.m[0], r.m[i]);
+                    std::swap(ps[0], ps[i]);
+                    mt = ps[0];
+                    mai = GET_PLAYERBOT_AI(mt);
+                    break;
+                }
         // the raid forms at the window: the main tank invites, and makes it a raid
         if (mt->IsAlive() && mt->GetMapId() == s.map && mt->GetExactDist(s.x, s.y, s.z) <= 60.0f)
         {
