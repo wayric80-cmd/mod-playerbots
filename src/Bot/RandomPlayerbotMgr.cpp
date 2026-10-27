@@ -3073,6 +3073,7 @@ struct WovRaid
     bool finalKilled = false;
     std::vector<uint32> reals;  // real players of the guild who were asked along
     time_t realInvT = 0, runeT = 0;
+    std::set<uint32> doused;
 };
 std::vector<WovRaid> g_wovRaids;
 std::unordered_map<uint32, time_t> g_wovRaidLast;  // guild -> last raid start
@@ -3694,7 +3695,7 @@ bool WovRaidStep(WovRaid& r, time_t now)
                     if (!b->IsAlive() || b->IsInCombat() || b->GetMapId() != s.dmap)
                         continue;
                     GameObject* go = b->FindNearestGameObject(entry, 60.0f);
-                    if (!go || go->HasFlag(GAMEOBJECT_FLAGS, GO_FLAG_NOT_SELECTABLE))
+                    if (!go || go->HasFlag(GAMEOBJECT_FLAGS, GO_FLAG_NOT_SELECTABLE) || !r.doused.insert(entry).second)
                         continue;
                     sScriptMgr->OnGossipHello(b, go);
                     if (urand(0, 99) < 60)
@@ -3806,7 +3807,34 @@ bool WovRaidStep(WovRaid& r, time_t now)
             if (!mm.deadT)
                 mm.deadT = now;
             if (now > mm.deadT + (b->GetMapId() != s.dmap ? 90 : 240))
+            {
                 WovRaidRunBack(b);
+                // got up at the corpse: it runs to where the raid is now (the leader waits for everyone in range)
+                if (b->IsAlive() && mt->IsAlive() && b->GetMapId() == mt->GetMapId() && b->GetExactDist(mt) > 60.0f)
+                    b->NearTeleportTo(mt->GetPositionX() + frand(-3.0f, 3.0f), mt->GetPositionY() + frand(-3.0f, 3.0f),
+                                      mt->GetPositionZ(), mt->GetOrientation());
+            }
+        }
+        // a straggler inside who has been far from the main tank for two minutes out of combat (lost the path,
+        // stuck behind a wall): it catches up, otherwise the leader waits for it for ever ("party not ready")
+        for (size_t i = 1; i < ps.size(); ++i)
+        {
+            Player* b = ps[i];
+            WovDgMember& mm = r.m[i];
+            bool far = b->IsAlive() && mt->IsAlive() && b->GetMapId() == s.dmap && mt->GetMapId() == s.dmap &&
+                       !b->IsInCombat() && !mt->IsInCombat() && b->GetExactDist(mt) > 80.0f;
+            if (!far)
+            {
+                mm.lastProgress = now;
+                continue;
+            }
+            if (now > mm.lastProgress + 2 * MINUTE)
+            {
+                b->NearTeleportTo(mt->GetPositionX() + frand(-3.0f, 3.0f), mt->GetPositionY() + frand(-3.0f, 3.0f), mt->GetPositionZ(),
+                                  mt->GetOrientation());
+                mm.lastProgress = now;
+                LOG_INFO("playerbots", "WoV raid #{} <{}> MC: {} catches up with the raid", r.id, r.gname, b->GetName());
+            }
         }
         if (now >= r.logT + 10 * MINUTE)
         {
