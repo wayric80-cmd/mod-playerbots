@@ -3047,6 +3047,9 @@ bool WovDgStep(WovDgRunState& r, time_t now)
 }  // namespace
 
 
+#include "InstanceSaveMgr.h"
+#include <map>
+#include <set>
 // ---- wov: raid nights -----------------------------------------------------------------------------------
 // A bot guild raids Molten Core on its raid nights (two evenings a week, 20:00-20:45 server time, picked per guild).
 // The level-60 members online come, the officers post in guild chat, everyone heads for the Molten Core window in
@@ -3250,6 +3253,14 @@ bool WovRaidAvail(Player* b, time_t now)
     return ai && !ai->GetMaster();
 }
 
+// the Molten Core lockout a character has this week (0 = none). A raid can only take people with no lockout or the
+// same one as its main tank, as for real players.
+uint32 WovMcBind(Player* p)
+{
+    InstanceSave* sv = sInstanceSaveMgr->PlayerGetInstanceSave(p->GetGUID(), 409, Difficulty(0));
+    return sv ? sv->GetInstanceId() : 0;
+}
+
 void WovLeaveBgQueues(Player* b)
 {
     for (uint32 i = 0; i < PLAYER_MAX_BATTLEGROUND_QUEUES; ++i)
@@ -3283,6 +3294,30 @@ bool WovRaidStart(uint32 guild, time_t now)
         else
             dps.push_back(b);
     }
+    // this week's lockout: the raid goes to the instance most of the guild is saved to (if a tank is saved there too),
+    // and only takes people who are saved there or nowhere
+    uint32 bind = 0;
+    {
+        std::map<uint32, uint32> n;
+        std::set<uint32> tankBinds;
+        for (auto* v : {&tanks, &heals, &dps, &hyb})
+            for (Player* p : *v)
+                if (uint32 b = WovMcBind(p))
+                    ++n[b];
+        for (Player* t : tanks)
+            tankBinds.insert(WovMcBind(t));
+        uint32 best = 0;
+        for (auto const& [b, c] : n)
+            if (tankBinds.count(b) && c > best)
+            {
+                best = c;
+                bind = b;
+            }
+        if (!bind && !tankBinds.count(0))
+            bind = tanks.empty() ? 0 : WovMcBind(tanks[0]);
+        for (auto* v : {&tanks, &heals, &dps, &hyb})
+            v->erase(std::remove_if(v->begin(), v->end(), [&](Player* p) { uint32 b = WovMcBind(p); return b && b != bind; }), v->end());
+    }
     // short of people: the raid leader asks around ("LF5M MC, need lock and heals") and level 60s from outside the
     // guild of the same side fill up, the roles the raid lacks first (warlocks for banishes, healers, tanks)
     uint32 have = tanks.size() + heals.size() + dps.size() + hyb.size();
@@ -3293,7 +3328,8 @@ bool WovRaidStart(uint32 guild, time_t now)
         for (auto const& [g, b] : sRandomPlayerbotMgr.GetAllBots())
             if (b && b->IsInWorld() && b->GetTeamId() == team && b->GetGuildId() != guild && b->GetLevel() >= 60 &&
                 !g_wovRaidRealGuilds.count(b->GetGuildId()) && !WovRaidNightFor(b->GetGUID().GetCounter()) && WovRaidAvail(b, now))
-                pool.push_back(b);
+                if (uint32 pb = WovMcBind(b); !pb || pb == bind)
+                    pool.push_back(b);
         std::shuffle(pool.begin(), pool.end(), std::mt19937(std::random_device{}()));
         auto count = [&](uint8 cls) {
             uint32 n = 0;
@@ -3336,7 +3372,10 @@ bool WovRaidStart(uint32 guild, time_t now)
         hyb.erase(it);
     }
     // main tank first: a tank by spec, then the warrior with the most health
-    std::sort(tanks.begin(), tanks.end(), [](Player* a, Player* b) {
+    std::sort(tanks.begin(), tanks.end(), [bind](Player* a, Player* b) {
+        bool la = WovMcBind(a) == bind, lb = WovMcBind(b) == bind;  // the main tank carries the raid's lockout
+        if (la != lb)
+            return la;
         bool ta = PlayerbotAI::IsTank(a, true) || a->getClass() == CLASS_WARRIOR, tb = PlayerbotAI::IsTank(b, true) || b->getClass() == CLASS_WARRIOR;
         return ta != tb ? ta : a->GetMaxHealth() > b->GetMaxHealth();
     });
