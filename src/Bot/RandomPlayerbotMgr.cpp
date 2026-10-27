@@ -3073,6 +3073,7 @@ std::vector<WovRaid> g_wovRaids;
 std::unordered_map<uint32, time_t> g_wovRaidLast;  // guild -> last raid start
 std::unordered_set<uint32> g_wovRaidRealGuilds;    // guilds led by a real player: they plan their own raids
 bool g_wovRaidEnable = false;
+uint32 g_wovRaidPug = 30;  // a guild short of people fills up to this with level 60s from outside ("LF5M MC")
 uint32 g_wovRaidMin = 20, g_wovRaidMax = 40, g_wovRaidMaxActive = 2, g_wovRaidHour = 20, g_wovRaidTest = 0, g_wovRaidNextId = 1;
 time_t g_wovRaidCfgT = 0, g_wovRaidRealT = 0;
 WovDgDef const kWovMcDef = {"MC", 3528, 60, 60, -1};
@@ -3102,6 +3103,7 @@ void WovRaidConfig(time_t now)
     g_wovRaidMin = std::max<uint32>(10, sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.Raids.MinSize", 20));
     g_wovRaidMax = std::min<uint32>(40, std::max(g_wovRaidMin, sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.Raids.MaxSize", 40)));
     g_wovRaidMaxActive = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.Raids.MaxActive", 2);
+    g_wovRaidPug = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.Raids.PugFillTo", 30);
     g_wovRaidHour = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.Raids.StartHour", 20) % 24;
     g_wovRaidTest = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.Raids.TestGuild", 0);
     if (!g_wovMcSpotOk)
@@ -3279,6 +3281,47 @@ bool WovRaidStart(uint32 guild, time_t now)
             hyb.push_back(b);
         else
             dps.push_back(b);
+    }
+    // short of people: the raid leader asks around ("LF5M MC, need lock and heals") and level 60s from outside the
+    // guild of the same side fill up, the roles the raid lacks first (warlocks for banishes, healers, tanks)
+    uint32 have = tanks.size() + heals.size() + dps.size() + hyb.size();
+    if (have >= g_wovRaidMin / 2 && have < g_wovRaidPug && !tanks.empty())
+    {
+        TeamId team = tanks[0]->GetTeamId();
+        std::vector<Player*> pool;
+        for (auto const& [g, b] : sRandomPlayerbotMgr.GetAllBots())
+            if (b && b->IsInWorld() && b->GetTeamId() == team && b->GetGuildId() != guild && b->GetLevel() >= 60 &&
+                !g_wovRaidRealGuilds.count(b->GetGuildId()) && !WovRaidNightFor(b->GetGUID().GetCounter()) && WovRaidAvail(b, now))
+                pool.push_back(b);
+        std::shuffle(pool.begin(), pool.end(), std::mt19937(std::random_device{}()));
+        auto count = [&](uint8 cls) {
+            uint32 n = 0;
+            for (auto* v : {&tanks, &heals, &dps, &hyb})
+                for (Player* p : *v)
+                    n += p->getClass() == cls ? 1 : 0;
+            return n;
+        };
+        uint32 pugs = 0;
+        auto take = [&](auto pred, std::vector<Player*>& into, uint32 upto) {
+            for (auto it = pool.begin(); it != pool.end() && into.size() < upto && have < g_wovRaidPug;)
+                if (pred(*it))
+                {
+                    into.push_back(*it);
+                    it = pool.erase(it);
+                    ++have;
+                    ++pugs;
+                }
+                else
+                    ++it;
+        };
+        uint32 locks = count(CLASS_WARLOCK);
+        if (locks < 3)
+            take([](Player* p) { return p->getClass() == CLASS_WARLOCK; }, dps, dps.size() + (3 - locks));
+        take([](Player* p) { return p->getClass() == CLASS_PRIEST || PlayerbotAI::IsHeal(p, true); }, heals, std::max<uint32>(5, g_wovRaidPug / 4));
+        take([](Player* p) { return p->getClass() == CLASS_WARRIOR; }, tanks, 4);
+        take([](Player* p) { return true; }, dps, 1000);
+        if (pugs)
+            LOG_INFO("playerbots", "WoV raid <{}>: {} from outside the guild fill up the raid", gname, pugs);
     }
     // too few warriors: a druid bear-tanks (an off-tank, rarely the main tank)
     while (tanks.size() < 2)
