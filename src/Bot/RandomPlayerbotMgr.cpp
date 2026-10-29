@@ -2214,6 +2214,7 @@ struct WovDgRunState
     bool swum = false;
     uint32 real = 0;          // a real player who answered the tank's LFM (takes the last dps spot)
     time_t realT = 0, lfmT = 0, limboT = 0;
+    std::map<uint32, time_t> limbo;  // member -> between maps since (one clock each)
     uint8 lfmN = 0;
 };
 std::vector<WovDgSpot> g_wovDgSpots;
@@ -2642,18 +2643,19 @@ bool WovDgStep(WovDgRunState& r, time_t now)
         if (!b->IsInWorld() || b->IsBeingTeleportedFar())
         {
             // between maps (portal, a ghost zoning in): look again next tick, but not for ever
-            if (!r.limboT)
-                r.limboT = now;
-            if (now > r.limboT + 2 * MINUTE)
+            time_t& since = r.limbo[mm.low];
+            if (!since)
+                since = now;
+            if (now > since + 2 * MINUTE)
             {
                 WovDgRelease(r, std::string(b->GetName() + " vanished between maps").c_str(), r.phase == DG_RUN);
                 return false;
             }
             return true;
         }
+        r.limbo.erase(mm.low);
         ps.push_back(b);
     }
-    r.limboT = 0;
     Player* tank = ps[0];
     PlayerbotAI* tai = GET_PLAYERBOT_AI(tank);
     Player* real = nullptr;
