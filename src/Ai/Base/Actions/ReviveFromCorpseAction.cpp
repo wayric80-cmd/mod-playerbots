@@ -14,6 +14,7 @@
 #include "Playerbots.h"
 #include "RandomPlayerbotMgr.h"
 #include "ServerFacade.h"
+#include "Group.h"
 
 bool WovBotReserved(uint32 low);  // wov: RandomPlayerbotMgr.cpp
 
@@ -44,6 +45,15 @@ bool ReviveFromCorpseAction::Execute(Event event)
 
     if (!corpse)
         return false;
+
+    // wov: in a raid the dead wait while the others still fight the boss (getting up at the body in the middle
+    // of it only meant dying again; on 28/10 that went on for hours). After the fight or the wipe they get up.
+    if (WovBotReserved(bot->GetGUID().GetCounter()) && bot->GetMap() && bot->GetMap()->IsRaid())
+        if (Group* g = bot->GetGroup())
+            for (GroupReference* ref = g->GetFirstMember(); ref; ref = ref->next())
+                if (Player* m = ref->GetSource())
+                    if (m != bot && m->IsInWorld() && m->IsAlive() && m->IsInCombat() && m->GetMap() == bot->GetMap())
+                        return false;
 
     // if (corpse->GetGhostTime() + bot->GetCorpseReclaimDelay(corpse->GetType() == CORPSE_RESURRECTABLE_PVP) >
     // time(nullptr))

@@ -4313,7 +4313,11 @@ bool WovRaidStep(WovRaid& r, time_t now)
             return true;
         }
         r.phaseT = now;
-        // single deaths: a released ghost zones in again, a corpse nobody rezzed gets up after the run back
+        // single deaths: a released ghost zones in again, a corpse nobody rezzed gets up after the run back,
+        // but not while the others are still fighting (up in the middle of the boss only meant dying again)
+        bool fightOn = false;
+        for (Player* b : ps)
+            fightOn = fightOn || (b->IsAlive() && b->IsInCombat() && b->GetMapId() == s.dmap);
         for (size_t i = 0; i < ps.size(); ++i)
         {
             Player* b = ps[i];
@@ -4335,7 +4339,7 @@ bool WovRaidStep(WovRaid& r, time_t now)
             }
             if (!mm.deadT)
                 mm.deadT = now;
-            if (now > mm.deadT + (b->GetMapId() != s.dmap ? 90 : 240))
+            if (now > mm.deadT + (b->GetMapId() != s.dmap ? 90 : 240) && !(fightOn && b->GetMapId() == s.dmap))
             {
                 WovRaidRunBack(b);
                 // got up at the corpse: it runs to where the raid is now (the leader waits for everyone in range)
