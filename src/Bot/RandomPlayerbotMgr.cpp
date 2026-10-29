@@ -3049,6 +3049,10 @@ bool WovDgStep(WovDgRunState& r, time_t now)
 
 #include "InstanceSaveMgr.h"
 #include "ScriptMgr.h"
+#include "ChatHelper.h"
+#include "GameObject.h"
+#include "LootMgr.h"
+#include "StatsWeightCalculator.h"
 #include <map>
 #include <set>
 // ---- wov: raid nights -----------------------------------------------------------------------------------
@@ -3060,6 +3064,17 @@ bool WovDgStep(WovDgRunState& r, time_t now)
 // dies (or they call it) it is "gg" in guild chat and everyone goes back to their own evening.
 namespace
 {
+// one item from a boss that the master looter hands out (wov: raid loot rules)
+struct WovRaidLoot
+{
+    ObjectGuid src;
+    uint8 slot = 0;
+    uint32 item = 0, boss = 0;
+    uint8 stage = 0, mode = 0, pool = 0;  // mode 0 roll, 1 dkp, 2 council; pool 0 main spec, 1 off spec, 2 free roll
+    time_t at = 0;
+    std::vector<std::pair<uint32, uint32>> rolls;  // (player, /roll)
+};
+
 struct WovRaid
 {
     uint32 id = 0, guild = 0;
@@ -3074,6 +3089,20 @@ struct WovRaid
     std::vector<uint32> reals;  // real players of the guild who were asked along
     time_t realInvT = 0, runeT = 0;
     std::set<uint32> doused;
+    // loot rules
+    uint8 rule = 0;  // 0 roll (main spec before off spec), 1 DKP, 2 loot council
+    bool lootSet = false;
+    uint32 ml = 0;                 // the master looter
+    std::map<uint32, int32> dkp;   // guild member -> DKP
+    std::map<uint32, uint32> got;  // items won in the guild's raids the last four weeks
+    std::set<uint64> corpses;      // boss corpses already seen
+    std::vector<WovRaidLoot> loot;
+    std::vector<std::pair<uint32, uint32>> equip;  // (bot, item) to put on once out of combat
+    time_t scanT = 0, endT = 0;
+    std::map<uint32, time_t> limbo;  // member -> between maps since (each its own clock: 30 zoning in one after
+                                     // the other always had someone in limbo, so a shared clock dropped them)
+    std::map<uint32, bool> wasAlive;  // to count deaths
+    std::deque<time_t> deaths;        // raid deaths the last minutes: many of them is a wipe, even if a few live
 };
 std::vector<WovRaid> g_wovRaids;
 std::unordered_map<uint32, time_t> g_wovRaidLast;  // guild -> last raid start
@@ -3238,6 +3267,426 @@ void WovRaidRunBack(Player* b)
     b->ResurrectPlayer(0.5f);
     b->SpawnCorpseBones();
 }
+
+// ---- wov: raid loot rules ---------------------------------------------------------------------------------------
+// A guild hands out what drops the way it has decided (table wov_raid_loot_rule): a /roll with main spec before off
+// spec, DKP (10 points for every boss the member was there for, 5 for being on time, a fixed price per item, the
+// highest balance among those who need it gets it) or a loot council (it goes where it is the biggest upgrade, guild
+// members before pugs, who got little lately first). The master looter is the highest ranked guild member in the
+// raid. Each epic from a boss is announced in raid chat and given out a minute or so after the kill, one at a time.
+char const* const kWovLootRule[] = {"roll", "dkp", "council"};
+
+void WovRaidLootLoad(WovRaid& r)
+{
+    std::string const g = std::to_string(r.guild);
+    r.rule = 0;
+    if (QueryResult q = CharacterDatabase.Query("SELECT method FROM wov_raid_loot_rule WHERE guildid = " + g))
+    {
+        std::string m = q->Fetch()[0].Get<std::string>();
+        r.rule = m == "dkp" ? 1 : m == "council" ? 2 : 0;
+    }
+    if (QueryResult q = CharacterDatabase.Query("SELECT guid, points FROM wov_raid_dkp WHERE guildid = " + g))
+        do
+            r.dkp[q->Fetch()[0].Get<uint32>()] = q->Fetch()[1].Get<int32>();
+        while (q->NextRow());
+    if (QueryResult q = CharacterDatabase.Query("SELECT winner, COUNT(*) FROM wov_raid_loot WHERE guildid = " + g +
+                                                " AND ts > NOW() - INTERVAL 28 DAY GROUP BY winner"))
+        do
+            r.got[q->Fetch()[0].Get<uint32>()] = uint32(q->Fetch()[1].Get<uint64>());
+        while (q->NextRow());
+}
+
+void WovRaidDkp(WovRaid& r, uint32 low, int32 d)
+{
+    r.dkp[low] += d;
+    CharacterDatabase.Execute("INSERT INTO wov_raid_dkp (guildid, guid, points) VALUES (" + std::to_string(r.guild) + ", " +
+                              std::to_string(low) + ", " + std::to_string(d) + ") ON DUPLICATE KEY UPDATE points = points + " +
+                              std::to_string(d));
+}
+
+// every guild member of the raid who is in the instance gets the points
+void WovRaidDkpAll(WovRaid& r, Player* mt, int32 d)
+{
+    Group* g = mt->GetGroup();
+    if (r.rule != 1 || !g)
+        return;
+    for (GroupReference* ref = g->GetFirstMember(); ref; ref = ref->next())
+        if (Player* p = ref->GetSource())
+            if (p->IsInWorld() && p->GetGuildId() == r.guild && p->GetMap() == mt->GetMap())
+                WovRaidDkp(r, p->GetGUID().GetCounter(), d);
+}
+
+// how much better an item is for a player than what it wears there (0.10 = 10 %); -1 when it cannot wear it
+float WovLootGain(Player* p, ItemTemplate const* proto, int32 rprop)
+{
+    if ((proto->Class != ITEM_CLASS_WEAPON && proto->Class != ITEM_CLASS_ARMOR) || p->CanUseItem(proto) != EQUIP_ERR_OK)
+        return -1.0f;
+    std::vector<uint8> slots;
+    switch (proto->InventoryType)
+    {
+        case INVTYPE_HEAD: slots = {EQUIPMENT_SLOT_HEAD}; break;
+        case INVTYPE_NECK: slots = {EQUIPMENT_SLOT_NECK}; break;
+        case INVTYPE_SHOULDERS: slots = {EQUIPMENT_SLOT_SHOULDERS}; break;
+        case INVTYPE_CHEST: case INVTYPE_ROBE: slots = {EQUIPMENT_SLOT_CHEST}; break;
+        case INVTYPE_WAIST: slots = {EQUIPMENT_SLOT_WAIST}; break;
+        case INVTYPE_LEGS: slots = {EQUIPMENT_SLOT_LEGS}; break;
+        case INVTYPE_FEET: slots = {EQUIPMENT_SLOT_FEET}; break;
+        case INVTYPE_WRISTS: slots = {EQUIPMENT_SLOT_WRISTS}; break;
+        case INVTYPE_HANDS: slots = {EQUIPMENT_SLOT_HANDS}; break;
+        case INVTYPE_FINGER: slots = {EQUIPMENT_SLOT_FINGER1, EQUIPMENT_SLOT_FINGER2}; break;
+        case INVTYPE_TRINKET: slots = {EQUIPMENT_SLOT_TRINKET1, EQUIPMENT_SLOT_TRINKET2}; break;
+        case INVTYPE_CLOAK: slots = {EQUIPMENT_SLOT_BACK}; break;
+        case INVTYPE_WEAPON:
+            slots = {EQUIPMENT_SLOT_MAINHAND};
+            if (p->CanDualWield())
+                slots.push_back(EQUIPMENT_SLOT_OFFHAND);
+            break;
+        case INVTYPE_2HWEAPON: case INVTYPE_WEAPONMAINHAND: slots = {EQUIPMENT_SLOT_MAINHAND}; break;
+        case INVTYPE_SHIELD: case INVTYPE_WEAPONOFFHAND: case INVTYPE_HOLDABLE: slots = {EQUIPMENT_SLOT_OFFHAND}; break;
+        case INVTYPE_RANGED: case INVTYPE_THROWN: case INVTYPE_RANGEDRIGHT: case INVTYPE_RELIC: slots = {EQUIPMENT_SLOT_RANGED}; break;
+        default: return -1.0f;
+    }
+    StatsWeightCalculator calc(p);
+    calc.SetOverflowPenalty(false);
+    float want = calc.CalculateItem(proto->ItemId, rprop);
+    if (want <= 0.0f)
+        return -1.0f;
+    auto score = [&](uint8 s) {
+        Item* eq = p->GetItemByPos(INVENTORY_SLOT_BAG_0, s);
+        return eq ? calc.CalculateItem(eq->GetEntry(), eq->GetItemRandomPropertyId()) : 0.0f;
+    };
+    Item* mh = p->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
+    bool twoHand = mh && mh->GetTemplate()->InventoryType == INVTYPE_2HWEAPON;
+    float have = 1e9f;
+    for (uint8 s : slots)
+    {
+        float v = score(s);
+        if (s == EQUIPMENT_SLOT_OFFHAND && twoHand)
+            v = score(EQUIPMENT_SLOT_MAINHAND);  // an off-hand means giving up the two-hander
+        else if (proto->InventoryType == INVTYPE_2HWEAPON)
+            v += score(EQUIPMENT_SLOT_OFFHAND);  // a two-hander replaces both hands
+        have = std::min(have, v);
+    }
+    return (want - have) / std::max(have, 1.0f);
+}
+
+uint32 WovLootCost(ItemTemplate const* proto)
+{
+    switch (proto->InventoryType)
+    {
+        case INVTYPE_WEAPON: case INVTYPE_2HWEAPON: case INVTYPE_WEAPONMAINHAND: case INVTYPE_WEAPONOFFHAND:
+        case INVTYPE_RANGED: case INVTYPE_RANGEDRIGHT: case INVTYPE_SHIELD: case INVTYPE_HOLDABLE:
+            return 40;
+        case INVTYPE_HEAD: case INVTYPE_CHEST: case INVTYPE_ROBE: case INVTYPE_LEGS:
+            return 30;
+        default:
+            return 20;
+    }
+}
+
+Loot* WovRaidLootOf(Map* map, ObjectGuid src)
+{
+    if (!map)
+        return nullptr;
+    if (src.IsCreatureOrVehicle())
+    {
+        Creature* c = map->GetCreature(src);
+        return c ? &c->loot : nullptr;
+    }
+    if (src.IsGameObject())
+    {
+        GameObject* go = map->GetGameObject(src);
+        return go ? &go->loot : nullptr;
+    }
+    return nullptr;
+}
+
+// the master looter's hand-out (as WorldSession::HandleLootMasterGiveOpcode)
+Item* WovRaidGive(Loot* loot, uint8 slot, ObjectGuid src, Player* to)
+{
+    LootItem& li = loot->items[slot];
+    ItemPosCountVec dest;
+    if (li.is_looted || to->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, li.itemid, li.count) != EQUIP_ERR_OK ||
+        !li.AllowedForPlayer(to, loot->sourceWorldObjectGUID))
+        return nullptr;
+    AllowedLooterSet looters = li.GetAllowedLooters();
+    uint32 count = li.count;
+    Item* ni = to->StoreNewItem(dest, li.itemid, true, li.randomPropertyId, looters);
+    if (!ni)
+        return nullptr;
+    to->SendNewItem(ni, count, false, false, true);
+    sScriptMgr->OnPlayerLootItem(to, ni, count, src);
+    li.count = 0;
+    li.is_looted = true;
+    loot->NotifyItemRemoved(slot);
+    if (loot->unlootedCount)
+        --loot->unlootedCount;
+    return ni;
+}
+
+// master loot, epics and up, the highest ranked guild bot of the raid as master looter
+void WovRaidLootSetup(WovRaid& r, Group* g, Player* mt)
+{
+    Player* ml = mt;
+    uint32 best = 255;
+    if (Guild* gg = sGuildMgr->GetGuildById(r.guild))
+        for (GroupReference* ref = g->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* p = ref->GetSource();
+            if (!p || !GET_PLAYERBOT_AI(p) || p->GetGuildId() != r.guild)
+                continue;
+            if (Guild::Member const* m = gg->GetMember(p->GetGUID()))
+                if (m->GetRankId() < best)
+                {
+                    best = m->GetRankId();
+                    ml = p;
+                }
+        }
+    g->SetLootMethod(MASTER_LOOT);
+    g->SetMasterLooterGuid(ml->GetGUID());
+    g->SetLootThreshold(ITEM_QUALITY_EPIC);
+    g->SendUpdate();
+    r.ml = ml->GetGUID().GetCounter();
+    r.lootSet = true;
+    LOG_INFO("playerbots", "WoV raid #{} <{}> MC loot: master loot by {}, {}", r.id, r.gname, ml->GetName(), kWovLootRule[r.rule]);
+}
+
+// a boss down: its epics go in the queue (and the DKP for the kill)
+void WovRaidLootScan(WovRaid& r, Player* mt, time_t now)
+{
+    static std::vector<uint32> const bosses = {12118, 11982, 12259, 12057, 12264, 12056, 11988, 12098, 11502};
+    std::list<Creature*> found;
+    mt->GetCreatureListWithEntryInGrid(found, bosses, 250.0f);
+    for (Creature* c : found)
+    {
+        if (c->IsAlive() || !c->HasDynamicFlag(UNIT_DYNFLAG_LOOTABLE) || !r.corpses.insert(c->GetGUID().GetRawValue()).second)
+            continue;
+        WovRaidDkpAll(r, mt, 10);
+        uint32 n = 0;
+        for (uint8 i = 0; i < c->loot.items.size(); ++i)
+        {
+            LootItem const& li = c->loot.items[i];
+            ItemTemplate const* proto = sObjectMgr->GetItemTemplate(li.itemid);
+            if (li.is_looted || li.freeforall || !proto || proto->Quality < ITEM_QUALITY_EPIC)
+                continue;
+            WovRaidLoot l;
+            l.src = c->GetGUID();
+            l.slot = i;
+            l.item = li.itemid;
+            l.boss = c->GetEntry();
+            l.at = now + 25 + n * 15 + urand(0, 15);
+            r.loot.push_back(l);
+            ++n;
+        }
+        LOG_INFO("playerbots", "WoV raid #{} <{}> MC loot: {} down, {} epics ({})", r.id, r.gname, c->GetName(), n, kWovLootRule[r.rule]);
+    }
+}
+
+void WovRaidLootSay(WovRaid const& r, Player* mt, std::string const& text)
+{
+    Player* ml = ObjectAccessor::FindPlayerByLowGUID(r.ml);
+    PlayerbotAI* ai = ml && ml->GetGroup() == mt->GetGroup() ? GET_PLAYERBOT_AI(ml) : nullptr;
+    if (!ai)
+        ai = GET_PLAYERBOT_AI(mt);
+    if (ai)
+        ai->SayToRaid(text);
+}
+
+void WovRaidLootStep(WovRaid& r, Player* mt, time_t now)
+{
+    // won items are put on out of combat
+    for (size_t i = 0; i < r.equip.size();)
+    {
+        Player* b = ObjectAccessor::FindPlayerByLowGUID(r.equip[i].first);
+        if (b && b->IsInCombat())
+        {
+            ++i;
+            continue;
+        }
+        if (b && b->GetSession())
+            if (Item* it = b->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(r.equip[i].second)))
+                if (!it->IsEquipped())
+                {
+                    WorldPacket* pk = new WorldPacket(CMSG_AUTOEQUIP_ITEM);
+                    *pk << uint8(it->GetBagSlot()) << uint8(it->GetSlot());
+                    b->GetSession()->QueuePacket(pk);
+                }
+        r.equip.erase(r.equip.begin() + i);
+    }
+    if (r.loot.empty() || now < r.loot.front().at)
+        return;
+    WovRaidLoot& l = r.loot.front();
+    Map* map = mt->GetMap();
+    Loot* loot = WovRaidLootOf(map, l.src);
+    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(l.item);
+    if (!loot || !proto || l.slot >= loot->items.size() || loot->items[l.slot].is_looted || loot->items[l.slot].itemid != l.item)
+    {
+        r.loot.erase(r.loot.begin());
+        return;
+    }
+    LootItem const& li = loot->items[l.slot];
+    struct Cand
+    {
+        Player* p;
+        float gain;
+        bool guild;
+    };
+    std::vector<Cand> cs;
+    if (Group* g = mt->GetGroup())
+        for (GroupReference* ref = g->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* p = ref->GetSource();
+            ItemPosCountVec dest;
+            if (!p || !p->IsInWorld() || p->GetMap() != map ||
+                p->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, li.itemid, li.count) != EQUIP_ERR_OK ||
+                !li.AllowedForPlayer(p, loot->sourceWorldObjectGUID))
+                continue;
+            cs.push_back({p, WovLootGain(p, proto, li.randomPropertyId), p->GetGuildId() == r.guild});
+        }
+    std::string const link = ChatHelper::FormatItem(proto);
+    if (cs.empty())
+    {
+        LOG_INFO("playerbots", "WoV raid #{} <{}> MC loot: nobody can take {}", r.id, r.gname, proto->Name1);
+        r.loot.erase(r.loot.begin());
+        return;
+    }
+    auto inPool = [&](Cand const& c, uint8 pool) {
+        return pool == 0 ? c.gain > 0.05f : pool == 1 ? c.gain > -0.99f : true;
+    };
+    auto give = [&](Cand const& w, std::string const& how, std::string const& detail) {
+        Item* ni = WovRaidGive(loot, l.slot, l.src, w.p);
+        if (!ni)
+        {
+            LOG_INFO("playerbots", "WoV raid #{} <{}> MC loot: could not give {} to {}", r.id, r.gname, proto->Name1, w.p->GetName());
+            r.loot.erase(r.loot.begin());
+            return;
+        }
+        uint32 low = w.p->GetGUID().GetCounter();
+        ++r.got[low];
+        WovRaidLootSay(r, mt, link + " " + how);
+        if (PlayerbotAI* wai = GET_PLAYERBOT_AI(w.p))
+        {
+            if (w.gain > 0.05f)
+                r.equip.push_back({low, ni->GetGUID().GetCounter()});
+            static char const* const thx[] = {"ty!", "thx", "ty :)", "nice ty", "ty guys", "yay ty"};
+            if (urand(0, 99) < 55)
+                wai->SayToRaid(WovPick(thx));
+        }
+        CharacterDatabase.Execute("INSERT INTO wov_raid_loot (guildid, raid, instance_id, boss, item, winner, pug, method, gain, detail) VALUES (" +
+                                  std::to_string(r.guild) + ", " + std::to_string(r.id) + ", " + std::to_string(mt->GetInstanceId()) + ", " +
+                                  std::to_string(l.boss) + ", " + std::to_string(l.item) + ", " + std::to_string(low) + ", " +
+                                  (w.guild ? "0" : "1") + ", '" + kWovLootRule[l.mode] + "', " + std::to_string(std::max(-1.0f, std::min(w.gain, 99.0f))) +
+                                  ", '" + detail + "')");
+        LOG_INFO("playerbots", "WoV raid #{} <{}> MC loot: {} -> {}{} ({}, {}, gain {:.0f}%)", r.id, r.gname, proto->Name1, w.p->GetName(),
+                 w.guild ? "" : " (pug)", kWovLootRule[l.mode], detail, w.gain * 100.0f);
+        r.loot.erase(r.loot.begin());
+    };
+    if (l.stage == 0)  // the master looter puts it up
+    {
+        bool guildMs = false, anyMs = false, anyOs = false;
+        for (Cand const& c : cs)
+        {
+            guildMs = guildMs || (c.guild && inPool(c, 0));
+            anyMs = anyMs || inPool(c, 0);
+            anyOs = anyOs || inPool(c, 1);
+        }
+        l.mode = r.rule == 1 && guildMs ? 1 : r.rule == 2 && anyMs ? 2 : 0;
+        l.pool = anyMs ? 0 : anyOs ? 1 : 2;
+        std::string line;
+        if (l.mode == 1)
+            line = "up for " + std::to_string(WovLootCost(proto)) + " dkp, MS only";
+        else if (l.mode == 2)
+            line = urand(0, 1) ? "council, give us a sec" : "council deciding";
+        else if (l.pool == 0)
+            line = urand(0, 1) ? "roll MS" : "MS roll";
+        else if (l.pool == 1)
+            line = "no MS? roll OS";
+        else
+            line = urand(0, 1) ? "free roll" : "anyone? roll";
+        WovRaidLootSay(r, mt, link + " " + line);
+        l.stage = 1;
+        l.at = now + (l.mode == 0 ? urand(4, 8) : urand(15, 30));
+        return;
+    }
+    if (l.mode == 0 && l.stage == 1)  // everyone in the pool rolls
+    {
+        for (Cand const& c : cs)
+            if (inPool(c, l.pool))
+                l.rolls.push_back({c.p->GetGUID().GetCounter(), c.p->DoRandomRoll(1, 100)});
+        l.stage = 2;
+        l.at = now + urand(6, 10);
+        return;
+    }
+    Cand const* w = nullptr;
+    std::string how, detail;
+    if (l.mode == 0)
+    {
+        uint32 top = 0;
+        for (auto const& [low, roll] : l.rolls)
+            for (Cand const& c : cs)
+                if (c.p->GetGUID().GetCounter() == low && roll > top)
+                {
+                    top = roll;
+                    w = &c;
+                }
+        if (w)
+        {
+            how = "to " + w->p->GetName() + " (" + std::to_string(top) + ")";
+            detail = "roll " + std::to_string(top) + (l.pool == 0 ? " MS" : l.pool == 1 ? " OS" : " free");
+        }
+    }
+    else if (l.mode == 1)
+    {
+        int32 top = 0;
+        for (Cand const& c : cs)
+        {
+            if (!c.guild || !inPool(c, 0))
+                continue;
+            int32 d = r.dkp[c.p->GetGUID().GetCounter()];
+            if (!w || d > top || (d == top && c.gain > w->gain))
+            {
+                w = &c;
+                top = d;
+            }
+        }
+        if (w)
+        {
+            int32 cost = int32(WovLootCost(proto));
+            WovRaidDkp(r, w->p->GetGUID().GetCounter(), -cost);
+            how = "to " + w->p->GetName() + ", -" + std::to_string(cost) + " (" + std::to_string(top - cost) + " left)";
+            detail = "dkp " + std::to_string(top) + " -" + std::to_string(cost);
+        }
+    }
+    else
+    {
+        float top = -1.0f;
+        for (Cand const& c : cs)
+        {
+            if (!inPool(c, 0))
+                continue;
+            float v = c.gain * (c.guild ? 1.0f : 0.3f) / (1.0f + 0.5f * float(r.got[c.p->GetGUID().GetCounter()])) * frand(0.9f, 1.1f);
+            if (v > top)
+            {
+                top = v;
+                w = &c;
+            }
+        }
+        if (w)
+        {
+            how = "to " + w->p->GetName();
+            detail = "council, " + std::to_string(r.got[w->p->GetGUID().GetCounter()]) + " items in 4 weeks";
+        }
+    }
+    if (!w)  // the ones who wanted it left: start again
+    {
+        l.stage = 0;
+        l.rolls.clear();
+        l.at = now + 5;
+        return;
+    }
+    give(*w, how, detail);
+}
+// ---- end wov: raid loot rules -----------------------------------------------------------------------------------
 
 // free for raid night: in the world, not busy elsewhere; a group of bots is left for the raid, one with a real player is not
 bool WovRaidAvail(Player* b, time_t now)
@@ -3423,6 +3872,7 @@ bool WovRaidStart(uint32 guild, time_t now)
         if (std::find_if(r.m.begin(), r.m.end(), [&](WovDgMember const& x) { return x.low == p->GetGUID().GetCounter(); }) == r.m.end())
             add(p, 1);
     g_wovRaidLast[guild] = now;
+    WovRaidLootLoad(r);
     WovRaidSay(r, kWovRnCall[urand(0, 3)], true);
     // real players in the guild are asked along (a whisper from the raid leader); they are invited at the window
     for (auto const& [id, session] : sWorldSessionMgr->GetAllSessions())
@@ -3462,22 +3912,24 @@ bool WovRaidStep(WovRaid& r, time_t now)
         }
         if (!b->IsInWorld() || b->IsBeingTeleportedFar())
         {
-            if (!r.limboT)
-                r.limboT = now;
-            if (now < r.limboT + 2 * MINUTE)
+            time_t& since = r.limbo[r.m[i].low];
+            if (!since)
+                since = now;
+            if (now < since + 3 * MINUTE)
                 return true;
             if (i == 0)
             {
                 WovRaidEnd(r, "the main tank vanished between maps", true, kWovRnCallIt, 3);
                 return false;
             }
+            r.limbo.erase(r.m[i].low);
             WovRaidDrop(r, i, "vanished between maps");
             continue;
         }
+        r.limbo.erase(r.m[i].low);
         ps.push_back(b);
         ++i;
     }
-    r.limboT = 0;
     Player* mt = ps[0];
     PlayerbotAI* mai = GET_PLAYERBOT_AI(mt);
     if (now > r.start + 4 * HOUR)
@@ -3570,6 +4022,8 @@ bool WovRaidStep(WovRaid& r, time_t now)
             if (g && g->IsLeader(mt->GetGUID()) && !g->isRaidGroup() && g->GetMembersCount() >= 2)
                 g->ConvertToRaid();
             g = mt->GetGroup();
+            if (g && g->isRaidGroup() && g->IsLeader(mt->GetGUID()) && !r.lootSet)
+                WovRaidLootSetup(r, g, mt);
             for (size_t i = 1; i < ps.size(); ++i)
             {
                 Player* b = ps[i];
@@ -3622,6 +4076,12 @@ bool WovRaidStep(WovRaid& r, time_t now)
             r.phase = DG_ENTER;
             r.phaseT = now;
             WovRaidSay(r, WovPick(kWovRnGo), false);
+            if (!r.lootSet || g->GetLootMethod() != MASTER_LOOT)
+                WovRaidLootSetup(r, g, mt);
+            static char const* const rules[3][2] = {{"loot is ML, MS > OS rolls", "ML on, roll MS over OS"},
+                                                    {"ML on, dkp as usual", "loot by dkp, ML on"},
+                                                    {"loot council tonight, ML on", "council loot as usual"}};
+            WovRaidLootSay(r, mt, rules[r.rule][urand(0, 1)]);
             return true;
         }
         if (now > r.start + 45 * MINUTE)
@@ -3673,6 +4133,7 @@ bool WovRaidStep(WovRaid& r, time_t now)
             mai->DoSpecificAction("dc on", Event("wov", "", nullptr), true);
             r.phase = DG_RUN;
             r.phaseT = r.roleT = now;
+            WovRaidDkpAll(r, mt, 5);  // on time
             LOG_INFO("playerbots", "WoV raid #{} <{}> MC: {} inside (instance {}), clear started", r.id, r.gname, ps.size(), mt->GetInstanceId());
         }
         else if (now > r.phaseT + 3 * MINUTE)
@@ -3694,10 +4155,27 @@ bool WovRaidStep(WovRaid& r, time_t now)
     }
     if (r.phase == DG_RUN)
     {
+        // the loot: master loot on, bosses down, items handed out one at a time
+        if (Group* lg = mt->GetGroup(); lg && mt->GetMapId() == s.dmap && now >= r.scanT + 10)
+        {
+            r.scanT = now;
+            if (lg->GetLootMethod() != MASTER_LOOT || !lg->IsMember(ObjectGuid::Create<HighGuid::Player>(r.ml)))
+                if (lg->IsLeader(mt->GetGUID()))
+                    WovRaidLootSetup(r, lg, mt);
+            WovRaidLootScan(r, mt, now);
+        }
+        if (mt->GetMapId() == s.dmap)
+            WovRaidLootStep(r, mt, now);
         if (r.finalKilled)
         {
-            WovRaidEnd(r, "Ragnaros is dead, MC cleared", true, kWovRnEnd, 4);
-            return false;
+            if (!r.endT)
+                r.endT = now;
+            if ((r.loot.empty() && now > r.endT + 20) || now > r.endT + 6 * MINUTE)
+            {
+                WovRaidEnd(r, "Ragnaros is dead, MC cleared", true, kWovRnEnd, 4);
+                return false;
+            }
+            return true;
         }
         // the Firelord runes: once a boss is down his rune can be doused with Aqual Quintessence; with all seven doused
         // Majordomo Executus comes (progression rule ManualRuneHandling). Someone in the raid carries the quintessence.
@@ -3766,6 +4244,40 @@ bool WovRaidStep(WovRaid& r, time_t now)
         bool anyAlive = false;  // anywhere: one who got up at the graveyard is on the way back, not a wipe
         for (Player* b : ps)
             anyAlive = anyAlive || b->IsAlive();
+        // a wipe is also when most of the raid died within a few minutes, even if a few are still up or were
+        // battle-rezzed (on 28/10 two raids died 700 times on Garr, Geddon and Shazzrah without ever counting one)
+        for (Player* b : ps)
+        {
+            uint32 low = b->GetGUID().GetCounter();
+            auto it = r.wasAlive.find(low);
+            if (it != r.wasAlive.end() && it->second && !b->IsAlive() && b->GetMapId() == s.dmap)
+                r.deaths.push_back(now);
+            r.wasAlive[low] = b->IsAlive();
+        }
+        while (!r.deaths.empty() && r.deaths.front() < now - 5 * MINUTE)
+            r.deaths.pop_front();
+        if (anyAlive && !r.rezT && r.deaths.size() >= std::max<size_t>(8, ps.size() * 6 / 10))
+        {
+            r.deaths.clear();
+            if (++r.wipes > 2)
+            {
+                WovRaidEnd(r, "called it after three wipes", true, kWovRnCallIt, 3);
+                return false;
+            }
+            for (Player* b : ps)  // those still up run out too, as when the raid leader calls the wipe
+                if (b->IsAlive() && b->GetMapId() == s.dmap)
+                {
+                    b->CombatStop(true);
+                    b->NearTeleportTo(s.dx + frand(-2.0f, 2.0f), s.dy + frand(-2.0f, 2.0f), s.dz, s.dO);
+                }
+            for (Player* b : ps)
+                WovRaidRunBack(b);
+            r.rezT = now;
+            r.phaseT = now;
+            WovRaidSay(r, WovPick(kWovRnWipe), false);
+            LOG_INFO("playerbots", "WoV raid #{} <{}> MC: wipe {} (most of the raid died within 5 min), running back", r.id, r.gname, r.wipes);
+            return true;
+        }
         if (r.rezT && now >= r.rezT + 30)  // back up after the run back: drink, buff, again
         {
             r.rezT = 0;
@@ -3785,6 +4297,7 @@ bool WovRaidStep(WovRaid& r, time_t now)
         {
             if (now > r.phaseT + 3 * MINUTE)
             {
+                r.deaths.clear();
                 if (++r.wipes > 2)
                 {
                     WovRaidEnd(r, "called it after three wipes", true, kWovRnCallIt, 3);
