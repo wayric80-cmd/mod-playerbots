@@ -4521,8 +4521,10 @@ void WovOnyAttune_Tick(time_t now)
         if (b->GetQuestStatus(qid) == QUEST_STATUS_NONE)
             b->AddQuest(q, nullptr);
         b->CompleteQuest(qid);
-        if (b->CanRewardQuest(q, false))
-            b->RewardQuest(q, 0, nullptr, false);
+        // not CanRewardQuest: it wants the Blood of the Black Dragon Champion in the bags, which the turn-in takes
+        b->RewardQuest(q, 0, nullptr, false);
+        if (!b->HasItemCount(16309, 1, true))  // full bags: the amulet anyway
+            b->StoreNewItemInBestSlots(16309, 1);
         if (b->HasItemCount(16309, 1, true))
         {
             ++n;
