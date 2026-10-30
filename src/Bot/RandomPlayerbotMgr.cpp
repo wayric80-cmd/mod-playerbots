@@ -3773,8 +3773,16 @@ bool WovRaidStart(uint32 guild, time_t now)
     }
     // short of people: the raid leader asks around ("LF5M MC, need lock and heals") and level 60s from outside the
     // guild of the same side fill up, the roles the raid lacks first (warlocks for banishes, healers, tanks)
+    // the instance's player cap: mapdifficulty_dbc can lower it (mod-progression-system sets MC to 20). Members over
+    // the cap pass the check at the window but are turned back on arrival ("Map 409 could not be created for player
+    // ..., porting player to homebind"), which the raid saw as "vanished between maps".
+    uint32 cap = g_wovRaidMax;
+    if (MapDifficulty const* md = GetMapDifficultyData(409, RAID_DIFFICULTY_10MAN_NORMAL))
+        if (md->maxPlayers)
+            cap = std::min<uint32>(cap, md->maxPlayers);
+    uint32 pugTo = std::min(g_wovRaidPug, cap);
     uint32 have = tanks.size() + heals.size() + dps.size() + hyb.size();
-    if (have >= std::max<uint32>(5, g_wovRaidMin / 3) && have < g_wovRaidPug && !tanks.empty())  // a small guild pugs the rest
+    if (have >= std::max<uint32>(5, g_wovRaidMin / 3) && have < pugTo && !tanks.empty())  // a small guild pugs the rest
     {
         TeamId team = tanks[0]->GetTeamId();
         std::vector<Player*> pool;
@@ -3793,7 +3801,7 @@ bool WovRaidStart(uint32 guild, time_t now)
         };
         uint32 pugs = 0;
         auto take = [&](auto pred, std::vector<Player*>& into, uint32 upto) {
-            for (auto it = pool.begin(); it != pool.end() && into.size() < upto && have < g_wovRaidPug;)
+            for (auto it = pool.begin(); it != pool.end() && into.size() < upto && have < pugTo;)
                 if (pred(*it))
                 {
                     into.push_back(*it);
@@ -3807,7 +3815,7 @@ bool WovRaidStart(uint32 guild, time_t now)
         uint32 locks = count(CLASS_WARLOCK);
         if (locks < 3)
             take([](Player* p) { return p->getClass() == CLASS_WARLOCK; }, dps, dps.size() + (3 - locks));
-        take([](Player* p) { return p->getClass() == CLASS_PRIEST || PlayerbotAI::IsHeal(p, true); }, heals, std::max<uint32>(5, g_wovRaidPug / 4));
+        take([](Player* p) { return p->getClass() == CLASS_PRIEST || PlayerbotAI::IsHeal(p, true); }, heals, std::max<uint32>(5, pugTo / 4));
         take([](Player* p) { return p->getClass() == CLASS_WARRIOR; }, tanks, 4);
         take([](Player* p) { return true; }, dps, 1000);
         if (pugs)
@@ -3838,7 +3846,7 @@ bool WovRaidStart(uint32 guild, time_t now)
         LOG_INFO("playerbots", "WoV raid <{}>: not enough people for MC tonight ({} level 60 online, {} tanks)", gname, total, tanks.size());
         return false;
     }
-    uint32 size = std::min(g_wovRaidMax, total);
+    uint32 size = std::min(cap, total);
     uint32 wantHeal = std::max<uint32>(4, size / 4), wantTank = std::min<uint32>(size >= 25 ? 4 : 3, tanks.size());
     WovRaid r;
     r.id = g_wovRaidNextId++;
