@@ -14,6 +14,7 @@
 #include "ChannelMgr.h"
 #include "CompanyStanding.h"
 #include "DBCStores.h"
+#include "DisableMgr.h"
 #include "DBCStructure.h"
 #include "DatabaseEnv.h"
 #include "Define.h"
@@ -3080,6 +3081,7 @@ struct WovRaidLoot
 struct WovRaid
 {
     uint32 id = 0, guild = 0;
+    uint8 def = 0;  // kWovRaidDefs: 0 Molten Core, 1 Onyxia
     std::string gname;
     std::vector<WovDgMember> m;  // m[0] is the main tank and raid leader
     std::vector<uint8> role;     // 0 tank, 1 healer, 2 dps
@@ -3114,8 +3116,6 @@ uint32 g_wovRaidPug = 30;  // a guild short of people fills up to this with leve
 uint32 g_wovRaidMin = 20, g_wovRaidMax = 40, g_wovRaidMaxActive = 2, g_wovRaidHour = 20, g_wovRaidTest = 0, g_wovRaidNextId = 1;
 time_t g_wovRaidCfgT = 0, g_wovRaidRealT = 0;
 WovDgDef const kWovMcDef = {"MC", 3528, 60, 60, -1};
-WovDgSpot g_wovMcSpot;
-bool g_wovMcSpotOk = false;
 uint32 const kWovRagnaros = 11502;
 
 char const* const kWovRnCall[] = {"MC tonight! invites going out, come to the window in BRM",
@@ -3130,6 +3130,42 @@ char const* const kWovRnEnd[] = {"gg all, good raid tonight", "thanks all, same 
                                    "gg, see you next raid"};
 char const* const kWovRnCallIt[] = {"ok calling it for tonight, ty all", "thats it for tonight, gj everyone",
                                       "calling it, we'll get it next week"};
+char const* const kWovRnAskMc[] = {"MC tonight, u coming? meet at the window in BRM, ill inv",
+                                   "raiding MC now, want in? come to blackrock mountain, lothos",
+                                   "hey we're doing MC, come to the BRM window and ill invite u"};
+char const* const kWovRnCallOny[] = {"ony tonight! invites going out, meet at the stone by her lair in wyrmbog",
+                                     "onyxia tonight, everyone to dustwallow, sums at the meeting stone",
+                                     "ony time, come to the stone outside the lair. bring the amulet",
+                                     "raid starting: onyxia. wyrmbog in dustwallow, lock will sum"};
+char const* const kWovRnAskOny[] = {"ony tonight, u coming? meet at the stone outside her lair, ill inv",
+                                    "doing onyxia now, want in? dustwallow marsh, wyrmbog",
+                                    "hey we're killing ony, come to the lair in dustwallow and ill invite u"};
+WovDgDef const kWovOnyDef = {"Ony", 2848, 60, 60, -1};
+
+// wov: the raids. Molten Core on the raid nights; Onyxia (once her lair is open) instead on the guild's first raid
+// night of the week, if the guild has enough people with the Drakefire Amulet and has not killed her this week.
+struct WovRaidDef
+{
+    char const* tag;
+    char const* done;               // why the raid ends when the last boss is dead
+    WovDgDef const* dg;             // the portal (areatrigger) of the spot
+    uint32 map, finalBoss, attune;  // attune: an item every member must carry (0 none)
+    float mx, my, mz;               // where the raid meets, on solid floor near the entrance
+    uint32 taxiH, taxiA;            // flight masters the far ones fly to (TaxiNodes)
+    std::vector<uint32> bosses;     // their corpses are handed out by the master looter
+    char const* const* call;        // 4 lines in guild chat when the raid is called
+    char const* const* ask;         // 3 whispers to real guild members
+};
+std::vector<WovRaidDef> const kWovRaidDefs = {
+    {"MC", "Ragnaros is dead, MC cleared", &kWovMcDef, 409, 11502, 0, -7506.0f, -1042.0f, 180.9f, 75, 74,
+     {12118, 11982, 12259, 12057, 12264, 12056, 11988, 12098, 11502}, kWovRnCall, kWovRnAskMc},
+    {"Ony", "Onyxia is dead", &kWovOnyDef, 249, 10184, 16309, -4753.0f, -3653.0f, 46.0f, 55, 32, {10184}, kWovRnCallOny,
+     kWovRnAskOny}};
+WovDgSpot g_wovRaidSpot[2];
+bool g_wovRaidSpotOk[2] = {false, false};
+uint32 g_wovRaidTestRaid = 0, g_wovOnyAttuneEvery = 150, g_wovRaidTestAttune = 0;
+WovDgSpot const& WovRaidSpot(WovRaid const& r) { return g_wovRaidSpot[r.def]; }
+char const* WovRaidTag(WovRaid const& r) { return kWovRaidDefs[r.def].tag; }
 
 void WovRaidConfig(time_t now)
 {
@@ -3143,28 +3179,35 @@ void WovRaidConfig(time_t now)
     g_wovRaidPug = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.Raids.PugFillTo", 30);
     g_wovRaidHour = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.Raids.StartHour", 20) % 24;
     g_wovRaidTest = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.Raids.TestGuild", 0);
-    if (!g_wovMcSpotOk)
+    g_wovRaidTestRaid = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.Raids.TestRaid", 0) % kWovRaidDefs.size();
+    g_wovRaidTestAttune = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.Raids.TestAttuneGuild", 0);
+    g_wovOnyAttuneEvery = std::max<uint32>(1, sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.Raids.OnyAttuneEvery", 150));
+    for (size_t d = 0; d < kWovRaidDefs.size(); ++d)
     {
-        AreaTrigger const* at = sObjectMgr->GetAreaTrigger(kWovMcDef.trigger);
-        AreaTriggerTeleport const* tp = sObjectMgr->GetAreaTriggerTeleport(kWovMcDef.trigger);
-        if (at && tp)
-        {
-            g_wovMcSpot.def = &kWovMcDef;
-            g_wovMcSpot.map = at->map;
-            // the raid meets at Lothos Riftwaker, beside the window on solid floor (the window ledge drops into the lava)
-            g_wovMcSpot.x = g_wovMcSpot.mx = -7506.0f;
-            g_wovMcSpot.y = g_wovMcSpot.my = -1042.0f;
-            g_wovMcSpot.z = g_wovMcSpot.mz = 180.9f;
-            g_wovMcSpot.meetSet = true;
-            g_wovMcSpot.dmap = tp->target_mapId;
-            g_wovMcSpot.dx = tp->target_X;
-            g_wovMcSpot.dy = tp->target_Y;
-            g_wovMcSpot.dz = tp->target_Z;
-            g_wovMcSpot.dO = tp->target_Orientation;
-            g_wovMcSpotOk = true;
-        }
+        WovRaidDef const& D = kWovRaidDefs[d];
+        g_wovDgFinal.insert(D.finalBoss);  // the kill hook reports the last boss too
+        if (g_wovRaidSpotOk[d])
+            continue;
+        AreaTrigger const* at = sObjectMgr->GetAreaTrigger(D.dg->trigger);
+        AreaTriggerTeleport const* tp = sObjectMgr->GetAreaTriggerTeleport(D.dg->trigger);
+        if (!at || !tp)
+            continue;
+        WovDgSpot& sp = g_wovRaidSpot[d];
+        sp.def = D.dg;
+        sp.map = at->map;
+        // the raid meets on solid floor: MC at Lothos Riftwaker (the window ledge drops into the lava), Onyxia at
+        // the meeting stone in Wyrmbog
+        sp.x = sp.mx = D.mx;
+        sp.y = sp.my = D.my;
+        sp.z = sp.mz = D.mz;
+        sp.meetSet = true;
+        sp.dmap = tp->target_mapId;
+        sp.dx = tp->target_X;
+        sp.dy = tp->target_Y;
+        sp.dz = tp->target_Z;
+        sp.dO = tp->target_Orientation;
+        g_wovRaidSpotOk[d] = true;
     }
-    g_wovDgFinal.insert(kWovRagnaros);  // the kill hook reports Ragnaros too
     if (now >= g_wovRaidRealT + 10 * MINUTE)
     {
         g_wovRaidRealT = now;
@@ -3241,7 +3284,7 @@ void WovRaidDrop(WovRaid& r, size_t i, char const* why)
 {
     uint32 low = r.m[i].low;
     Player* b = ObjectAccessor::FindPlayerByLowGUID(low);
-    LOG_INFO("playerbots", "WoV raid #{} <{}> MC: {} drops out ({})", r.id, r.gname, b ? b->GetName() : std::to_string(low), why);
+    LOG_INFO("playerbots", "WoV raid #{} <{}> {}: {} drops out ({})", r.id, r.gname, WovRaidTag(r), b ? b->GetName() : std::to_string(low), why);
     r.m.erase(r.m.begin() + i);
     r.role.erase(r.role.begin() + i);
     WovRaidFree(low);
@@ -3253,12 +3296,12 @@ void WovRaidEnd(WovRaid& r, char const* why, bool guildBye, char const* const* l
         WovRaidSay(r, lines[urand(0, n - 1)], true);
     for (WovDgMember const& mm : r.m)
         WovRaidFree(mm.low);
-    LOG_INFO("playerbots", "WoV raid #{} <{}> MC: {} ({} min, {} wipes)", r.id, r.gname, why, (time(nullptr) - r.start) / 60, r.wipes);
+    LOG_INFO("playerbots", "WoV raid #{} <{}> {}: {} ({} min, {} wipes)", r.id, r.gname, WovRaidTag(r), why, (time(nullptr) - r.start) / 60, r.wipes);
 }
 
-void WovRaidRunBack(Player* b)
+void WovRaidRunBack(WovRaid const& r, Player* b)
 {
-    WovDgSpot const& s = g_wovMcSpot;
+    WovDgSpot const& s = WovRaidSpot(r);
     if (b->IsAlive() || b->IsBeingTeleported())
         return;
     if (b->GetMapId() != s.dmap)
@@ -3450,13 +3493,13 @@ void WovRaidLootSetup(WovRaid& r, Group* g, Player* mt)
     g->SendUpdate();
     r.ml = ml->GetGUID().GetCounter();
     r.lootSet = true;
-    LOG_INFO("playerbots", "WoV raid #{} <{}> MC loot: master loot by {}, {}", r.id, r.gname, ml->GetName(), kWovLootRule[r.rule]);
+    LOG_INFO("playerbots", "WoV raid #{} <{}> {} loot: master loot by {}, {}", r.id, r.gname, WovRaidTag(r), ml->GetName(), kWovLootRule[r.rule]);
 }
 
 // a boss down: its epics go in the queue (and the DKP for the kill)
 void WovRaidLootScan(WovRaid& r, Player* mt, time_t now)
 {
-    static std::vector<uint32> const bosses = {12118, 11982, 12259, 12057, 12264, 12056, 11988, 12098, 11502};
+    std::vector<uint32> const& bosses = kWovRaidDefs[r.def].bosses;
     std::list<Creature*> found;
     mt->GetCreatureListWithEntryInGrid(found, bosses, 250.0f);
     for (Creature* c : found)
@@ -3480,7 +3523,7 @@ void WovRaidLootScan(WovRaid& r, Player* mt, time_t now)
             r.loot.push_back(l);
             ++n;
         }
-        LOG_INFO("playerbots", "WoV raid #{} <{}> MC loot: {} down, {} epics ({})", r.id, r.gname, c->GetName(), n, kWovLootRule[r.rule]);
+        LOG_INFO("playerbots", "WoV raid #{} <{}> {} loot: {} down, {} epics ({})", r.id, r.gname, WovRaidTag(r), c->GetName(), n, kWovLootRule[r.rule]);
     }
 }
 
@@ -3548,7 +3591,7 @@ void WovRaidLootStep(WovRaid& r, Player* mt, time_t now)
     std::string const link = ChatHelper::FormatItem(proto);
     if (cs.empty())
     {
-        LOG_INFO("playerbots", "WoV raid #{} <{}> MC loot: nobody can take {}", r.id, r.gname, proto->Name1);
+        LOG_INFO("playerbots", "WoV raid #{} <{}> {} loot: nobody can take {}", r.id, r.gname, WovRaidTag(r), proto->Name1);
         r.loot.erase(r.loot.begin());
         return;
     }
@@ -3559,7 +3602,7 @@ void WovRaidLootStep(WovRaid& r, Player* mt, time_t now)
         Item* ni = WovRaidGive(loot, l.slot, l.src, w.p);
         if (!ni)
         {
-            LOG_INFO("playerbots", "WoV raid #{} <{}> MC loot: could not give {} to {}", r.id, r.gname, proto->Name1, w.p->GetName());
+            LOG_INFO("playerbots", "WoV raid #{} <{}> {} loot: could not give {} to {}", r.id, r.gname, WovRaidTag(r), proto->Name1, w.p->GetName());
             r.loot.erase(r.loot.begin());
             return;
         }
@@ -3579,7 +3622,7 @@ void WovRaidLootStep(WovRaid& r, Player* mt, time_t now)
                                   std::to_string(l.boss) + ", " + std::to_string(l.item) + ", " + std::to_string(low) + ", " +
                                   (w.guild ? "0" : "1") + ", '" + kWovLootRule[l.mode] + "', " + std::to_string(std::max(-1.0f, std::min(w.gain, 99.0f))) +
                                   ", '" + detail + "')");
-        LOG_INFO("playerbots", "WoV raid #{} <{}> MC loot: {} -> {}{} ({}, {}, gain {:.0f}%)", r.id, r.gname, proto->Name1, w.p->GetName(),
+        LOG_INFO("playerbots", "WoV raid #{} <{}> {} loot: {} -> {}{} ({}, {}, gain {:.0f}%)", r.id, r.gname, WovRaidTag(r), proto->Name1, w.p->GetName(),
                  w.guild ? "" : " (pug)", kWovLootRule[l.mode], detail, w.gain * 100.0f);
         r.loot.erase(r.loot.begin());
     };
@@ -3706,11 +3749,11 @@ bool WovRaidAvail(Player* b, time_t now)
     return ai && !ai->GetMaster();
 }
 
-// the Molten Core lockout a character has this week (0 = none). A raid can only take people with no lockout or the
+// the lockout a character has this week for a raid (0 = none). A raid can only take people with no lockout or the
 // same one as its main tank, as for real players.
-uint32 WovMcBind(Player* p)
+uint32 WovRaidBind(Player* p, uint32 map)
 {
-    InstanceSave* sv = sInstanceSaveMgr->PlayerGetInstanceSave(p->GetGUID(), 409, Difficulty(0));
+    InstanceSave* sv = sInstanceSaveMgr->PlayerGetInstanceSave(p->GetGUID(), map, Difficulty(0));
     return sv ? sv->GetInstanceId() : 0;
 }
 
@@ -3726,13 +3769,15 @@ void WovLeaveBgQueues(Player* b)
     }
 }
 
-bool WovRaidStart(uint32 guild, time_t now)
+bool WovRaidStart(uint32 guild, time_t now, uint8 d)
 {
+    WovRaidDef const& D = kWovRaidDefs[d];
     std::vector<Player*> tanks, heals, dps, hyb;
     std::string gname;
     for (auto const& [g, b] : sRandomPlayerbotMgr.GetAllBots())
     {
-        if (!b || !b->IsInWorld() || b->GetGuildId() != guild || b->GetLevel() < 60 || !WovRaidAvail(b, now))
+        if (!b || !b->IsInWorld() || b->GetGuildId() != guild || b->GetLevel() < 60 || !WovRaidAvail(b, now) ||
+            (D.attune && !b->HasItemCount(D.attune, 1, true)))
             continue;
         if (gname.empty())
             if (Guild* gg = sGuildMgr->GetGuildById(guild))
@@ -3755,10 +3800,10 @@ bool WovRaidStart(uint32 guild, time_t now)
         std::set<uint32> tankBinds;
         for (auto* v : {&tanks, &heals, &dps, &hyb})
             for (Player* p : *v)
-                if (uint32 b = WovMcBind(p))
+                if (uint32 b = WovRaidBind(p, D.map))
                     ++n[b];
         for (Player* t : tanks)
-            tankBinds.insert(WovMcBind(t));
+            tankBinds.insert(WovRaidBind(t, D.map));
         uint32 best = 0;
         for (auto const& [b, c] : n)
             if (tankBinds.count(b) && c > best)
@@ -3767,9 +3812,9 @@ bool WovRaidStart(uint32 guild, time_t now)
                 bind = b;
             }
         if (!bind && !tankBinds.count(0))
-            bind = tanks.empty() ? 0 : WovMcBind(tanks[0]);
+            bind = tanks.empty() ? 0 : WovRaidBind(tanks[0], D.map);
         for (auto* v : {&tanks, &heals, &dps, &hyb})
-            v->erase(std::remove_if(v->begin(), v->end(), [&](Player* p) { uint32 b = WovMcBind(p); return b && b != bind; }), v->end());
+            v->erase(std::remove_if(v->begin(), v->end(), [&](Player* p) { uint32 b = WovRaidBind(p, D.map); return b && b != bind; }), v->end());
     }
     // short of people: the raid leader asks around ("LF5M MC, need lock and heals") and level 60s from outside the
     // guild of the same side fill up, the roles the raid lacks first (warlocks for banishes, healers, tanks)
@@ -3777,7 +3822,7 @@ bool WovRaidStart(uint32 guild, time_t now)
     // the cap pass the check at the window but are turned back on arrival ("Map 409 could not be created for player
     // ..., porting player to homebind"), which the raid saw as "vanished between maps".
     uint32 cap = g_wovRaidMax;
-    if (MapDifficulty const* md = GetMapDifficultyData(409, RAID_DIFFICULTY_10MAN_NORMAL))
+    if (MapDifficulty const* md = GetMapDifficultyData(D.map, RAID_DIFFICULTY_10MAN_NORMAL))
         if (md->maxPlayers)
             cap = std::min<uint32>(cap, md->maxPlayers);
     uint32 pugTo = std::min(g_wovRaidPug, cap);
@@ -3788,8 +3833,9 @@ bool WovRaidStart(uint32 guild, time_t now)
         std::vector<Player*> pool;
         for (auto const& [g, b] : sRandomPlayerbotMgr.GetAllBots())
             if (b && b->IsInWorld() && b->GetTeamId() == team && b->GetGuildId() != guild && b->GetLevel() >= 60 &&
-                !g_wovRaidRealGuilds.count(b->GetGuildId()) && !WovRaidNightFor(b->GetGUID().GetCounter()) && WovRaidAvail(b, now))
-                if (uint32 pb = WovMcBind(b); !pb || pb == bind)
+                !g_wovRaidRealGuilds.count(b->GetGuildId()) && !WovRaidNightFor(b->GetGUID().GetCounter()) && WovRaidAvail(b, now) &&
+                (!D.attune || b->HasItemCount(D.attune, 1, true)))
+                if (uint32 pb = WovRaidBind(b, D.map); !pb || pb == bind)
                     pool.push_back(b);
         std::shuffle(pool.begin(), pool.end(), std::mt19937(std::random_device{}()));
         auto count = [&](uint8 cls) {
@@ -3833,8 +3879,8 @@ bool WovRaidStart(uint32 guild, time_t now)
         hyb.erase(it);
     }
     // main tank first: a tank by spec, then the warrior with the most health
-    std::sort(tanks.begin(), tanks.end(), [bind](Player* a, Player* b) {
-        bool la = WovMcBind(a) == bind, lb = WovMcBind(b) == bind;  // the main tank carries the raid's lockout
+    std::sort(tanks.begin(), tanks.end(), [bind, &D](Player* a, Player* b) {
+        bool la = WovRaidBind(a, D.map) == bind, lb = WovRaidBind(b, D.map) == bind;  // the main tank carries the raid's lockout
         if (la != lb)
             return la;
         bool ta = PlayerbotAI::IsTank(a, true) || a->getClass() == CLASS_WARRIOR, tb = PlayerbotAI::IsTank(b, true) || b->getClass() == CLASS_WARRIOR;
@@ -3843,13 +3889,14 @@ bool WovRaidStart(uint32 guild, time_t now)
     uint32 total = tanks.size() + heals.size() + dps.size() + hyb.size();
     if (total < g_wovRaidMin || tanks.size() < 2)
     {
-        LOG_INFO("playerbots", "WoV raid <{}>: not enough people for MC tonight ({} level 60 online, {} tanks)", gname, total, tanks.size());
+        LOG_INFO("playerbots", "WoV raid <{}>: not enough people for {} tonight ({} level 60{} online, {} tanks)", gname, D.tag, total, D.attune ? " with the attunement" : "", tanks.size());
         return false;
     }
     uint32 size = std::min(cap, total);
     uint32 wantHeal = std::max<uint32>(4, size / 4), wantTank = std::min<uint32>(size >= 25 ? 4 : 3, tanks.size());
     WovRaid r;
     r.id = g_wovRaidNextId++;
+    r.def = d;
     r.guild = guild;
     r.gname = gname;
     r.start = r.phaseT = now;
@@ -3883,7 +3930,7 @@ bool WovRaidStart(uint32 guild, time_t now)
             add(p, 1);
     g_wovRaidLast[guild] = now;
     WovRaidLootLoad(r);
-    WovRaidSay(r, kWovRnCall[urand(0, 3)], true);
+    WovRaidSay(r, D.call[urand(0, 3)], true);
     // real players in the guild are asked along (a whisper from the raid leader); they are invited at the window
     for (auto const& [id, session] : sWorldSessionMgr->GetAllSessions())
     {
@@ -3891,12 +3938,9 @@ bool WovRaidStart(uint32 guild, time_t now)
         if (!p || !WovIsReal(p) || !p->IsInWorld() || p->GetGuildId() != guild || p->GetLevel() < 55)
             continue;
         r.reals.push_back(p->GetGUID().GetCounter());
-        static char const* const ask[] = {"MC tonight, u coming? meet at the window in BRM, ill inv",
-                                          "raiding MC now, want in? come to blackrock mountain, lothos",
-                                          "hey we're doing MC, come to the BRM window and ill invite u"};
-        tanks[0]->Whisper(ask[urand(0, 2)], LANG_UNIVERSAL, p);
+        tanks[0]->Whisper(D.ask[urand(0, 2)], LANG_UNIVERSAL, p);
     }
-    LOG_INFO("playerbots", "WoV raid #{} <{}> MC: {} going ({} tanks, {} healers), main tank {}", r.id, gname, r.m.size(), wantTank, h,
+    LOG_INFO("playerbots", "WoV raid #{} <{}> {}: {} going ({} tanks, {} healers), main tank {}", r.id, gname, D.tag, r.m.size(), wantTank, h,
              tanks[0]->GetName());
     g_wovRaids.push_back(r);
     return true;
@@ -3905,7 +3949,8 @@ bool WovRaidStart(uint32 guild, time_t now)
 // returns false when the raid is over
 bool WovRaidStep(WovRaid& r, time_t now)
 {
-    WovDgSpot const& s = g_wovMcSpot;
+    WovDgSpot const& s = WovRaidSpot(r);
+    WovRaidDef const& D = kWovRaidDefs[r.def];
     std::vector<Player*> ps;
     for (size_t i = 0; i < r.m.size();)
     {
@@ -3980,9 +4025,12 @@ bool WovRaidStep(WovRaid& r, time_t now)
                 else if (now >= mm.closerT)
                 {
                     bool horde = b->GetTeamId() == TEAM_HORDE;
-                    b->TeleportTo(0, horde ? -6559.0f : -6559.0f, horde ? -1100.0f : -1169.0f, 310.5f, 3.1f);
+                    if (TaxiNodesEntry const* tn = sTaxiNodesStore.LookupEntry(horde ? D.taxiH : D.taxiA))
+                    {
+                        b->TeleportTo(tn->map_id, tn->x + frand(-2.0f, 2.0f), tn->y + frand(-2.0f, 2.0f), tn->z + 0.5f, frand(0.0f, 6.28f));
+                        LOG_INFO("playerbots", "WoV raid #{} <{}> {}: {} flies in to {}", r.id, r.gname, D.tag, b->GetName(), tn->name[0]);
+                    }
                     mm.closerT = now + 3600;  // once
-                    LOG_INFO("playerbots", "WoV raid #{} <{}> MC: {} flies in to Thorium Point", r.id, r.gname, b->GetName());
                 }
             }
             if (Group* og = b->GetGroup())  // someone else's group: leaves it for the raid
@@ -4006,7 +4054,7 @@ bool WovRaidStep(WovRaid& r, time_t now)
             b->TeleportTo(s.map, s.x + frand(-1.5f, 1.5f), s.y + frand(-1.5f, 1.5f), s.z + 0.5f, frand(0.0f, 6.28f));
             if (urand(0, 99) < 30)
                 b->Whisper(WovPick(kWovRnSumThx), LANG_UNIVERSAL, helper);
-            LOG_INFO("playerbots", "WoV raid #{} <{}> MC: {} summons {}", r.id, r.gname, lock ? lock->GetName() : "the meeting stone",
+            LOG_INFO("playerbots", "WoV raid #{} <{}> {}: {} summons {}", r.id, r.gname, WovRaidTag(r), lock ? lock->GetName() : "the meeting stone",
                      b->GetName());
         }
         // the main tank is not there after a quarter of an hour (held up, stuck in a fight): a tank who is there
@@ -4017,7 +4065,7 @@ bool WovRaidStep(WovRaid& r, time_t now)
                 if (r.role[i] == 0 && ps[i]->IsAlive() && ps[i]->GetMapId() == s.map && ps[i]->GetExactDist(s.x, s.y, s.z) <= 60.0f &&
                     !ps[i]->GetGroup())
                 {
-                    LOG_INFO("playerbots", "WoV raid #{} <{}> MC: {} is not here, {} takes over as main tank", r.id, r.gname, mt->GetName(),
+                    LOG_INFO("playerbots", "WoV raid #{} <{}> {}: {} is not here, {} takes over as main tank", r.id, r.gname, WovRaidTag(r), mt->GetName(),
                              ps[i]->GetName());
                     std::swap(r.m[0], r.m[i]);
                     std::swap(ps[0], ps[i]);
@@ -4068,8 +4116,8 @@ bool WovRaidStep(WovRaid& r, time_t now)
                 st += " " + b->GetName() + ":" + (onMap ? std::to_string(int(b->GetExactDist(s.x, s.y, s.z))) : "m" + std::to_string(b->GetMapId())) +
                       (b->IsAlive() ? "" : "d") + (b->IsInCombat() ? "c" : "") + "/" + std::to_string(uint32(GET_PLAYERBOT_AI(b)->rpgInfo.GetStatus()));
             }
-            LOG_INFO("playerbots", "WoV raid #{} <{}> MC gathering: {} of {} at the window, {} in the raid, warlock there: {} |{}", r.id,
-                     r.gname, here, ps.size(), grouped, lock ? "yes" : "no", st);
+            LOG_INFO("playerbots", "WoV raid #{} <{}> {} gathering: {} of {} at the window, {} in the raid, warlock there: {} |{}", r.id,
+                     r.gname, WovRaidTag(r), here, ps.size(), grouped, lock ? "yes" : "no", st);
         }
         Group* g = mt->GetGroup();
         uint32 ready = 0;
@@ -4127,8 +4175,8 @@ bool WovRaidStep(WovRaid& r, time_t now)
             if (!b->TeleportTo(s.dmap, s.dx + frand(-3.0f, 3.0f), s.dy + frand(-3.0f, 3.0f), s.dz, s.dO) && now >= r.sumT + 30)
             {
                 r.sumT = now;
-                LOG_INFO("playerbots", "WoV raid #{} <{}> MC: {} could not step through the window (combat {}, alive {}, can enter {})", r.id,
-                         r.gname, b->GetName(), b->IsInCombat(), b->IsAlive(), uint32(sMapMgr->PlayerCannotEnter(s.dmap, b, false)));
+                LOG_INFO("playerbots", "WoV raid #{} <{}> {}: {} could not step through the window (combat {}, alive {}, can enter {})", r.id,
+                         r.gname, WovRaidTag(r), b->GetName(), b->IsInCombat(), b->IsAlive(), uint32(sMapMgr->PlayerCannotEnter(s.dmap, b, false)));
             }
         }
         bool inside = true;
@@ -4144,7 +4192,7 @@ bool WovRaidStep(WovRaid& r, time_t now)
             r.phase = DG_RUN;
             r.phaseT = r.roleT = now;
             WovRaidDkpAll(r, mt, 5);  // on time
-            LOG_INFO("playerbots", "WoV raid #{} <{}> MC: {} inside (instance {}), clear started", r.id, r.gname, ps.size(), mt->GetInstanceId());
+            LOG_INFO("playerbots", "WoV raid #{} <{}> {}: {} inside (instance {}), clear started", r.id, r.gname, WovRaidTag(r), ps.size(), mt->GetInstanceId());
         }
         else if (now > r.phaseT + 3 * MINUTE)
         {
@@ -4153,8 +4201,8 @@ bool WovRaidStep(WovRaid& r, time_t now)
                     WovRaidDrop(r, i, "did not get inside");
             if (mt->GetMapId() != s.dmap || r.m.size() < g_wovRaidMin / 2)
             {
-                LOG_INFO("playerbots", "WoV raid #{} <{}> MC: main tank {} is on map {} instance {} ({:.0f},{:.0f}), raid instance {}", r.id,
-                         r.gname, mt->GetName(), mt->GetMapId(), mt->GetInstanceId(), mt->GetPositionX(), mt->GetPositionY(),
+                LOG_INFO("playerbots", "WoV raid #{} <{}> {}: main tank {} is on map {} instance {} ({:.0f},{:.0f}), raid instance {}", r.id,
+                         r.gname, WovRaidTag(r), mt->GetName(), mt->GetMapId(), mt->GetInstanceId(), mt->GetPositionX(), mt->GetPositionY(),
                          ps.size() > 1 ? ps[1]->GetInstanceId() : 0);
                 WovRaidEnd(r, "could not get the raid inside", true, kWovRnCallIt, 3);
                 return false;
@@ -4182,14 +4230,14 @@ bool WovRaidStep(WovRaid& r, time_t now)
                 r.endT = now;
             if ((r.loot.empty() && now > r.endT + 20) || now > r.endT + 6 * MINUTE)
             {
-                WovRaidEnd(r, "Ragnaros is dead, MC cleared", true, kWovRnEnd, 4);
+                WovRaidEnd(r, D.done, true, kWovRnEnd, 4);
                 return false;
             }
             return true;
         }
         // the Firelord runes: once a boss is down his rune can be doused with Aqual Quintessence; with all seven doused
         // Majordomo Executus comes (progression rule ManualRuneHandling). Someone in the raid carries the quintessence.
-        if (now >= r.runeT + 10)
+        if (D.map == 409 && now >= r.runeT + 10)
         {
             r.runeT = now;
             static uint32 const runes[] = {176956, 176957, 176955, 176953, 176952, 176954, 176951};
@@ -4204,12 +4252,12 @@ bool WovRaidStep(WovRaid& r, time_t now)
                     sScriptMgr->OnGossipHello(b, go);
                     if (urand(0, 99) < 60)
                         GET_PLAYERBOT_AI(b)->SayToRaid(urand(0, 1) ? "dousing the rune" : "rune down");
-                    LOG_INFO("playerbots", "WoV raid #{} <{}> MC: {} douses a Firelord rune ({})", r.id, r.gname, b->GetName(), entry);
+                    LOG_INFO("playerbots", "WoV raid #{} <{}> {}: {} douses a Firelord rune ({})", r.id, r.gname, WovRaidTag(r), b->GetName(), entry);
                     break;
                 }
         }
         // Garr: each warlock keeps one Firesworn banished (the classic way to take him with a small raid)
-        if (Creature* garr = mt->FindNearestCreature(12057, 120.0f))
+        if (Creature* garr = D.map == 409 ? mt->FindNearestCreature(12057, 120.0f) : nullptr)
             if (garr->IsAlive() && garr->IsInCombat())
             {
                 std::list<Creature*> adds;
@@ -4230,7 +4278,7 @@ bool WovRaidStep(WovRaid& r, time_t now)
                             (!pick || b->GetExactDist(c) < b->GetExactDist(pick)))
                             pick = c;
                     if (pick && GET_PLAYERBOT_AI(b)->CastSpell("banish", pick))
-                        LOG_INFO("playerbots", "WoV raid #{} <{}> MC: {} banishes a Firesworn", r.id, r.gname, b->GetName());
+                        LOG_INFO("playerbots", "WoV raid #{} <{}> {}: {} banishes a Firesworn", r.id, r.gname, WovRaidTag(r), b->GetName());
                 }
             }
         if (now >= r.roleT + 30)  // a strategy reset must not take the roles away mid-raid
@@ -4281,18 +4329,18 @@ bool WovRaidStep(WovRaid& r, time_t now)
                     b->NearTeleportTo(s.dx + frand(-2.0f, 2.0f), s.dy + frand(-2.0f, 2.0f), s.dz, s.dO);
                 }
             for (Player* b : ps)
-                WovRaidRunBack(b);
+                WovRaidRunBack(r, b);
             r.rezT = now;
             r.phaseT = now;
             WovRaidSay(r, WovPick(kWovRnWipe), false);
-            LOG_INFO("playerbots", "WoV raid #{} <{}> MC: wipe {} (most of the raid died within 5 min), running back", r.id, r.gname, r.wipes);
+            LOG_INFO("playerbots", "WoV raid #{} <{}> {}: wipe {} (most of the raid died within 5 min), running back", r.id, r.gname, WovRaidTag(r), r.wipes);
             return true;
         }
         if (r.rezT && now >= r.rezT + 30)  // back up after the run back: drink, buff, again
         {
             r.rezT = 0;
             for (Player* b : ps)
-                WovRaidRunBack(b);
+                WovRaidRunBack(r, b);
             for (Player* b : ps)
                 if (b->IsAlive())
                 {
@@ -4314,11 +4362,11 @@ bool WovRaidStep(WovRaid& r, time_t now)
                     return false;
                 }
                 for (Player* b : ps)
-                    WovRaidRunBack(b);
+                    WovRaidRunBack(r, b);
                 r.rezT = now;
                 r.phaseT = now;
                 WovRaidSay(r, WovPick(kWovRnWipe), false);
-                LOG_INFO("playerbots", "WoV raid #{} <{}> MC: wipe {}, running back", r.id, r.gname, r.wipes);
+                LOG_INFO("playerbots", "WoV raid #{} <{}> {}: wipe {}, running back", r.id, r.gname, WovRaidTag(r), r.wipes);
             }
             return true;
         }
@@ -4351,7 +4399,7 @@ bool WovRaidStep(WovRaid& r, time_t now)
                 mm.deadT = now;
             if (now > mm.deadT + (b->GetMapId() != s.dmap ? 90 : 240) && !(fightOn && b->GetMapId() == s.dmap))
             {
-                WovRaidRunBack(b);
+                WovRaidRunBack(r, b);
                 // got up at the corpse: it runs to where the raid is now (the leader waits for everyone in range)
                 if (b->IsAlive() && mt->IsAlive() && b->GetMapId() == mt->GetMapId() && b->GetExactDist(mt) > 60.0f)
                     b->NearTeleportTo(mt->GetPositionX() + frand(-3.0f, 3.0f), mt->GetPositionY() + frand(-3.0f, 3.0f),
@@ -4376,7 +4424,7 @@ bool WovRaidStep(WovRaid& r, time_t now)
                 b->NearTeleportTo(mt->GetPositionX() + frand(-3.0f, 3.0f), mt->GetPositionY() + frand(-3.0f, 3.0f), mt->GetPositionZ(),
                                   mt->GetOrientation());
                 mm.lastProgress = now;
-                LOG_INFO("playerbots", "WoV raid #{} <{}> MC: {} catches up with the raid", r.id, r.gname, b->GetName());
+                LOG_INFO("playerbots", "WoV raid #{} <{}> {}: {} catches up with the raid", r.id, r.gname, WovRaidTag(r), b->GetName());
             }
         }
         if (now >= r.logT + 10 * MINUTE)
@@ -4385,7 +4433,7 @@ bool WovRaidStep(WovRaid& r, time_t now)
             uint32 alive = 0;
             for (Player* b : ps)
                 alive += b->IsAlive() ? 1 : 0;
-            LOG_INFO("playerbots", "WoV raid #{} <{}> MC inside: MT at {:.0f},{:.0f},{:.0f}, {}/{} alive, {} min, {} wipes", r.id, r.gname,
+            LOG_INFO("playerbots", "WoV raid #{} <{}> {} inside: MT at {:.0f},{:.0f},{:.0f}, {}/{} alive, {} min, {} wipes", r.id, r.gname, WovRaidTag(r),
                      mt->GetPositionX(), mt->GetPositionY(), mt->GetPositionZ(), alive, ps.size(), (now - r.start) / 60, r.wipes);
         }
         if (!r.rezT)  // stall watchdog, as in the dungeons
@@ -4401,7 +4449,7 @@ bool WovRaidStep(WovRaid& r, time_t now)
             {
                 r.moveT = now;
                 ++r.stalls;
-                LOG_INFO("playerbots", "WoV raid #{} <{}> MC: stalled at {:.0f},{:.0f},{:.0f} (stall {})", r.id, r.gname, mt->GetPositionX(),
+                LOG_INFO("playerbots", "WoV raid #{} <{}> {}: stalled at {:.0f},{:.0f},{:.0f} (stall {})", r.id, r.gname, WovRaidTag(r), mt->GetPositionX(),
                          mt->GetPositionY(), mt->GetPositionZ(), r.stalls);
                 if (r.stalls == 1)
                     mai->DoSpecificAction("dc on", Event("wov", "", nullptr), true);
@@ -4422,9 +4470,73 @@ bool WovRaidStep(WovRaid& r, time_t now)
     return false;
 }
 
+// the first of the guild's two raid nights this week
+bool WovRaidFirstNight(uint32 guild, time_t now)
+{
+    tm lt;
+    localtime_r(&now, &lt);
+    return lt.tm_wday == int(guild * 3 % 7);
+}
+
+bool WovOnyOpen()
+{
+    return g_wovRaidSpotOk[1] && !sDisableMgr->IsDisabledFor(DISABLE_TYPE_MAP, 249, nullptr, RAID_DIFFICULTY_10MAN_NORMAL);
+}
+
+// Onyxia tonight: open, and most of the guild's attuned level 60s online have no Onyxia lockout yet this week
+bool WovOnyWanted(uint32 guild)
+{
+    if (!WovOnyOpen())
+        return false;
+    uint32 att = 0, saved = 0;
+    for (auto const& [g, b] : sRandomPlayerbotMgr.GetAllBots())
+        if (b && b->IsInWorld() && b->GetGuildId() == guild && b->GetLevel() >= 60 && b->HasItemCount(16309, 1, true))
+        {
+            ++att;
+            saved += WovRaidBind(b, 249) ? 1 : 0;
+        }
+    return att >= g_wovRaidMin / 2 && saved * 2 < att;
+}
+
+// the Onyxia attunement: level 60s do the Drakefire Amulet chain in their own time (on average after a day or so of
+// play at 60). The last quest of the chain is rewarded, which hands out the amulet. TestAttuneGuild: a whole guild now.
+void WovOnyAttune_Tick(time_t now)
+{
+    static time_t last = 0;
+    if (now < last + 10 * MINUTE || !WovOnyOpen())
+        return;
+    last = now;
+    uint32 n = 0;
+    for (auto const& [g, b] : sRandomPlayerbotMgr.GetAllBots())
+    {
+        if (!b || !b->IsInWorld() || b->GetLevel() < 60 || b->IsInCombat() || !b->IsAlive() || b->HasItemCount(16309, 1, true))
+            continue;
+        bool test = g_wovRaidTestAttune && b->GetGuildId() == g_wovRaidTestAttune;
+        if (!test && urand(1, g_wovOnyAttuneEvery) != 1)
+            continue;
+        uint32 qid = b->GetTeamId() == TEAM_HORDE ? 6602 : 6502;  // Blood of the Black Dragon Champion / Drakefire Amulet
+        Quest const* q = sObjectMgr->GetQuestTemplate(qid);
+        if (!q || b->GetQuestRewardStatus(qid))
+            continue;
+        if (b->GetQuestStatus(qid) == QUEST_STATUS_NONE)
+            b->AddQuest(q, nullptr);
+        b->CompleteQuest(qid);
+        if (b->CanRewardQuest(q, false))
+            b->RewardQuest(q, 0, nullptr, false);
+        if (b->HasItemCount(16309, 1, true))
+        {
+            ++n;
+            LOG_INFO("playerbots", "WoV attune: {} ({}) earned the Drakefire Amulet", b->GetName(), b->GetGuildId());
+        }
+        if (n >= 20)
+            break;
+    }
+}
+
 void WovRaid_Tick(time_t now)
 {
     WovRaidConfig(now);
+    WovOnyAttune_Tick(now);
     for (size_t i = 0; i < g_wovRaids.size();)
     {
         if (WovRaidStep(g_wovRaids[i], now))
@@ -4432,7 +4544,7 @@ void WovRaid_Tick(time_t now)
         else
             g_wovRaids.erase(g_wovRaids.begin() + i);
     }
-    if (!g_wovRaidEnable || !g_wovMcSpotOk || g_wovRaids.size() >= g_wovRaidMaxActive)
+    if (!g_wovRaidEnable || !g_wovRaidSpotOk[0] || g_wovRaids.size() >= g_wovRaidMaxActive)
         return;
     static time_t lastPlan = 0;
     if (now < lastPlan + 60)
@@ -4462,7 +4574,15 @@ void WovRaid_Tick(time_t now)
         static std::unordered_map<uint32, time_t> retryAt;
         if (night && now < retryAt[guild])
             continue;
-        if (!WovRaidStart(guild, now))
+        // which raid: Onyxia on the first raid night of the week when she is open and the guild has not killed her
+        // this week, otherwise (or when not enough are attuned) Molten Core
+        uint8 d = test ? uint8(g_wovRaidTestRaid) : (WovRaidFirstNight(guild, now) && WovOnyWanted(guild) ? 1 : 0);
+        if (!g_wovRaidSpotOk[d])
+            d = 0;
+        bool started = WovRaidStart(guild, now, d);
+        if (!started && d == 1 && !test)
+            started = WovRaidStart(guild, now, 0);
+        if (!started)
         {
             // not enough yet: people still finishing a battleground or a dungeon. Ask again every 5 minutes while the
             // start window is open, then no raid tonight (test: again in 30 min)
@@ -4601,7 +4721,7 @@ void WovDungeonRun_Tick(time_t now)
                     r.finalKilled = true;
         for (WovRaid& r : g_wovRaids)
             for (WovDgMember const& mm : r.m)
-                if (mm.low == k && e == kWovRagnaros)
+                if (mm.low == k && e == kWovRaidDefs[r.def].finalBoss)
                     r.finalKilled = true;
     }
     WovRaid_Tick(now);  // wov: raid nights
