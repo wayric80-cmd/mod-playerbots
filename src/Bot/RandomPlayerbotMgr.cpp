@@ -36,6 +36,8 @@
 // wov/gen_players.py). A bot only logs in while its player would be online. Reference implementation
 // and simulator: wov/wov_schedule.py -- keep the two in sync.
 #include "Config.h"
+#include "PlayerbotFactory.h"  // wov: trainer
+#include "Trainer.h"           // wov: trainer
 #include <unordered_map>
 #include "CharacterCache.h"
 namespace
@@ -5925,6 +5927,16 @@ void WovWealthTick()
     }
 }
 
+// wov: trainer trips (declared here so the errand keeps the bot active, see WovMarket_Tick)
+struct WovTrainTrip
+{
+    uint32 entry = 0, map = 0;
+    float x = 0, y = 0, z = 0;
+    time_t start = 0;
+    ObjectGuid target;
+};
+std::unordered_map<uint32, WovTrainTrip> g_wovTrainTrips;
+
 std::mutex g_wovForceMutex;
 std::unordered_set<uint32> g_wovForce;  // bots on an errand: kept active although no real player is near
 
@@ -5938,6 +5950,8 @@ void WovMarket_Tick(time_t now)
     {
         std::unordered_set<uint32> force;
         for (auto const& [low, t] : g_wovTrips)
+            force.insert(low);
+        for (auto const& [low, t] : g_wovTrainTrips)  // wov: trainer
             force.insert(low);
         for (auto const& [low, sk] : g_wovBotSk)
             force.insert(low);
@@ -6188,6 +6202,257 @@ void WovMarket_Tick(time_t now)
             ++started;
     }
 }
+
+// ---- wov: trainer (AiPlayerbot.WoV.HumanStart with AutoLearnTrainerSpells = 0) --------------------------------
+// A person goes to the class trainer every couple of levels and pays for the new ranks. The bots do the same instead
+// of learning them for free at level-up: when there is something new to learn and the money for it, a bot walks (or
+// flies) to the nearest friendly trainer of its class, buys what it can afford, cheapest first, and goes back to
+// what it was doing. Most people train every second level, so one new spell on an odd level waits.
+struct WovTrainerSpawn
+{
+    uint32 entry, map;
+    float x, y, z;
+    uint32 faction;
+};
+std::unordered_map<uint8, std::vector<WovTrainerSpawn>> g_wovTrainers;  // by class
+std::unordered_map<uint32, time_t> g_wovTrainNext;                     // next time a bot is looked at
+
+void WovTrainersLoad()
+{
+    static bool loaded = false;
+    if (loaded)
+        return;
+    loaded = true;
+    if (QueryResult r = WorldDatabase.Query(
+            "SELECT c.id, c.map, c.position_x, c.position_y, c.position_z, t.Requirement, ct.faction FROM creature c "
+            "JOIN creature_default_trainer d ON d.CreatureId = c.id JOIN trainer t ON t.Id = d.TrainerId "
+            "JOIN creature_template ct ON ct.entry = c.id WHERE t.Type = 0 AND c.map IN (0, 1)"))
+        do
+        {
+            Field* f = r->Fetch();
+            g_wovTrainers[uint8(f[5].Get<uint32>())].push_back(
+                {f[0].Get<uint32>(), f[1].Get<uint32>(), f[2].Get<float>(), f[3].Get<float>(), f[4].Get<float>(), f[6].Get<uint32>()});
+        } while (r->NextRow());
+    size_t n = 0;
+    for (auto const& [c, v] : g_wovTrainers)
+        n += v.size();
+    LOG_INFO("playerbots", "WoV trainer: {} class trainers loaded", n);
+}
+
+// what this bot could buy from the trainer (entry) now: count, cheapest and total cost
+uint32 WovTrainable(Player* bot, uint32 entry, uint32& cheapest)
+{
+    cheapest = 0;
+    Trainer::Trainer* tr = sObjectMgr->GetTrainer(entry);
+    if (!tr || !tr->IsTrainerValidForPlayer(bot))
+        return 0;
+    uint32 n = 0;
+    for (Trainer::Spell const& sp : tr->GetSpells())
+    {
+        if (!PlayerbotFactory::IsTrainerSpellAllowedForBot(bot, tr, &sp) || !tr->CanTeachSpell(bot, &sp))
+            continue;
+        if (!n || sp.MoneyCost < cheapest)
+            cheapest = sp.MoneyCost;
+        ++n;
+    }
+    return n;
+}
+
+uint32 WovTrainLearn(Player* bot, Creature* c, uint32& spent)
+{
+    spent = 0;
+    Trainer::Trainer* tr = sObjectMgr->GetTrainer(c->GetEntry());
+    if (!tr || !tr->IsTrainerValidForPlayer(bot))
+        return 0;
+    float disc = bot->GetReputationPriceDiscount(c);
+    uint32 learned = 0;
+    for (int pass = 0; pass < 3; ++pass)  // a rank learnt can open the next one
+    {
+        std::vector<Trainer::Spell const*> can;
+        for (Trainer::Spell const& sp : tr->GetSpells())
+            if (PlayerbotFactory::IsTrainerSpellAllowedForBot(bot, tr, &sp) && tr->CanTeachSpell(bot, &sp))
+                can.push_back(&sp);
+        std::sort(can.begin(), can.end(), [](auto a, auto b) { return a->MoneyCost < b->MoneyCost; });
+        bool any = false;
+        for (Trainer::Spell const* sp : can)
+        {
+            uint32 cost = uint32(std::floor(sp->MoneyCost * disc));
+            if (bot->GetMoney() < cost)
+                continue;
+            SpellInfo const* si = sSpellMgr->GetSpellInfo(sp->SpellId);
+            if (!si)
+                continue;
+            bot->ModifyMoney(-int32(cost));
+            if (si->HasEffect(SPELL_EFFECT_LEARN_SPELL))
+                bot->CastSpell(bot, sp->SpellId, true);
+            else
+                bot->learnSpell(sp->SpellId, false);
+            spent += cost;
+            ++learned;
+            any = true;
+        }
+        if (!any)
+            break;
+    }
+    return learned;
+}
+
+void WovTrain_Tick(time_t now)
+{
+    static time_t last = 0, cfgT = 0;
+    static bool on = false;
+    if (now < last + 10)
+        return;
+    last = now;
+    if (now >= cfgT + 60)
+    {
+        cfgT = now;
+        on = sConfigMgr->GetOption<bool>("AiPlayerbot.WoV.HumanStart", false) && !sPlayerbotAIConfig.autoLearnTrainerSpells;
+    }
+    if (!on)
+    {
+        g_wovTrainTrips.clear();
+        return;
+    }
+    WovTrainersLoad();
+    for (auto it = g_wovTrainTrips.begin(); it != g_wovTrainTrips.end();)
+    {
+        WovTrainTrip& t = it->second;
+        Player* bot = ObjectAccessor::FindPlayerByLowGUID(it->first);
+        PlayerbotAI* ai = bot ? GET_PLAYERBOT_AI(bot) : nullptr;
+        if (!bot || !ai || !bot->IsInWorld() || now > t.start + 2400 || bot->GetGroup() || bot->InBattleground() ||
+            g_wovBotSk.count(it->first) || g_wovTrips.count(it->first) || bot->GetMapId() != t.map)
+        {
+            if (bot)
+                LOG_INFO("playerbots", "WoV trainer: {} gave up the trip", bot->GetName());
+            g_wovTrainNext[it->first] = now + 900;
+            it = g_wovTrainTrips.erase(it);
+            continue;
+        }
+        if (bot->IsInFlight() || ai->rpgInfo.GetStatus() == RPG_TRAVEL_FLIGHT || !bot->IsAlive() || bot->IsInCombat())
+        {
+            if (!bot->IsInFlight() && bot->IsAlive() && !bot->IsInCombat() && ai->rpgInfo.GetStatus() == RPG_TRAVEL_FLIGHT &&
+                WovStuck(bot, now, 90))
+                WovUnstick(bot, ai, WorldPosition(t.map, t.x, t.y, t.z), "trainer flight");
+            ++it;
+            continue;
+        }
+        float d = bot->GetExactDist(t.x, t.y, t.z);
+        if (d > 1500.0f)
+        {
+            LOG_INFO("playerbots", "WoV trainer: {} landed too far from the trainer ({:.0f} yd)", bot->GetName(), d);
+            g_wovTrainNext[it->first] = now + 900;
+            it = g_wovTrainTrips.erase(it);
+            continue;
+        }
+        if (d > 40.0f)
+        {
+            if (ai->rpgInfo.GetStatus() != RPG_GO_CAMP)
+                ai->rpgInfo.ChangeToGoCamp(WorldPosition(t.map, t.x, t.y, t.z));
+            else if (WovStuck(bot, now, 120))
+                WovUnstick(bot, ai, WorldPosition(t.map, t.x, t.y, t.z), "trainer walk");
+            ++it;
+            continue;
+        }
+        Creature* c = t.target ? ObjectAccessor::GetCreature(*bot, t.target) : nullptr;
+        if (!c)
+            if ((c = bot->FindNearestCreature(t.entry, 60.0f)))
+                t.target = c->GetGUID();
+        if (!c)
+        {
+            LOG_INFO("playerbots", "WoV trainer: {} cannot find the trainer", bot->GetName());
+            g_wovTrainNext[it->first] = now + 1800;
+            it = g_wovTrainTrips.erase(it);
+            continue;
+        }
+        if (bot->GetExactDist(c) <= 5.0f)
+        {
+            uint32 spent = 0, cheapest = 0;
+            uint32 n = WovTrainLearn(bot, c, spent);
+            uint32 left = WovTrainable(bot, c->GetEntry(), cheapest);
+            LOG_INFO("playerbots", "WoV trainer: {} (lvl {}) trains at {}: {} new spells for {}c, {} left, {}c in the bag",
+                     bot->GetName(), bot->GetLevel(), c->GetName(), n, spent, left, bot->GetMoney());
+            g_wovTrainNext[it->first] = now + urand(1800, 3600);
+            it = g_wovTrainTrips.erase(it);
+            continue;
+        }
+        if (!WovAimAt(bot, ai, t.target) || (bot->GetExactDist(c) < 25.0f && !bot->isMoving()))
+            bot->GetMotionMaster()->MovePoint(0, c->GetPositionX(), c->GetPositionY(), c->GetPositionZ());
+        ++it;
+    }
+    uint32 looked = 0, started = 0;
+    for (auto const& [guid, bot] : sRandomPlayerbotMgr.GetAllBots())
+    {
+        if (looked >= 40 || started >= 6)
+            break;
+        if (!bot || !bot->IsInWorld() || !bot->IsAlive() || bot->IsInCombat() || bot->IsInFlight() || bot->GetGroup() ||
+            bot->InBattleground() || bot->GetLevel() < 2 || !WovOpenWorld(bot))
+            continue;
+        uint32 low = bot->GetGUID().GetCounter();
+        if (g_wovTrainTrips.count(low) || g_wovTrips.count(low) || g_wovBotSk.count(low))
+            continue;
+        auto busy = g_wovBusyBot.find(low);
+        if (busy != g_wovBusyBot.end() && now < time_t(busy->second))
+            continue;
+        time_t& nx = g_wovTrainNext[low];
+        if (now < nx)
+            continue;
+        ++looked;
+        nx = now + urand(600, 1200);
+        PlayerbotAI* ai = GET_PLAYERBOT_AI(bot);
+        if (!ai || ai->rpgInfo.GetStatus() == RPG_TRAVEL_FLIGHT)
+            continue;
+        auto tv = g_wovTrainers.find(bot->getClass());
+        if (tv == g_wovTrainers.end())
+            continue;
+        FactionTemplateEntry const* mine = bot->GetFactionTemplateEntry();
+        WovTrainerSpawn const* best = nullptr;
+        float bestD = 1.0e9f;
+        for (WovTrainerSpawn const& sp : tv->second)
+        {
+            if (sp.map != bot->GetMapId())
+                continue;
+            FactionTemplateEntry const* ft = sFactionTemplateStore.LookupEntry(sp.faction);
+            if (!ft || !mine || ft->IsHostileTo(*mine) || !ft->IsFriendlyTo(*mine))
+                continue;
+            float d = bot->GetExactDist(sp.x, sp.y, sp.z);
+            if (d < bestD)
+            {
+                bestD = d;
+                best = &sp;
+            }
+        }
+        if (!best)
+            continue;
+        uint32 cheapest = 0;
+        uint32 n = WovTrainable(bot, best->entry, cheapest);
+        if (!n || bot->GetMoney() < cheapest || (n < 2 && bot->GetLevel() % 2))
+            continue;
+        WovTrainTrip t;
+        t.entry = best->entry;
+        t.map = best->map;
+        t.x = best->x;
+        t.y = best->y;
+        t.z = best->z;
+        t.start = now;
+        if (bestD > 600.0f)
+        {
+            TravelMgr::FlightMasterInfo const* fm = sTravelMgr.GetNearestFlightMasterInfo(bot);
+            uint32 to = sObjectMgr->GetNearestTaxiNode(t.x, t.y, t.z, t.map, bot->GetTeamId());
+            if (!fm || !fm->taxiNodeId || !to || fm->taxiNodeId == to)
+                continue;
+            std::vector<uint32> path = sTravelNodeMap.FindTaxiPath(fm->taxiNodeId, to);
+            if (path.empty())
+                continue;
+            ai->rpgInfo.ChangeToTravelFlight(fm->templateEntry, fm->pos, path);
+        }
+        g_wovTrainTrips[low] = t;
+        ++started;
+        LOG_INFO("playerbots", "WoV trainer: {} (lvl {}, {}c) heads to its trainer, {} new spells, {:.0f} yd{}", bot->GetName(),
+                 bot->GetLevel(), bot->GetMoney(), n, bestD, bestD > 600.0f ? " by air" : "");
+    }
+}
+// ---- end wov: trainer -------------------------------------------------------------------------------------
 }  // namespace
 
 // Median buyout of one item in this faction's auction house right now (0 when nobody sells it).
@@ -6516,6 +6781,7 @@ void RandomPlayerbotMgr::UpdateAIInternal(uint32 /*elapsed*/, bool /*minimal*/)
     WovRegear_Tick(time(nullptr));  // wov: regear once
     WovRegearBracket_Tick(time(nullptr));  // wov: one fresh set per level bracket
     WovMarket_Tick(time(nullptr));  // wov: market
+    WovTrain_Tick(time(nullptr));   // wov: trainer
     WovCraft_Tick(time(nullptr));  // wov: crafting orders
 
     /*if (sPlayerbotAIConfig.enablePrototypePerformanceDiff)

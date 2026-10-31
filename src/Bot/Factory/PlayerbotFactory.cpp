@@ -1057,12 +1057,10 @@ void PlayerbotFactory::Randomize(bool incremental)
 // refreshed every few hours would fill up with it.
 void PlayerbotFactory::Refresh(bool keepInventory)
 {
-    // Prepare();
-    // if (!sPlayerbotAIConfig.equipAndSpecPersistence ||
-    //     bot->GetLevel() < sPlayerbotAIConfig.equipAndSpecPersistenceLevel)
-    // {
-    //     InitEquipment(true);
-    // }
+    // wov: with HumanStart a person's bot gets food, drink and ammo topped up (and its pet), nothing else for free:
+    // reagents, potions and other consumables, class spells (bought at the trainer), skills, reputation, enchants,
+    // mounts and money are earned or bought
+    bool const human = sConfigMgr->GetOption<bool>("AiPlayerbot.WoV.HumanStart", false);
     InitAttunementQuests();
     if (!keepInventory)
         ClearInventory();
@@ -1078,32 +1076,40 @@ void PlayerbotFactory::Refresh(bool keepInventory)
     }
     if (needFood)
         InitFood();
-    InitReagents();
-    InitConsumables();
-    InitPotions();
+    if (!human)
+    {
+        InitReagents();
+        InitConsumables();
+        InitPotions();
+    }
     InitPet();
     InitPetTalents();
-    InitSkills();
-    InitClassSpells();
-    InitAvailableSpells();
-    InitReputation();
-    InitSpecialSpells();
-    if (!sConfigMgr->GetOption<bool>("AiPlayerbot.WoV.HumanStart", false))  // wov: a person buys the mount
+    if (!human)
+    {
+        InitSkills();
+        InitClassSpells();
+        InitAvailableSpells();
+        InitReputation();
+        InitSpecialSpells();
         InitMounts();
+    }
     InitKeyring();
     if (!sPlayerbotAIConfig.equipAndSpecPersistence ||
         bot->GetLevel() < sPlayerbotAIConfig.equipAndSpecPersistenceLevel)
     {
         InitTalentsTree(true, true, !keepInventory);
     }
-    if (bot->GetLevel() >= sPlayerbotAIConfig.minEnchantingBotLevel)
+    if (!human && bot->GetLevel() >= sPlayerbotAIConfig.minEnchantingBotLevel)
         ApplyEnchantAndGemsNew();
     bot->DurabilityRepairAll(false, 1.0f, false);
     if (bot->isDead())
         bot->ResurrectPlayer(1.0f, false);
-    uint32 money = urand(level * 1000, level * 5 * 1000);
-    if (bot->GetMoney() < money)
-        bot->SetMoney(money);
+    if (!human)
+    {
+        uint32 money = urand(level * 1000, level * 5 * 1000);
+        if (bot->GetMoney() < money)
+            bot->SetMoney(money);
+    }
     // bot->SaveToDB(false, false);
 }
 
