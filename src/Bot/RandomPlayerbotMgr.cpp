@@ -2218,6 +2218,7 @@ struct WovDgRunState
     bool swum = false;
     uint32 real = 0;          // a real player who answered the tank's LFM (takes the last dps spot)
     time_t realT = 0, lfmT = 0, limboT = 0;
+    bool realInvited = false;  // wov: the tank invites the real player when it reaches the stone, as the others come
     std::map<uint32, time_t> limbo;  // member -> between maps since (one clock each)
     uint8 lfmN = 0;
 };
@@ -2668,7 +2669,8 @@ bool WovDgStep(WovDgRunState& r, time_t now)
     {
         real = ObjectAccessor::FindPlayerByLowGUID(r.real);
         realIn = real && tank->GetGroup() && tank->GetGroup()->IsMember(real->GetGUID());
-        if (!real || (!realIn && (r.phase != DG_GATHER || now > r.realT + 2 * MINUTE || real->GetGroup())))
+        bool pending = !r.realInvited && r.phase == DG_GATHER;  // promised an invite at the stone, not sent yet
+        if (!real || (!realIn && (real->GetGroup() || (!pending && (r.phase != DG_GATHER || now > r.realT + 2 * MINUTE)))))
         {
             LOG_INFO("playerbots", "WoV dungeon run #{} {}: the real player is no longer with the run", r.id, r.spot->def->name);
             r.real = 0;
@@ -2793,6 +2795,15 @@ bool WovDgStep(WovDgRunState& r, time_t now)
         // the party forms at the stone as people arrive
         if (!r.tankThere && tank->GetExactDist(r.spot->mx, r.spot->my, r.spot->mz) <= 40.0f)
             r.tankThere = now;
+        if (real && !r.realInvited && !real->GetGroup() && tank->GetExactDist(r.spot->mx, r.spot->my, r.spot->mz) <= 60.0f &&
+            (!tank->GetGroup() || (tank->GetGroup()->IsLeader(tank->GetGUID()) && !tank->GetGroup()->IsFull())))
+        {
+            tank->Whisper(urand(0, 1) ? "at the stone, inv sent" : "here now, sent inv", LANG_UNIVERSAL, real);
+            WovInviteFrom(tank, real);
+            r.realInvited = true;
+            r.realT = now;
+            LOG_INFO("playerbots", "WoV dungeon run #{} {}: tank at the stone, invites {}", r.id, r.spot->def->name, real->GetName());
+        }
         if (tank->GetExactDist(r.spot->mx, r.spot->my, r.spot->mz) <= 60.0f)
             for (size_t i = 1; i < ps.size(); ++i)
             {
@@ -4860,9 +4871,21 @@ void WovDungeonRun_Tick(time_t now)
                 }
             r.real = pl;
             r.realT = now;
-            static char const* const ok[] = {"sure, inv", "inv sent, meet at the stone", "k inv", "invited, come to the stone", "sure, sent"};
-            tank->Whisper(ok[urand(0, 4)], LANG_UNIVERSAL, p);
-            WovInviteFrom(tank, p);
+            r.realInvited = false;
+            // a person who posts LF1M while still on the way says so and invites at the stone, where the group forms
+            if (r.tankThere)
+            {
+                static char const* const ok[] = {"sure, inv", "inv sent, we're at the stone", "k inv", "invited, come to the stone", "sure, sent"};
+                tank->Whisper(ok[urand(0, 4)], LANG_UNIVERSAL, p);
+                WovInviteFrom(tank, p);
+                r.realInvited = true;
+            }
+            else
+            {
+                static char const* const omw[] = {"sure, omw to the stone, will inv there", "k, meet at the stone, inv when im there",
+                                                  "sure! inv at the stone, rest are on the way", "yep, head to the stone, ill inv you there"};
+                tank->Whisper(omw[urand(0, 3)], LANG_UNIVERSAL, p);
+            }
             LOG_INFO("playerbots", "WoV dungeon run #{} {}: real player {} joins (lvl {})", r.id, r.spot->def->name, p->GetName(), p->GetLevel());
             break;
         }
