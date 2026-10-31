@@ -6380,7 +6380,8 @@ void WovTrain_Tick(time_t now)
             bot->GetMotionMaster()->MovePoint(0, c->GetPositionX(), c->GetPositionY(), c->GetPositionZ());
         ++it;
     }
-    uint32 looked = 0, started = 0;
+    uint32 looked = 0, started = 0, noTrainer = 0, nothing = 0, poor = 0, oddLevel = 0, noFlight = 0;
+    static time_t sumT = 0;
     for (auto const& [guid, bot] : sRandomPlayerbotMgr.GetAllBots())
     {
         if (looked >= 40 || started >= 6)
@@ -6423,11 +6424,27 @@ void WovTrain_Tick(time_t now)
             }
         }
         if (!best)
+        {
+            ++noTrainer;
             continue;
+        }
         uint32 cheapest = 0;
         uint32 n = WovTrainable(bot, best->entry, cheapest);
-        if (!n || bot->GetMoney() < cheapest || (n < 2 && bot->GetLevel() % 2))
+        if (!n)
+        {
+            ++nothing;
             continue;
+        }
+        if (bot->GetMoney() < cheapest)
+        {
+            ++poor;
+            continue;
+        }
+        if (n < 2 && bot->GetLevel() % 2)
+        {
+            ++oddLevel;
+            continue;
+        }
         WovTrainTrip t;
         t.entry = best->entry;
         t.map = best->map;
@@ -6440,16 +6457,32 @@ void WovTrain_Tick(time_t now)
             TravelMgr::FlightMasterInfo const* fm = sTravelMgr.GetNearestFlightMasterInfo(bot);
             uint32 to = sObjectMgr->GetNearestTaxiNode(t.x, t.y, t.z, t.map, bot->GetTeamId());
             if (!fm || !fm->taxiNodeId || !to || fm->taxiNodeId == to)
+            {
+                ++noFlight;
                 continue;
+            }
             std::vector<uint32> path = sTravelNodeMap.FindTaxiPath(fm->taxiNodeId, to);
             if (path.empty())
+            {
+                ++noFlight;
                 continue;
+            }
             ai->rpgInfo.ChangeToTravelFlight(fm->templateEntry, fm->pos, path);
         }
         g_wovTrainTrips[low] = t;
         ++started;
         LOG_INFO("playerbots", "WoV trainer: {} (lvl {}, {}c) heads to its trainer, {} new spells, {:.0f} yd{}", bot->GetName(),
                  bot->GetLevel(), bot->GetMoney(), n, bestD, bestD > 600.0f ? " by air" : "");
+    }
+    static uint32 sLooked = 0, sNoTr = 0, sNothing = 0, sPoor = 0, sOdd = 0, sNoFl = 0, sStarted = 0;
+    sLooked += looked; sNoTr += noTrainer; sNothing += nothing; sPoor += poor; sOdd += oddLevel; sNoFl += noFlight; sStarted += started;
+    if (now >= sumT + 600)
+    {
+        sumT = now;
+        LOG_INFO("playerbots", "WoV trainer: last 10 min looked at {} bots: {} trips, {} nothing new, {} too poor, {} wait for an even "
+                 "level, {} no trainer on the map, {} no flight; {} on the way", sLooked, sStarted, sNothing, sPoor, sOdd, sNoTr, sNoFl,
+                 g_wovTrainTrips.size());
+        sLooked = sNoTr = sNothing = sPoor = sOdd = sNoFl = sStarted = 0;
     }
 }
 // ---- end wov: trainer -------------------------------------------------------------------------------------
