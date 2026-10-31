@@ -22,6 +22,7 @@ uint64 WovWealthTarget(Player* bot);  // wov: RandomPlayerbotMgr.cpp
 #include "ItemVisitors.h"
 #include "Log.h"
 #include "LootMgr.h"
+#include "Config.h"
 #include "ObjectMgr.h"
 #include "PerfMonitor.h"
 #include "PetDefines.h"
@@ -1087,7 +1088,8 @@ void PlayerbotFactory::Refresh(bool keepInventory)
     InitAvailableSpells();
     InitReputation();
     InitSpecialSpells();
-    InitMounts();
+    if (!sConfigMgr->GetOption<bool>("AiPlayerbot.WoV.HumanStart", false))  // wov: a person buys the mount
+        InitMounts();
     InitKeyring();
     if (!sPlayerbotAIConfig.equipAndSpecPersistence ||
         bot->GetLevel() < sPlayerbotAIConfig.equipAndSpecPersistenceLevel)

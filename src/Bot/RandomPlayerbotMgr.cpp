@@ -7784,6 +7784,62 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
     return false;
 }
 
+// wov: a bot starts the way a new character does (AiPlayerbot.WoV.HumanStart = 1): no factory gear, no bags, no extra
+// consumables. Everything it owned is destroyed, it goes to level 1 with no talents, only the race/class default
+// spells and skills, the starting outfit of its race, class and gender plus the create-info items, and the starting
+// money. Quests are forgotten. What it wears later it finds, buys, crafts or wins, as a person would.
+static void WovHumanStart(Player* bot)
+{
+    for (uint8 i = EQUIPMENT_SLOT_START; i < BANK_SLOT_BAG_END; ++i)  // equipment, bags (with their contents), backpack, bank
+        if (bot->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+            bot->DestroyItem(INVENTORY_SLOT_BAG_0, i, true);
+    for (uint8 i = KEYRING_SLOT_START; i < CURRENCYTOKEN_SLOT_END; ++i)
+        if (bot->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+            bot->DestroyItem(INVENTORY_SLOT_BAG_0, i, true);
+    for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+        if (uint32 q = bot->GetQuestSlotQuestId(slot))
+        {
+            bot->SetQuestSlot(slot, 0);
+            bot->RemoveActiveQuest(q, false);
+        }
+    std::vector<uint32> done(bot->getRewardedQuests().begin(), bot->getRewardedQuests().end());
+    for (uint32 q : done)
+        bot->RemoveRewardedQuest(q, false);
+    if (bot->GetLevel() != 1)
+        bot->GiveLevel(1);
+    bot->SetUInt32Value(PLAYER_XP, 0);
+    bot->resetTalents(true);
+    bot->resetSpells();
+    bot->InitTalentForLevel();
+    uint8 gender = bot->getGender();
+    if (CharStartOutfitEntry const* o = GetCharStartOutfitEntry(bot->getRace(), bot->getClass(), gender))
+        for (int j = 0; j < MAX_OUTFIT_ITEMS; ++j)
+        {
+            if (o->ItemId[j] <= 0)
+                continue;
+            ItemTemplate const* t = sObjectMgr->GetItemTemplate(o->ItemId[j]);
+            if (!t)
+                continue;
+            uint32 count = t->BuyCount;
+            if (t->Class == ITEM_CLASS_CONSUMABLE && t->SubClass == ITEM_SUBCLASS_FOOD)
+            {
+                if (t->Spells[0].SpellCategory == SPELL_CATEGORY_FOOD)
+                    count = 4;
+                else if (t->Spells[0].SpellCategory == SPELL_CATEGORY_DRINK)
+                    count = 2;
+                count = std::min<uint32>(count, t->GetMaxStackSize());
+            }
+            bot->StoreNewItemInBestSlots(o->ItemId[j], count);
+        }
+    if (PlayerInfo const* info = sObjectMgr->GetPlayerInfo(bot->getRace(), bot->getClass()))
+        for (auto const& it : info->item)
+            bot->StoreNewItemInBestSlots(it.item_id, it.item_amount);
+    bot->SetMoney(sWorld->getIntConfig(CONFIG_START_PLAYER_MONEY));
+    bot->SetFullHealth();
+    if (bot->GetMaxPower(POWER_MANA) > 0)
+        bot->SetPower(POWER_MANA, bot->GetMaxPower(POWER_MANA));
+}
+
 bool RandomPlayerbotMgr::ProcessBot(Player* bot)
 {
 
@@ -7836,8 +7892,13 @@ bool RandomPlayerbotMgr::ProcessBot(Player* bot)
             if (bot->GetGroup())
                 botAI->LeaveOrDisbandGroup();
             SetValue(bot, "level", level);
-            PlayerbotFactory factory(bot, level);
-            factory.Randomize(false);
+            if (sConfigMgr->GetOption<bool>("AiPlayerbot.WoV.HumanStart", false) && bot->getClass() != CLASS_DEATH_KNIGHT)
+                WovHumanStart(bot);  // as a new character: starting outfit only
+            else
+            {
+                PlayerbotFactory factory(bot, level);
+                factory.Randomize(false);
+            }
             MarkFactoryInitialized(bot);
             if (PlayerInfo const* info = sObjectMgr->GetPlayerInfo(bot->getRace(), bot->getClass()))
             {
