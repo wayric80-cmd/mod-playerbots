@@ -3108,6 +3108,8 @@ struct WovRaid
                                      // the other always had someone in limbo, so a shared clock dropped them)
     std::map<uint32, bool> wasAlive;  // to count deaths
     std::deque<time_t> deaths;        // raid deaths the last minutes: many of them is a wipe, even if a few live
+    time_t onyT = 0;                  // wov: Onyxia probe, last status line
+    bool onyFight = false;            // wov: Onyxia probe, she was in combat at the last look
 };
 std::vector<WovRaid> g_wovRaids;
 std::unordered_map<uint32, time_t> g_wovRaidLast;  // guild -> last raid start
@@ -3167,6 +3169,49 @@ bool g_wovRaidSpotOk[2] = {false, false};
 uint32 g_wovRaidTestRaid = 0, g_wovOnyAttuneEvery = 150, g_wovRaidTestAttune = 0;
 WovDgSpot const& WovRaidSpot(WovRaid const& r) { return g_wovRaidSpot[r.def]; }
 char const* WovRaidTag(WovRaid const& r) { return kWovRaidDefs[r.def].tag; }
+
+// wov: what is going on at Onyxia, to find out why the raids die there (logged on deaths, wipes and every 20 s)
+char const* WovRaidRoleName(WovRaid const& r, size_t i)
+{
+    if (i >= r.role.size())
+        return "?";
+    return r.role[i] == 0 ? "tank" : (r.role[i] == 1 ? "healer" : "dps");
+}
+
+std::string WovOnyState(WovRaid const& r, std::vector<Player*> const& ps, Player* ref)
+{
+    Creature* ony = ref ? ref->FindNearestCreature(10184, 250.0f, true) : nullptr;
+    if (!ony)
+        return "Onyxia not in range";
+    float hp = ony->GetHealthPct();
+    bool air = ony->IsFlying();
+    char const* ph = air ? "P2 (air)" : (hp > 65.0f ? "P1" : (hp > 40.0f ? "P2 (ground)" : "P3"));
+    std::string vic = "none";
+    if (Unit* v = ony->GetVictim())
+    {
+        vic = v->GetName();
+        for (size_t i = 0; i < ps.size(); ++i)
+            if (ps[i] == v)
+                vic = Acore::StringFormat("{} ({})", vic, WovRaidRoleName(r, i));
+    }
+    Spell* sp = ony->GetCurrentSpell(CURRENT_GENERIC_SPELL);
+    uint32 cast = (sp && sp->m_spellInfo) ? sp->m_spellInfo->Id : 0;
+    std::list<Creature*> wl;
+    ony->GetCreatureListWithEntryInGrid(wl, 11262, 200.0f);
+    uint32 whelps = 0;
+    for (Creature* c : wl)
+        whelps += (c->IsAlive() && c->IsInCombat()) ? 1 : 0;
+    uint32 alive = 0, tanks = 0, heals = 0;
+    for (size_t i = 0; i < ps.size(); ++i)
+        if (ps[i]->IsAlive() && ps[i]->GetMapId() == ony->GetMapId())
+        {
+            ++alive;
+            tanks += (i < r.role.size() && r.role[i] == 0) ? 1 : 0;
+            heals += (i < r.role.size() && r.role[i] == 1) ? 1 : 0;
+        }
+    return Acore::StringFormat("Onyxia {:.0f}% {}{}, target {}, cast {}, whelps {}, alive {}/{} ({} tanks, {} healers)", hp, ph,
+                               ony->IsInCombat() ? "" : " idle", vic, cast, whelps, alive, ps.size(), tanks, heals);
+}
 
 void WovRaidConfig(time_t now)
 {
@@ -4361,11 +4406,41 @@ bool WovRaidStep(WovRaid& r, time_t now)
             uint32 low = b->GetGUID().GetCounter();
             auto it = r.wasAlive.find(low);
             if (it != r.wasAlive.end() && it->second && !b->IsAlive() && b->GetMapId() == s.dmap)
+            {
                 r.deaths.push_back(now);
+                if (r.def == 1)
+                {
+                    std::string where = "Onyxia not in range";
+                    if (Creature* ony = b->FindNearestCreature(10184, 250.0f, true))
+                    {
+                        float ang = std::fabs(Position::NormalizeOrientation(ony->GetAngle(b) - ony->GetOrientation()));
+                        if (ang > M_PI)
+                            ang = 2 * M_PI - ang;
+                        where = Acore::StringFormat("{:.0f} yd {} of her", b->GetExactDist2d(ony),
+                                                    ang < M_PI / 4 ? "in front" : (ang > 3 * M_PI / 4 ? "behind" : "to the side"));
+                    }
+                    size_t idx = std::find(ps.begin(), ps.end(), b) - ps.begin();
+                    LOG_INFO("playerbots", "WoV raid #{} <{}> Ony death: {} ({} {}) at {:.0f},{:.0f},{:.0f}, {} | {}", r.id, r.gname,
+                             b->GetName(), WovRaidRoleName(r, idx), b->getClass(), b->GetPositionX(), b->GetPositionY(),
+                             b->GetPositionZ(), where, WovOnyState(r, ps, mt));
+                }
+            }
             r.wasAlive[low] = b->IsAlive();
         }
         while (!r.deaths.empty() && r.deaths.front() < now - 5 * MINUTE)
             r.deaths.pop_front();
+        if (r.def == 1 && mt->GetMapId() == s.dmap)
+        {
+            Creature* ony = mt->FindNearestCreature(10184, 250.0f, true);
+            bool fight = ony && ony->IsInCombat();
+            if (fight != r.onyFight || (fight && now >= r.onyT + 20))
+            {
+                r.onyT = now;
+                LOG_INFO("playerbots", "WoV raid #{} <{}> Ony {}: {}", r.id, r.gname,
+                         fight == r.onyFight ? "status" : (fight ? "PULL" : "reset"), WovOnyState(r, ps, mt));
+                r.onyFight = fight;
+            }
+        }
         if (anyAlive && !r.rezT && r.deaths.size() >= std::max<size_t>(8, ps.size() * 6 / 10))
         {
             r.deaths.clear();
