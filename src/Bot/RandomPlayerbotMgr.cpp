@@ -5930,6 +5930,8 @@ void WovWealthTick()
 // wov: trainer trips (declared here so the errand keeps the bot active, see WovMarket_Tick)
 struct WovTrainTrip
 {
+    uint8 kind = 0;  // 0 class trainer, 1 riding trainer, 2 profession trainer
+    uint16 skill = 0;
     uint32 entry = 0, map = 0;
     float x = 0, y = 0, z = 0;
     time_t start = 0;
@@ -6204,18 +6206,25 @@ void WovMarket_Tick(time_t now)
 }
 
 // ---- wov: trainer (AiPlayerbot.WoV.HumanStart with AutoLearnTrainerSpells = 0) --------------------------------
-// A person goes to the class trainer every couple of levels and pays for the new ranks. The bots do the same instead
-// of learning them for free at level-up: when there is something new to learn and the money for it, a bot walks (or
-// flies) to the nearest friendly trainer of its class, buys what it can afford, cheapest first, and goes back to
-// what it was doing. Most people train every second level, so one new spell on an odd level waits.
+// The bots go to their trainers as people do instead of getting spells, riding and professions handed to them:
+// - class trainer: when there is something new to learn (most people train on even levels),
+// - riding trainer: at the riding levels (UseGroundMountAtMinLevel / UseFastGroundMountAtMinLevel); the riding skill
+//   and a mount of their race come with the visit,
+// - profession trainers: the two professions (chosen once, WovProfessions) from level 5, and again when the skill
+//   reaches the cap of its rank or several new recipes wait.
+// The walk (or flight) is the bot's own. AiPlayerbot.WoV.Trainer.Free = 1 (operator, 31/10): what it learns there costs
+// nothing. Skill points still come from gathering and crafting.
 struct WovTrainerSpawn
 {
     uint32 entry, map;
     float x, y, z;
     uint32 faction;
 };
-std::unordered_map<uint8, std::vector<WovTrainerSpawn>> g_wovTrainers;  // by class
-std::unordered_map<uint32, time_t> g_wovTrainNext;                     // next time a bot is looked at
+std::unordered_map<uint8, std::vector<WovTrainerSpawn>> g_wovTrainers;      // class trainers by class
+std::vector<WovTrainerSpawn> g_wovRidingTrainers;                           // riding trainers
+std::unordered_map<uint16, std::vector<WovTrainerSpawn>> g_wovProfTrainers;  // profession trainers by skill
+std::unordered_map<uint32, time_t> g_wovTrainNext;                          // next time a bot is looked at
+bool g_wovTrainFree = true;
 
 void WovTrainersLoad()
 {
@@ -6224,23 +6233,55 @@ void WovTrainersLoad()
         return;
     loaded = true;
     if (QueryResult r = WorldDatabase.Query(
-            "SELECT c.id, c.map, c.position_x, c.position_y, c.position_z, t.Requirement, ct.faction FROM creature c "
+            "SELECT c.id, c.map, c.position_x, c.position_y, c.position_z, t.Type, t.Requirement, ct.faction FROM creature c "
             "JOIN creature_default_trainer d ON d.CreatureId = c.id JOIN trainer t ON t.Id = d.TrainerId "
-            "JOIN creature_template ct ON ct.entry = c.id WHERE t.Type = 0 AND c.map IN (0, 1) "
+            "JOIN creature_template ct ON ct.entry = c.id WHERE t.Type IN (0, 1, 2) AND c.map IN (0, 1) "
             "AND NOT EXISTS (SELECT 1 FROM game_event_creature g WHERE g.guid = c.guid)"))  // event spawns are not there
         do
         {
             Field* f = r->Fetch();
-            g_wovTrainers[uint8(f[5].Get<uint32>())].push_back(
-                {f[0].Get<uint32>(), f[1].Get<uint32>(), f[2].Get<float>(), f[3].Get<float>(), f[4].Get<float>(), f[6].Get<uint32>()});
+            WovTrainerSpawn sp{f[0].Get<uint32>(), f[1].Get<uint32>(), f[2].Get<float>(), f[3].Get<float>(), f[4].Get<float>(),
+                               f[7].Get<uint32>()};
+            uint32 type = f[5].Get<uint32>();
+            if (type == 0)
+                g_wovTrainers[uint8(f[6].Get<uint32>())].push_back(sp);
+            else if (type == 1)
+                g_wovRidingTrainers.push_back(sp);
+            else if (uint16 skill = PlayerbotFactory::WovTrainerTradeSkill(sObjectMgr->GetTrainer(sp.entry)))
+                g_wovProfTrainers[skill].push_back(sp);
         } while (r->NextRow());
-    size_t n = 0;
+    size_t n = 0, p = 0;
     for (auto const& [c, v] : g_wovTrainers)
         n += v.size();
-    LOG_INFO("playerbots", "WoV trainer: {} class trainers loaded", n);
+    for (auto const& [c, v] : g_wovProfTrainers)
+        p += v.size();
+    LOG_INFO("playerbots", "WoV trainer: {} class, {} riding and {} profession trainers ({} professions) loaded", n,
+             g_wovRidingTrainers.size(), p, g_wovProfTrainers.size());
 }
 
-// what this bot could buy from the trainer (entry) now: count, cheapest and total cost
+WovTrainerSpawn const* WovNearestTrainer(Player* bot, std::vector<WovTrainerSpawn> const& v, float& bestD)
+{
+    FactionTemplateEntry const* mine = bot->GetFactionTemplateEntry();
+    WovTrainerSpawn const* best = nullptr;
+    bestD = 1.0e9f;
+    for (WovTrainerSpawn const& sp : v)
+    {
+        if (sp.map != bot->GetMapId())
+            continue;
+        FactionTemplateEntry const* ft = sFactionTemplateStore.LookupEntry(sp.faction);
+        if (!ft || !mine || ft->IsHostileTo(*mine) || !ft->IsFriendlyTo(*mine))
+            continue;
+        float d = bot->GetExactDist(sp.x, sp.y, sp.z);
+        if (d < bestD)
+        {
+            bestD = d;
+            best = &sp;
+        }
+    }
+    return best;
+}
+
+// what this bot could learn from the trainer (entry) now
 uint32 WovTrainable(Player* bot, uint32 entry, uint32& cheapest)
 {
     cheapest = 0;
@@ -6277,13 +6318,14 @@ uint32 WovTrainLearn(Player* bot, Creature* c, uint32& spent)
         bool any = false;
         for (Trainer::Spell const* sp : can)
         {
-            uint32 cost = uint32(std::floor(sp->MoneyCost * disc));
+            uint32 cost = g_wovTrainFree ? 0 : uint32(std::floor(sp->MoneyCost * disc));
             if (bot->GetMoney() < cost)
                 continue;
             SpellInfo const* si = sSpellMgr->GetSpellInfo(sp->SpellId);
             if (!si)
                 continue;
-            bot->ModifyMoney(-int32(cost));
+            if (cost)
+                bot->ModifyMoney(-int32(cost));
             if (si->HasEffect(SPELL_EFFECT_LEARN_SPELL))
                 bot->CastSpell(bot, sp->SpellId, true);
             else
@@ -6298,9 +6340,21 @@ uint32 WovTrainLearn(Player* bot, Creature* c, uint32& spent)
     return learned;
 }
 
+// riding the bot should have at its level and lacks: 33388 (apprentice) or 33391 (journeyman), 0 if none
+uint32 WovRidingDue(Player* bot)
+{
+    if (bot->GetLevel() >= uint32(sPlayerbotAIConfig.useGroundMountAtMinLevel) && !bot->HasSpell(33388))
+        return 33388;
+    if (bot->GetLevel() >= uint32(sPlayerbotAIConfig.useFastGroundMountAtMinLevel) && !bot->HasSpell(33391))
+        return 33391;
+    return 0;
+}
+
+char const* WovTrainKind(WovTrainTrip const& t) { return t.kind == 0 ? "class" : (t.kind == 1 ? "riding" : "profession"); }
+
 void WovTrain_Tick(time_t now)
 {
-    static time_t last = 0, cfgT = 0;
+    static time_t last = 0, cfgT = 0, sumT = 0;
     static bool on = false;
     if (now < last + 10)
         return;
@@ -6309,6 +6363,7 @@ void WovTrain_Tick(time_t now)
     {
         cfgT = now;
         on = sConfigMgr->GetOption<bool>("AiPlayerbot.WoV.HumanStart", false) && !sPlayerbotAIConfig.autoLearnTrainerSpells;
+        g_wovTrainFree = sConfigMgr->GetOption<bool>("AiPlayerbot.WoV.Trainer.Free", true);
     }
     if (!on)
     {
@@ -6325,7 +6380,7 @@ void WovTrain_Tick(time_t now)
             g_wovBotSk.count(it->first) || g_wovTrips.count(it->first) || bot->GetMapId() != t.map)
         {
             if (bot)
-                LOG_INFO("playerbots", "WoV trainer: {} gave up the trip", bot->GetName());
+                LOG_INFO("playerbots", "WoV trainer: {} gave up the trip to its {} trainer", bot->GetName(), WovTrainKind(t));
             g_wovTrainNext[it->first] = now + 900;
             it = g_wovTrainTrips.erase(it);
             continue;
@@ -6362,22 +6417,44 @@ void WovTrain_Tick(time_t now)
         if (!c)
         {
             LOG_INFO("playerbots", "WoV trainer: {} cannot find the trainer ({}), not used again", bot->GetName(), t.entry);
-            for (auto& [cls, v] : g_wovTrainers)  // a spawn that is not there (event, phase): forget it
+            auto forget = [&](std::vector<WovTrainerSpawn>& v) {  // a spawn that is not there (event, phase): forget it
                 v.erase(std::remove_if(v.begin(), v.end(), [&](WovTrainerSpawn const& sp) {
                             return sp.entry == t.entry && std::fabs(sp.x - t.x) < 1.0f && std::fabs(sp.y - t.y) < 1.0f; }),
                         v.end());
-            g_wovTrainNext[it->first] = now + 1800;
+            };
+            for (auto& [k, v] : g_wovTrainers)
+                forget(v);
+            for (auto& [k, v] : g_wovProfTrainers)
+                forget(v);
+            forget(g_wovRidingTrainers);
+            g_wovTrainNext[it->first] = now + 300;
             it = g_wovTrainTrips.erase(it);
             continue;
         }
         if (bot->GetExactDist(c) <= 5.0f)
         {
-            uint32 spent = 0, cheapest = 0;
-            uint32 n = WovTrainLearn(bot, c, spent);
-            uint32 left = WovTrainable(bot, c->GetEntry(), cheapest);
-            LOG_INFO("playerbots", "WoV trainer: {} (lvl {}) trains at {}: {} new spells for {}c, {} left, {}c in the bag",
-                     bot->GetName(), bot->GetLevel(), c->GetName(), n, spent, left, bot->GetMoney());
-            g_wovTrainNext[it->first] = now + urand(1800, 3600);
+            uint32 spent = 0, cheapest = 0, n = 0;
+            if (t.kind == 1)
+            {
+                if (bot->GetLevel() >= uint32(sPlayerbotAIConfig.useGroundMountAtMinLevel) && !bot->HasSpell(33388))
+                    bot->learnSpell(33388, false), ++n;
+                if (bot->GetLevel() >= uint32(sPlayerbotAIConfig.useFastGroundMountAtMinLevel) && !bot->HasSpell(33391))
+                    bot->learnSpell(33391, false), ++n;
+                PlayerbotFactory factory(bot, bot->GetLevel());
+                factory.InitMounts();  // a mount of its race for the riding it now has
+                LOG_INFO("playerbots", "WoV trainer: {} (lvl {}) learns riding at {} and gets its mount", bot->GetName(),
+                         bot->GetLevel(), c->GetName());
+            }
+            else
+            {
+                n = WovTrainLearn(bot, c, spent);
+                uint32 left = WovTrainable(bot, c->GetEntry(), cheapest);
+                LOG_INFO("playerbots", "WoV trainer: {} (lvl {}) at its {} trainer {}: {} learnt for {}c, {} left{}", bot->GetName(),
+                         bot->GetLevel(), WovTrainKind(t), c->GetName(), n, spent, left,
+                         t.kind == 2 ? Acore::StringFormat(", skill {} {}/{}", t.skill, bot->GetSkillValue(t.skill),
+                                                           bot->GetMaxSkillValue(t.skill)) : std::string());
+            }
+            g_wovTrainNext[it->first] = now + urand(900, 1800);
             it = g_wovTrainTrips.erase(it);
             continue;
         }
@@ -6385,8 +6462,8 @@ void WovTrain_Tick(time_t now)
             bot->GetMotionMaster()->MovePoint(0, c->GetPositionX(), c->GetPositionY(), c->GetPositionZ());
         ++it;
     }
-    uint32 looked = 0, started = 0, noTrainer = 0, nothing = 0, poor = 0, oddLevel = 0, noFlight = 0;
-    static time_t sumT = 0;
+    uint32 looked = 0, started = 0;
+    static uint32 sLooked = 0, sClass = 0, sRiding = 0, sProf = 0, sNoFl = 0;
     for (auto const& [guid, bot] : sRandomPlayerbotMgr.GetAllBots())
     {
         if (looked >= 40 || started >= 6)
@@ -6408,49 +6485,55 @@ void WovTrain_Tick(time_t now)
         PlayerbotAI* ai = GET_PLAYERBOT_AI(bot);
         if (!ai || ai->rpgInfo.GetStatus() == RPG_TRAVEL_FLIGHT)
             continue;
-        auto tv = g_wovTrainers.find(bot->getClass());
-        if (tv == g_wovTrainers.end())
-            continue;
-        FactionTemplateEntry const* mine = bot->GetFactionTemplateEntry();
+        WovTrainTrip t;
         WovTrainerSpawn const* best = nullptr;
         float bestD = 1.0e9f;
-        for (WovTrainerSpawn const& sp : tv->second)
+        uint32 n = 0, cheapest = 0;
+        // 1) riding at the riding levels
+        if (WovRidingDue(bot) && (best = WovNearestTrainer(bot, g_wovRidingTrainers, bestD)))
+            t.kind = 1;
+        // 2) professions from level 5: learn them, then go back at the cap of a rank or for a handful of recipes
+        if (!best && bot->GetLevel() >= 5)
         {
-            if (sp.map != bot->GetMapId())
-                continue;
-            FactionTemplateEntry const* ft = sFactionTemplateStore.LookupEntry(sp.faction);
-            if (!ft || !mine || ft->IsHostileTo(*mine) || !ft->IsFriendlyTo(*mine))
-                continue;
-            float d = bot->GetExactDist(sp.x, sp.y, sp.z);
-            if (d < bestD)
+            PlayerbotFactory factory(bot, bot->GetLevel());
+            std::pair<uint16, uint16> pr = factory.WovProfessions();
+            for (uint16 sk : {pr.first, pr.second})
             {
-                bestD = d;
-                best = &sp;
+                auto pv = g_wovProfTrainers.find(sk);
+                if (!sk || pv == g_wovProfTrainers.end())
+                    continue;
+                float dd = 0;
+                WovTrainerSpawn const* sp = WovNearestTrainer(bot, pv->second, dd);
+                if (!sp)
+                    continue;
+                uint32 nn = WovTrainable(bot, sp->entry, cheapest);
+                bool due = !bot->HasSkill(sk) ? nn > 0
+                                              : nn > 0 && (bot->GetSkillValue(sk) + 10 >= bot->GetMaxSkillValue(sk) || nn >= 4);
+                if (!due || (!g_wovTrainFree && bot->GetMoney() < cheapest))
+                    continue;
+                best = sp;
+                bestD = dd;
+                n = nn;
+                t.kind = 2;
+                t.skill = sk;
+                break;
+            }
+        }
+        // 3) the class trainer
+        if (!best)
+        {
+            auto tv = g_wovTrainers.find(bot->getClass());
+            if (tv != g_wovTrainers.end() && (best = WovNearestTrainer(bot, tv->second, bestD)))
+            {
+                n = WovTrainable(bot, best->entry, cheapest);
+                if (!n || (!g_wovTrainFree && bot->GetMoney() < cheapest) || (n < 2 && bot->GetLevel() % 2))
+                    best = nullptr;
+                else
+                    t.kind = 0;
             }
         }
         if (!best)
-        {
-            ++noTrainer;
             continue;
-        }
-        uint32 cheapest = 0;
-        uint32 n = WovTrainable(bot, best->entry, cheapest);
-        if (!n)
-        {
-            ++nothing;
-            continue;
-        }
-        if (bot->GetMoney() < cheapest)
-        {
-            ++poor;
-            continue;
-        }
-        if (n < 2 && bot->GetLevel() % 2)
-        {
-            ++oddLevel;
-            continue;
-        }
-        WovTrainTrip t;
         t.entry = best->entry;
         t.map = best->map;
         t.x = best->x;
@@ -6461,33 +6544,30 @@ void WovTrain_Tick(time_t now)
         {
             TravelMgr::FlightMasterInfo const* fm = sTravelMgr.GetNearestFlightMasterInfo(bot);
             uint32 to = sObjectMgr->GetNearestTaxiNode(t.x, t.y, t.z, t.map, bot->GetTeamId());
-            if (!fm || !fm->taxiNodeId || !to || fm->taxiNodeId == to)
-            {
-                ++noFlight;
-                continue;
-            }
-            std::vector<uint32> path = sTravelNodeMap.FindTaxiPath(fm->taxiNodeId, to);
+            std::vector<uint32> path;
+            if (fm && fm->taxiNodeId && to && fm->taxiNodeId != to)
+                path = sTravelNodeMap.FindTaxiPath(fm->taxiNodeId, to);
             if (path.empty())
             {
-                ++noFlight;
+                ++sNoFl;
                 continue;
             }
             ai->rpgInfo.ChangeToTravelFlight(fm->templateEntry, fm->pos, path);
         }
         g_wovTrainTrips[low] = t;
         ++started;
-        LOG_INFO("playerbots", "WoV trainer: {} (lvl {}, {}c) heads to its trainer, {} new spells, {:.0f} yd{}", bot->GetName(),
-                 bot->GetLevel(), bot->GetMoney(), n, bestD, bestD > 600.0f ? " by air" : "");
+        (t.kind == 0 ? sClass : (t.kind == 1 ? sRiding : sProf))++;
+        LOG_INFO("playerbots", "WoV trainer: {} (lvl {}) heads to its {} trainer{}, {} to learn, {:.0f} yd{}", bot->GetName(),
+                 bot->GetLevel(), WovTrainKind(t), t.kind == 2 ? Acore::StringFormat(" (skill {})", t.skill) : std::string(),
+                 t.kind == 1 ? 1u : n, bestD, bestD > 600.0f ? " by air" : "");
     }
-    static uint32 sLooked = 0, sNoTr = 0, sNothing = 0, sPoor = 0, sOdd = 0, sNoFl = 0, sStarted = 0;
-    sLooked += looked; sNoTr += noTrainer; sNothing += nothing; sPoor += poor; sOdd += oddLevel; sNoFl += noFlight; sStarted += started;
+    sLooked += looked;
     if (now >= sumT + 600)
     {
         sumT = now;
-        LOG_INFO("playerbots", "WoV trainer: last 10 min looked at {} bots: {} trips, {} nothing new, {} too poor, {} wait for an even "
-                 "level, {} no trainer on the map, {} no flight; {} on the way", sLooked, sStarted, sNothing, sPoor, sOdd, sNoTr, sNoFl,
-                 g_wovTrainTrips.size());
-        sLooked = sNoTr = sNothing = sPoor = sOdd = sNoFl = sStarted = 0;
+        LOG_INFO("playerbots", "WoV trainer: last 10 min looked at {} bots: {} to the class trainer, {} riding, {} professions, "
+                 "{} without a flight; {} on the way", sLooked, sClass, sRiding, sProf, sNoFl, g_wovTrainTrips.size());
+        sLooked = sClass = sRiding = sProf = sNoFl = 0;
     }
 }
 // ---- end wov: trainer -------------------------------------------------------------------------------------

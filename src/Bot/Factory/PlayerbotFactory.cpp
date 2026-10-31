@@ -3993,6 +3993,42 @@ void PlayerbotFactory::AutoGear(Player* bot, uint32 itemQuality, uint32 ilvl, bo
     bot->DurabilityRepairAll(false, 1.0f, false);
 }
 
+// wov: the primary trade skill a trainer teaches (0 for a cooking, first aid or fishing trainer, or none)
+uint16 PlayerbotFactory::WovTrainerTradeSkill(Trainer::Trainer const* trainer)
+{
+    if (!trainer)
+        return 0;
+    for (Trainer::Spell const& sp : trainer->GetSpells())
+    {
+        uint16 s = GetTrainerSpellTradeSkill(&sp);
+        if (IsPrimaryTradeSkill(s))
+            return s;
+    }
+    return 0;
+}
+
+// wov: the two professions this bot will have, chosen the way InitTradeSkills chooses them, stored and kept; nothing
+// is learnt here (the bot learns them at the trainer)
+std::pair<uint16, uint16> PlayerbotFactory::WovProfessions()
+{
+    uint16 a = sRandomPlayerbotMgr.GetValue(bot, "firstSkill");
+    uint16 b = sRandomPlayerbotMgr.GetValue(bot, "secondSkill");
+    if (IsPrimaryTradeSkill(a) && IsPrimaryTradeSkill(b) && a != b)
+        return {a, b};
+    ProfessionRollType rt = static_cast<ProfessionRollType>(sRandomPlayerbotMgr.GetValue(bot, "professionRollType"));
+    if (rt != ProfessionRollType::Class && rt != ProfessionRollType::Random)
+    {
+        rt = urand(1, 100) <= sPlayerbotAIConfig.classMatchingProfessionChance ? ProfessionRollType::Class
+                                                                                : ProfessionRollType::Random;
+        sRandomPlayerbotMgr.SetValue(bot, "professionRollType", static_cast<uint32>(rt));
+    }
+    std::pair<uint16, uint16> p =
+        ChooseProfessionPair(rt == ProfessionRollType::Class ? GetClassProfessionPairs(bot) : GetRandomProfessionPairs());
+    sRandomPlayerbotMgr.SetValue(bot, "firstSkill", p.first);
+    sRandomPlayerbotMgr.SetValue(bot, "secondSkill", p.second);
+    return p;
+}
+
 void PlayerbotFactory::InitMounts()
 {
     uint32 firstmount = sPlayerbotAIConfig.useGroundMountAtMinLevel;

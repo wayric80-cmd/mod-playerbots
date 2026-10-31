@@ -93,6 +93,9 @@ public:
     void InitGlyphs(bool increment = false);
     void InitFood();
     void InitMounts();
+    // wov: trainer visits (AiPlayerbot.WoV.HumanStart)
+    static uint16 WovTrainerTradeSkill(Trainer::Trainer const* trainer);  // primary trade skill a trainer teaches, 0 if none
+    std::pair<uint16, uint16> WovProfessions();  // the bot's two professions, chosen once and kept (firstSkill/secondSkill)
     void InitBags(bool destroyOld = true);
     void ApplyEnchantAndGemsNew(bool destroyOld = true);
     void InitInstanceQuests();
