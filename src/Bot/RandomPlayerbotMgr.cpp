@@ -6226,7 +6226,8 @@ void WovTrainersLoad()
     if (QueryResult r = WorldDatabase.Query(
             "SELECT c.id, c.map, c.position_x, c.position_y, c.position_z, t.Requirement, ct.faction FROM creature c "
             "JOIN creature_default_trainer d ON d.CreatureId = c.id JOIN trainer t ON t.Id = d.TrainerId "
-            "JOIN creature_template ct ON ct.entry = c.id WHERE t.Type = 0 AND c.map IN (0, 1)"))
+            "JOIN creature_template ct ON ct.entry = c.id WHERE t.Type = 0 AND c.map IN (0, 1) "
+            "AND NOT EXISTS (SELECT 1 FROM game_event_creature g WHERE g.guid = c.guid)"))  // event spawns are not there
         do
         {
             Field* f = r->Fetch();
@@ -6360,7 +6361,11 @@ void WovTrain_Tick(time_t now)
                 t.target = c->GetGUID();
         if (!c)
         {
-            LOG_INFO("playerbots", "WoV trainer: {} cannot find the trainer", bot->GetName());
+            LOG_INFO("playerbots", "WoV trainer: {} cannot find the trainer ({}), not used again", bot->GetName(), t.entry);
+            for (auto& [cls, v] : g_wovTrainers)  // a spawn that is not there (event, phase): forget it
+                v.erase(std::remove_if(v.begin(), v.end(), [&](WovTrainerSpawn const& sp) {
+                            return sp.entry == t.entry && std::fabs(sp.x - t.x) < 1.0f && std::fabs(sp.y - t.y) < 1.0f; }),
+                        v.end());
             g_wovTrainNext[it->first] = now + 1800;
             it = g_wovTrainTrips.erase(it);
             continue;
