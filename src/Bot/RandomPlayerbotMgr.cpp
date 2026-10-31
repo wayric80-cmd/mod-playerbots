@@ -1247,6 +1247,8 @@ void WovPostLfx(Player* bot, Player* real)
     if (!ai || bot->GetGroup())
         return;
     uint32 low = bot->GetGUID().GetCounter();
+    if (WovBotReserved(low))  // already on its way to a dungeon run or a raid with others
+        return;
     time_t now = time(nullptr);
     WovLfx cur;
     {
@@ -1449,6 +1451,15 @@ void WovInit_Tick(time_t now)
         Player* p = ObjectAccessor::FindPlayerByLowGUID(playerLow);
         if (!bot || !p || p->GetGroup() || (bot->GetGroup() && bot->GetGroup()->IsFull()))
             continue;
+        // wov: it posted LFG/LFM, then was picked for a dungeon run or a raid: it says so instead of making a group the
+        // run would pull it straight back out of (31/10: Rotzbengel invited Zugzug and the group broke at once)
+        if (WovBotReserved(botLow))
+        {
+            static char const* const no[] = {"sry, already found a group", "nvm got a group already, sry",
+                                             "sry just joined another grp"};
+            bot->Whisper(no[urand(0, 2)], LANG_UNIVERSAL, p);
+            continue;
+        }
         bot->Whisper(WovPick(kWovInvOk), LANG_UNIVERSAL, p);
         WorldPacket pk;
         pk << p->GetName();
