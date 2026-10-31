@@ -3922,7 +3922,13 @@ bool WovRaidStart(uint32 guild, time_t now, uint8 d)
             cap = std::min<uint32>(cap, md->maxPlayers);
     uint32 pugTo = std::min(g_wovRaidPug, cap);
     uint32 have = tanks.size() + heals.size() + dps.size() + hyb.size();
-    if (have >= std::max<uint32>(5, g_wovRaidMin / 3) && have < pugTo && !tanks.empty())  // a small guild pugs the rest
+    // wov: Onyxia needs a proper raid: three tanks for the whelps and the breath, and eight healers (31/10: 3 tanks and
+    // 10 healers killed her without a wipe, 2 tanks and 5 healers wiped in the air phase). Short of those roles the
+    // raid pugs them even when the guild has the numbers.
+    bool ony = D.map == 249;
+    uint32 needTank = ony ? 3 : 2, needHeal = ony ? 8 : 0;
+    bool roleShort = ony && (tanks.size() < needTank || heals.size() + hyb.size() < needHeal);
+    if (have >= std::max<uint32>(5, g_wovRaidMin / 3) && (have < pugTo || roleShort) && !tanks.empty())  // a small guild pugs the rest
     {
         TeamId team = tanks[0]->GetTeamId();
         std::vector<Player*> pool;
@@ -3941,8 +3947,8 @@ bool WovRaidStart(uint32 guild, time_t now, uint8 d)
             return n;
         };
         uint32 pugs = 0;
-        auto take = [&](auto pred, std::vector<Player*>& into, uint32 upto) {
-            for (auto it = pool.begin(); it != pool.end() && into.size() < upto && have < pugTo;)
+        auto take = [&](auto pred, std::vector<Player*>& into, uint32 upto, bool overCap = false) {
+            for (auto it = pool.begin(); it != pool.end() && into.size() < upto && (have < pugTo || overCap);)
                 if (pred(*it))
                 {
                     into.push_back(*it);
@@ -3956,6 +3962,11 @@ bool WovRaidStart(uint32 guild, time_t now, uint8 d)
         uint32 locks = count(CLASS_WARLOCK);
         if (locks < 3)
             take([](Player* p) { return p->getClass() == CLASS_WARLOCK; }, dps, dps.size() + (3 - locks));
+        if (ony && heals.size() + hyb.size() < needHeal)  // Onyxia: the healers and tanks she needs, past the pug cap if needed
+            take([](Player* p) { return p->getClass() == CLASS_PRIEST || PlayerbotAI::IsHeal(p, true); }, heals,
+                 needHeal - std::min<uint32>(needHeal, hyb.size()), true);
+        if (ony && tanks.size() < 4)
+            take([](Player* p) { return p->getClass() == CLASS_WARRIOR; }, tanks, 4, true);
         take([](Player* p) { return p->getClass() == CLASS_PRIEST || PlayerbotAI::IsHeal(p, true); }, heals, std::max<uint32>(5, pugTo / 4));
         take([](Player* p) { return p->getClass() == CLASS_WARRIOR; }, tanks, 4);
         take([](Player* p) { return true; }, dps, 1000);
@@ -3982,13 +3993,19 @@ bool WovRaidStart(uint32 guild, time_t now, uint8 d)
         return ta != tb ? ta : a->GetMaxHealth() > b->GetMaxHealth();
     });
     uint32 total = tanks.size() + heals.size() + dps.size() + hyb.size();
+    if (ony && total >= g_wovRaidMin && (tanks.size() < needTank || heals.size() + hyb.size() < needHeal))
+    {
+        LOG_INFO("playerbots", "WoV raid <{}>: not enough tanks or healers for Ony tonight ({} tanks, {} healers, needs {} and {})", gname,
+                 tanks.size(), heals.size() + hyb.size(), needTank, needHeal);
+        return false;
+    }
     if (total < g_wovRaidMin || tanks.size() < 2)
     {
         LOG_INFO("playerbots", "WoV raid <{}>: not enough people for {} tonight ({} level 60{} online, {} tanks)", gname, D.tag, total, D.attune ? " with the attunement" : "", tanks.size());
         return false;
     }
     uint32 size = std::min(cap, total);
-    uint32 wantHeal = std::max<uint32>(4, size / 4), wantTank = std::min<uint32>(size >= 25 ? 4 : 3, tanks.size());
+    uint32 wantHeal = std::max<uint32>(ony ? needHeal : 4, size / 4), wantTank = std::min<uint32>(size >= 25 ? 4 : 3, tanks.size());
     WovRaid r;
     r.id = g_wovRaidNextId++;
     r.def = d;
