@@ -3096,6 +3096,7 @@ struct WovRaid
     // loot rules
     uint8 rule = 0;  // 0 roll (main spec before off spec), 1 DKP, 2 loot council
     bool lootSet = false;
+    bool groupLoot = false;        // need/greed because a real player is along
     uint32 ml = 0;                 // the master looter
     std::map<uint32, int32> dkp;   // guild member -> DKP
     std::map<uint32, uint32> got;  // items won in the guild's raids the last four weeks
@@ -3330,6 +3331,11 @@ void WovRaidLootLoad(WovRaid& r)
         std::string m = q->Fetch()[0].Get<std::string>();
         r.rule = m == "dkp" ? 1 : m == "council" ? 2 : 0;
     }
+    else  // a new guild settles on its rule: most /roll main spec before off spec, about one in four keeps DKP
+    {
+        r.rule = r.guild % 4 == 1 ? 1 : 0;
+        CharacterDatabase.Execute("INSERT IGNORE INTO wov_raid_loot_rule (guildid, method) VALUES (" + g + ", '" + kWovLootRule[r.rule] + "')");
+    }
     if (QueryResult q = CharacterDatabase.Query("SELECT guid, points FROM wov_raid_dkp WHERE guildid = " + g))
         do
             r.dkp[q->Fetch()[0].Get<uint32>()] = q->Fetch()[1].Get<int32>();
@@ -3472,6 +3478,18 @@ Item* WovRaidGive(Loot* loot, uint8 slot, ObjectGuid src, Player* to)
 // master loot, epics and up, the highest ranked guild bot of the raid as master looter
 void WovRaidLootSetup(WovRaid& r, Group* g, Player* mt)
 {
+    if (WovRealIn(g))  // a real player along: need/greed with the client's roll window, nobody hands out
+    {
+        g->SetLootMethod(GROUP_LOOT);
+        g->SetLootThreshold(ITEM_QUALITY_UNCOMMON);
+        g->SendUpdate();
+        r.ml = 0;
+        r.lootSet = true;
+        r.groupLoot = true;
+        LOG_INFO("playerbots", "WoV raid #{} <{}> {} loot: need/greed (a real player is in the raid)", r.id, r.gname, WovRaidTag(r));
+        return;
+    }
+    r.groupLoot = false;
     Player* ml = mt;
     uint32 best = 255;
     if (Guild* gg = sGuildMgr->GetGuildById(r.guild))
@@ -3596,7 +3614,7 @@ void WovRaidLootStep(WovRaid& r, Player* mt, time_t now)
         return;
     }
     auto inPool = [&](Cand const& c, uint8 pool) {
-        return pool == 0 ? c.gain > 0.05f : pool == 1 ? c.gain > -0.99f : true;
+        return pool == 0 ? c.gain > 0.05f : pool == 1 ? c.gain > -0.30f : true;
     };
     auto give = [&](Cand const& w, std::string const& how, std::string const& detail) {
         Item* ni = WovRaidGive(loot, l.slot, l.src, w.p);
@@ -3635,8 +3653,39 @@ void WovRaidLootStep(WovRaid& r, Player* mt, time_t now)
             anyMs = anyMs || inPool(c, 0);
             anyOs = anyOs || inPool(c, 1);
         }
+        if (!anyMs && !anyOs)  // nobody needs it: disenchanted, or the guild bank
+        {
+            Cand const* de = nullptr;
+            Cand const* bank = nullptr;
+            for (Cand const& c : cs)
+            {
+                if (c.p->GetSkillValue(SKILL_ENCHANTING) >= 225 && (!de || c.p->GetSkillValue(SKILL_ENCHANTING) > de->p->GetSkillValue(SKILL_ENCHANTING)))
+                    de = &c;
+                if (c.p->GetGUID().GetCounter() == r.ml)
+                    bank = &c;
+            }
+            Cand const* to = de ? de : bank ? bank : &cs[0];
+            Item* ni = WovRaidGive(loot, l.slot, l.src, to->p);
+            if (ni && de)
+            {
+                to->p->DestroyItem(ni->GetBagSlot(), ni->GetSlot(), true);
+                to->p->StoreNewItemInBestSlots(20725, urand(1, 2));  // Nexus Crystal
+            }
+            if (ni)
+            {
+                WovRaidLootSay(r, mt, link + (de ? (urand(0, 1) ? " DE" : " nobody? DE then") : " to the guild bank"));
+                CharacterDatabase.Execute("INSERT INTO wov_raid_loot (guildid, raid, instance_id, boss, item, winner, pug, method, gain, detail) VALUES (" +
+                                          std::to_string(r.guild) + ", " + std::to_string(r.id) + ", " + std::to_string(mt->GetInstanceId()) + ", " +
+                                          std::to_string(l.boss) + ", " + std::to_string(l.item) + ", " + std::to_string(to->p->GetGUID().GetCounter()) +
+                                          ", " + (to->guild ? "0" : "1") + ", 'roll', 0, '" + (de ? "disenchanted" : "guild bank") + "')");
+                LOG_INFO("playerbots", "WoV raid #{} <{}> {} loot: {} {} by {}", r.id, r.gname, WovRaidTag(r), proto->Name1,
+                         de ? "disenchanted" : "to the guild bank", to->p->GetName());
+            }
+            r.loot.erase(r.loot.begin());
+            return;
+        }
         l.mode = r.rule == 1 && guildMs ? 1 : r.rule == 2 && anyMs ? 2 : 0;
-        l.pool = anyMs ? 0 : anyOs ? 1 : 2;
+        l.pool = anyMs ? 0 : 1;
         std::string line;
         if (l.mode == 1)
             line = "up for " + std::to_string(WovLootCost(proto)) + " dkp, MS only";
@@ -4217,10 +4266,13 @@ bool WovRaidStep(WovRaid& r, time_t now)
         if (Group* lg = mt->GetGroup(); lg && mt->GetMapId() == s.dmap && now >= r.scanT + 10)
         {
             r.scanT = now;
-            if (lg->GetLootMethod() != MASTER_LOOT || !lg->IsMember(ObjectGuid::Create<HighGuid::Player>(r.ml)))
-                if (lg->IsLeader(mt->GetGUID()))
-                    WovRaidLootSetup(r, lg, mt);
-            WovRaidLootScan(r, mt, now);
+            bool wantGroup = WovRealIn(lg);
+            bool off = wantGroup ? lg->GetLootMethod() != GROUP_LOOT
+                                 : (lg->GetLootMethod() != MASTER_LOOT || !lg->IsMember(ObjectGuid::Create<HighGuid::Player>(r.ml)));
+            if (off && lg->IsLeader(mt->GetGUID()))
+                WovRaidLootSetup(r, lg, mt);
+            if (!r.groupLoot)
+                WovRaidLootScan(r, mt, now);
         }
         if (mt->GetMapId() == s.dmap)
             WovRaidLootStep(r, mt, now);
