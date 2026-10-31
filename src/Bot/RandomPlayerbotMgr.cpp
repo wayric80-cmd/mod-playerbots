@@ -2772,7 +2772,20 @@ bool WovDgStep(WovDgRunState& r, time_t now)
             }
             if (d <= 60.0f && mm.flew && b->IsAlive())
                 ++here;
-            if (!b->IsInCombat() && b->IsAlive())
+            // wov 31/10: the group is made at the start, like people who group up and then travel. A member far from
+            // the tank makes its own way (the follow strategy would walk it across the zone after the tank); once
+            // with the tank or at the stone it follows again.
+            if (i > 0 && b->GetGroup() && b->GetGroup()->IsMember(tank->GetGUID()))
+            {
+                PlayerbotAI* bai = GET_PLAYERBOT_AI(b);
+                bool near = b->GetMapId() == tank->GetMapId() && b->GetExactDist(tank) <= 40.0f;
+                bool follow = bai->HasStrategy("follow", BOT_STATE_NON_COMBAT);
+                if (!near && d > 40.0f && follow)
+                    bai->ChangeStrategy("-follow", BOT_STATE_NON_COMBAT);
+                else if ((near || d <= 40.0f) && !follow)
+                    bai->ChangeStrategy("+follow", BOT_STATE_NON_COMBAT);
+            }
+            if (!b->IsInCombat() && b->IsAlive() && (i == 0 || !GET_PLAYERBOT_AI(b)->HasStrategy("follow", BOT_STATE_NON_COMBAT)))
                 WovDgGoTo(b, GET_PLAYERBOT_AI(b), r.spot, mm, now);
             // in someone else's group (picked up on the way): it leaves it for the run
             if (Group* og = b->GetGroup())
@@ -2815,11 +2828,12 @@ bool WovDgStep(WovDgRunState& r, time_t now)
             r.realT = now;
             LOG_INFO("playerbots", "WoV dungeon run #{} {}: tank at the stone, invites {}", r.id, r.spot->def->name, real->GetName());
         }
-        if (tank->GetExactDist(r.spot->mx, r.spot->my, r.spot->mz) <= 60.0f)
+        // wov 31/10: the group is made when the run starts, wherever its members are; they travel as a group
+        if (true)
             for (size_t i = 1; i < ps.size(); ++i)
             {
                 Player* b = ps[i];
-                if (b->GetExactDist(r.spot->mx, r.spot->my, r.spot->mz) <= 60.0f && !b->GetGroup() &&
+                if (!b->GetGroup() &&
                     (!tank->GetGroup() || (tank->GetGroup()->IsLeader(tank->GetGUID()) && !tank->GetGroup()->IsFull())))
                     WovInviteFrom(tank, b);
             }
@@ -4884,9 +4898,9 @@ void WovDungeonRun_Tick(time_t now)
             r.realT = now;
             r.realInvited = false;
             // a person who posts LF1M while still on the way says so and invites at the stone, where the group forms
-            if (r.tankThere)
+            if (true)  // wov 31/10: the group is made when the run starts, so the tank invites at once
             {
-                static char const* const ok[] = {"sure, inv", "inv sent, we're at the stone", "k inv", "invited, come to the stone", "sure, sent"};
+                static char const* const ok[] = {"sure, inv", "inv sent, meet at the stone", "k inv", "invited, see u at the stone", "sure, sent"};
                 tank->Whisper(ok[urand(0, 4)], LANG_UNIVERSAL, p);
                 WovInviteFrom(tank, p);
                 r.realInvited = true;
