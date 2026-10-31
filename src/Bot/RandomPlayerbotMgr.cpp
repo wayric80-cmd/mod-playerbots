@@ -1940,9 +1940,9 @@ void WovTogether_Tick(time_t now)
                 ai->ResetStrategies();
                 ai->ChangeStrategy("+follow,-lfg,-bg", BOT_STATE_NON_COMBAT);
                 ai->Reset();
-                if (m->GetMapId() != p->GetMapId() || m->GetExactDist(p) > 250.0f)
-                    m->TeleportTo(p->GetMapId(), p->GetPositionX() + frand(-3.0f, 3.0f), p->GetPositionY() + frand(-3.0f, 3.0f),
-                                  p->GetPositionZ(), p->GetOrientation());
+                // wov 31/10: no teleport to the player (the operator saw the whole group appear in Stratholme); a member
+                // far away walks or rides there like anyone, following its new leader
+
             }
             if (PlayerbotAI* lai = GET_PLAYERBOT_AI(leader))
                 lai->SayToParty(WovRep(WovPick(kWovHand), "{dg}", w.dg ? w.dg->name : "this"));
@@ -4880,7 +4880,8 @@ void WovDungeonRun_Tick(time_t now)
             if (!tank || !p || p->GetGroup() || p->GetTeamId() != tank->GetTeamId() || p->GetLevel() < r.spot->def->minL ||
                 p->GetLevel() > r.spot->def->maxL)
                 break;
-            if (tank->GetGroup() && (!tank->GetGroup()->IsLeader(tank->GetGUID()) || tank->GetGroup()->IsFull()))
+            // wov 31/10: the group is full from the start now; the last dps makes room below
+            if (tank->GetGroup() && !tank->GetGroup()->IsLeader(tank->GetGUID()))
                 break;
             // the last dps steps aside before the group is made; it goes back to its own business
             uint32 drop = r.m.back().low;
@@ -4890,8 +4891,9 @@ void WovDungeonRun_Tick(time_t now)
             if (Player* d = ObjectAccessor::FindPlayerByLowGUID(drop))
                 if (PlayerbotAI* dai = GET_PLAYERBOT_AI(d))
                 {
-                    if (d->GetGroup() && d->GetGroup()->IsMember(tank->GetGUID()))
-                        dai->LeaveOrDisbandGroup();
+                    if (Group* tg = tank->GetGroup())
+                        if (tg->IsMember(d->GetGUID()))
+                            tg->RemoveMember(d->GetGUID(), GROUP_REMOVEMETHOD_DEFAULT);  // at once, so the invite fits
                     dai->rpgInfo.ChangeToIdle();
                 }
             r.real = pl;
