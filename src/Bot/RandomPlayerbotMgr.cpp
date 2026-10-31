@@ -275,6 +275,8 @@ uint32 WovRpgWeightPct(Player* bot, int status)
 }
 
 bool WovBotReserved(uint32 low);  // wov: below (dungeon runs, raid nights)
+bool WovDgStartForPlayer(Player* p, char const* dgName, time_t now);  // wov: below (dungeon runs)
+std::string WovRunIntentOf(uint32 low);                               // wov: below (dungeon runs)
 
 // ---- wov: Call to Arms (world PvP) -------------------------------------------------------------------
 // A PvP kill in the open world can grow into a skirmish: the side that is losing people calls for help in
@@ -1266,7 +1268,7 @@ void WovPostLfx(Player* bot, Player* real)
         cur.dg = WovDungeonFor(bot);
         if (!cur.dg)
             return;
-        cur.lfm = urand(0, 99) < 45;
+        cur.lfm = false;  // wov 31/10: LF1M is posted by the dungeon runs (WovDgPostLfm), which then really go
         cur.t0 = now;
         cur.role = WovRole(bot);
         cur.need = WovPick(kWovNeed);
@@ -1460,11 +1462,9 @@ void WovInit_Tick(time_t now)
             bot->Whisper(no[urand(0, 2)], LANG_UNIVERSAL, p);
             continue;
         }
-        bot->Whisper(WovPick(kWovInvOk), LANG_UNIVERSAL, p);
-        WorldPacket pk;
-        pk << p->GetName();
-        pk << uint32(0);
-        bot->GetSession()->HandleGroupInviteOpcode(pk);
+        // wov 31/10: it posted LFG, so the one who answers makes the group: it asks for the invite and accepts it
+        static char const* const invMe[] = {"sure, inv me", "inv pls", "yes pls, inv", "sure! inv", "ya inv me"};
+        bot->Whisper(invMe[urand(0, 4)], LANG_UNIVERSAL, p);
     }
 
     for (size_t i = 0; i < g_wovGuildApps.size();)
@@ -1587,6 +1587,9 @@ void WovInit_OnWhisper(Player* from, Player* to)
 // For mod-ollama-chat's prompts: what this bot has said it is doing in the channels, so its talk stays consistent.
 std::string WovIntentOf(uint32 low)
 {
+    std::string run = WovRunIntentOf(low);  // wov: a dungeon run says what the group is doing
+    if (!run.empty())
+        return run;
     if (!g_wovInitEnable)
         return "";
     Player* bot = ObjectAccessor::FindPlayerByLowGUID(low);
@@ -1817,6 +1820,8 @@ void WovHandleChat(WovChatEvt const& e, time_t now)
         }
         LOG_INFO("playerbots", "WoV together: {} LFM {} -> {} answers", p->GetName(), dg->name, sent);
     }
+    else if (!p->GetGroup() && WovDgStartForPlayer(p, dg->name, now))
+        LOG_INFO("playerbots", "WoV together: {} LFG {} -> a dungeon run takes them", p->GetName(), dg->name);
     else if (!p->GetGroup())
     {
         for (Player* bot : cands)
@@ -2555,6 +2560,142 @@ bool WovDgStart(time_t now)
              tanks.size(), nSpot, nHeal, nDps);
     return false;
 }
+
+}  // namespace (wov: the next functions are used from other blocks of this file)
+
+// wov 31/10: a real player who posts LFG <dungeon> gets a real run: a tank near that entrance takes them, with a healer
+// and two dps; the tank invites them at once and leads, everyone makes their own way to the entrance, in they go
+// together. Same machinery as the bots' own runs; the player is the fifth (r.real).
+bool WovDgStartForPlayer(Player* p, char const* dgName, time_t now)
+{
+    if (!g_wovDgEnable || !p || p->GetGroup() || !dgName)
+        return false;
+    for (WovDgRunState const& o : g_wovDgRuns)
+        if (o.real == p->GetGUID().GetCounter())
+            return false;
+    WovDgSpot const* spot = nullptr;
+    for (WovDgSpot const& sp : g_wovDgSpots)
+    {
+        if (std::string(sp.def->name) != dgName || !g_wovDgEnabled.count(sp.def->trigger) || sp.map != p->GetMapId())
+            continue;
+        if (sp.def->team >= 0 && int(p->GetTeamId()) != sp.def->team)
+            continue;
+        bool taken = false;
+        for (WovDgRunState const& o : g_wovDgRuns)
+            taken = taken || o.spot == &sp;
+        if (!taken)
+        {
+            spot = &sp;
+            break;
+        }
+    }
+    if (!spot || !WovDgFits(p, spot->def, p->GetLevel()))
+        return false;
+    std::vector<std::pair<float, Player*>> cands;
+    for (auto const& [g, b] : sRandomPlayerbotMgr.GetAllBots())
+    {
+        if (!b || !b->IsInWorld() || b->GetMapId() != spot->map || !WovDgFits(b, spot->def, p->GetLevel()) ||
+            !WovDgFree(b, p->GetTeamId(), now))
+            continue;
+        float d = b->GetExactDist(spot->x, spot->y, spot->z);
+        if (d <= g_wovDgTankRange)
+            cands.push_back({d, b});
+    }
+    std::sort(cands.begin(), cands.end(), [](auto const& a, auto const& b) { return a.first < b.first; });
+    Player* tank = nullptr;
+    Player* heal = nullptr;
+    std::vector<Player*> dps;
+    for (auto const& [d, b] : cands)
+        if (!tank && WovDgCanTank(b) && !PlayerbotAI::IsHeal(b, true))
+            tank = b;
+    for (auto const& [d, b] : cands)
+    {
+        if (b == tank || d > g_wovDgMemberRange || PlayerbotAI::IsTank(b, true))
+            continue;
+        if (!heal && WovDgCanHeal(b))
+            heal = b;
+        else if (!PlayerbotAI::IsHeal(b, true) && b->getClass() != CLASS_PRIEST && dps.size() < 2)
+            dps.push_back(b);
+    }
+    if (!heal)
+        for (auto const& [d, b] : cands)
+        {
+            uint8 c = b->getClass();
+            if (b != tank && d <= g_wovDgMemberRange && (c == CLASS_PALADIN || c == CLASS_SHAMAN || c == CLASS_DRUID) &&
+                std::find(dps.begin(), dps.end(), b) == dps.end() && !PlayerbotAI::IsTank(b, true))
+            {
+                heal = b;
+                break;
+            }
+        }
+    if (!tank || !heal || dps.size() < 2)
+    {
+        LOG_INFO("playerbots", "WoV dungeon runs: no party for {}'s LFG {} (tank {}, healer {}, {} dps)", p->GetName(), dgName,
+                 tank != nullptr, heal != nullptr, dps.size());
+        return false;
+    }
+    WovDgRunState r;
+    r.id = g_wovDgNextId++;
+    r.spot = spot;
+    r.start = r.phaseT = now;
+    for (Player* b : std::vector<Player*>{tank, heal, dps[0], dps[1]})
+    {
+        r.m.push_back({b->GetGUID().GetCounter(), 1e9f, now, false, 0.0f, 0.0f, now});
+        g_wovBusyBot[b->GetGUID().GetCounter()] = uint32(now + 3 * HOUR);
+    }
+    r.real = p->GetGUID().GetCounter();
+    r.realT = now;
+    r.realInvited = true;
+    static char const* const lines[] = {"need dps for {dg}? inv", "doing {dg}, want in? inv", "we need 1 more for {dg}, sent inv",
+                                        "{dg}? ya come, inv", "inv for {dg}, meet at the stone"};
+    tank->Whisper(WovRep(lines[urand(0, 4)], "{dg}", dgName), LANG_UNIVERSAL, p);
+    WovInviteFrom(tank, p);
+    LOG_INFO("playerbots", "WoV dungeon run #{} {}: for {}'s LFG: tank {} (lvl {}), heal {}, dps {} {}, {:.0f} yd to the stone", r.id,
+             dgName, p->GetName(), tank->GetName(), tank->GetLevel(), heal->GetName(), dps[0]->GetName(), dps[1]->GetName(),
+             tank->GetExactDist(spot->x, spot->y, spot->z));
+    g_wovDgRuns.push_back(r);
+    return true;
+}
+
+// wov: what each bot in a dungeon run is doing, for the chat prompts (read on the chat thread, so a snapshot)
+std::mutex g_wovRunIntentMutex;
+std::unordered_map<uint32, std::string> g_wovRunIntent;
+
+void WovRunIntentRefresh()
+{
+    std::unordered_map<uint32, std::string> m;
+    for (WovDgRunState const& r : g_wovDgRuns)
+    {
+        if (r.m.empty())
+            continue;
+        Player* tank = ObjectAccessor::FindPlayerByLowGUID(r.m[0].low);
+        std::string tn = tank ? tank->GetName() : "the tank";
+        std::string where = r.phase == DG_GATHER ? "everyone is making their way to the entrance, where you go in together"
+                                                 : "you are inside now, clearing it";
+        for (size_t i = 0; i < r.m.size(); ++i)
+        {
+            std::string t = "Right now you are in a five-man group for " + std::string(r.spot->def->name) +
+                            (i == 0 ? ", you are the tank and lead it" : ", " + tn + " tanks and leads") + "; " + where + ".";
+            if (i == 0 && r.lfmT && !r.real && r.phase == DG_GATHER)
+                t += " You posted LF1M for it in General.";
+            t += " Talk is about that group and run; do not look for other groups. Never say you sent, will send or "
+                 "are waiting for an invite: the game shows invites. If someone wants to join, they whisper you.";
+            m[r.m[i].low] = t;
+        }
+    }
+    std::lock_guard<std::mutex> lock(g_wovRunIntentMutex);
+    g_wovRunIntent.swap(m);
+}
+
+std::string WovRunIntentOf(uint32 low)
+{
+    std::lock_guard<std::mutex> lock(g_wovRunIntentMutex);
+    auto it = g_wovRunIntent.find(low);
+    return it == g_wovRunIntent.end() ? std::string() : it->second;
+}
+
+namespace
+{
 
 // a member who does not show up is replaced by someone of the same role close to the stone ("anyone else?")
 bool WovDgReplace(WovDgRunState& r, size_t idx, Player* tank, time_t now)
@@ -4928,6 +5069,7 @@ void WovDungeonRun_Tick(time_t now)
                     r.finalKilled = true;
     }
     WovRaid_Tick(now);  // wov: raid nights
+    WovRunIntentRefresh();  // wov: chat knows what the run is doing
     for (size_t i = 0; i < g_wovDgRuns.size();)
     {
         if (WovDgStep(g_wovDgRuns[i], now))
