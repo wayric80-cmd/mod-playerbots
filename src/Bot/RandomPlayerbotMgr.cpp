@@ -2200,6 +2200,7 @@ struct WovDgMember
     time_t closerT = 0;  // last time it got 30 yd closer to the stone
     time_t deadT = 0;    // dead since (on the way)
     time_t outT = 0;     // alive but outside the instance since (revived at the graveyard or at the portal)
+    uint8 sumN = 0;      // wov raids: summons tried; after three it travels on its own (no endless summon loop)
 };
 struct WovDgRunState
 {
@@ -4104,7 +4105,7 @@ bool WovRaidStep(WovRaid& r, time_t now)
                 if (b->getClass() == CLASS_WARLOCK)
                     lock = b;
             }
-            else if (b->IsAlive() && !b->IsInCombat() && !b->IsInFlight() && !b->InBattleground())
+            else if (b->IsAlive() && !b->IsInCombat() && !b->IsInFlight() && !b->InBattleground() && mm.sumN < 3)
                 away.push_back(i);
             if (!b->IsAlive() || b->IsInCombat())
                 continue;
@@ -4143,6 +4144,10 @@ bool WovRaidStep(WovRaid& r, time_t now)
             r.sumT = now;
             size_t i = away[urand(0, away.size() - 1)];
             Player* b = ps[i];
+            if (++r.m[i].sumN >= 3)
+                LOG_INFO("playerbots", "WoV raid #{} <{}> {}: last summon for {} (map {} zone {}, {:.0f} yd away), it travels on its own after this",
+                         r.id, r.gname, WovRaidTag(r), b->GetName(), b->GetMapId(), b->GetZoneId(),
+                         b->GetMapId() == s.map ? b->GetExactDist(s.x, s.y, s.z) : -1.0f);
             if (urand(0, 99) < 40)
                 b->Whisper(WovPick(kWovRnSumAsk), LANG_UNIVERSAL, helper);
             b->TeleportTo(s.map, s.x + frand(-1.5f, 1.5f), s.y + frand(-1.5f, 1.5f), s.z + 0.5f, frand(0.0f, 6.28f));
