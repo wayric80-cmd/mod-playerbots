@@ -6842,6 +6842,57 @@ void WovTrain_Tick(time_t now)
 // Deathknell, was sent to the "big ruins" and to Undercity for a trainer, and told a mount costs 100g at 40; the
 // knowledge base was not retrieved for either). Called from the chat thread for replies to real players: reads only
 // the trainer table loaded at start and static game data.
+// wov 1/11: a real player asks a bot for a guild invite. A bot whose rank may invite really invites (queued, done on
+// the world thread); otherwise the chat facts say who can.
+bool WovIsGuildInvAsk(std::string m)
+{
+    std::transform(m.begin(), m.end(), m.begin(), ::tolower);
+    bool guild = m.find("guild") != std::string::npos || m.find("ginv") != std::string::npos || m.find("g inv") != std::string::npos;
+    bool ask = m.find("inv") != std::string::npos || m.find("join") != std::string::npos;
+    return guild && ask;
+}
+
+bool WovCanGuildInvite(Player* bot, Player* p)
+{
+    if (!bot || !p || !bot->GetGuildId() || p->GetGuildId() || bot->GetTeamId() != p->GetTeamId())
+        return false;
+    Guild* g = sGuildMgr->GetGuildById(bot->GetGuildId());
+    return g && (g->GetRankRights(bot->GetRank()) & GR_RIGHT_INVITE) == GR_RIGHT_INVITE;
+}
+
+std::mutex g_wovGuildInvMutex;
+std::vector<std::pair<uint32, uint32>> g_wovGuildInvQueue;  // (bot low, player low)
+
+void WovGuild_OnWhisper(Player* from, Player* to, std::string const& msg)
+{
+    if (!from || !to || sRandomPlayerbotMgr.IsRandomBot(from) || !sRandomPlayerbotMgr.IsRandomBot(to) || !WovIsGuildInvAsk(msg) ||
+        !WovCanGuildInvite(to, from))
+        return;
+    std::lock_guard<std::mutex> lock(g_wovGuildInvMutex);
+    g_wovGuildInvQueue.emplace_back(to->GetGUID().GetCounter(), from->GetGUID().GetCounter());
+}
+
+void WovGuildInv_Tick()
+{
+    std::vector<std::pair<uint32, uint32>> q;
+    {
+        std::lock_guard<std::mutex> lock(g_wovGuildInvMutex);
+        q.swap(g_wovGuildInvQueue);
+    }
+    for (auto const& [b, pl] : q)
+    {
+        Player* bot = ObjectAccessor::FindPlayerByLowGUID(b);
+        Player* p = ObjectAccessor::FindPlayerByLowGUID(pl);
+        if (!WovCanGuildInvite(bot, p))
+            continue;
+        if (Guild* g = sGuildMgr->GetGuildById(bot->GetGuildId()))
+        {
+            g->HandleInviteMember(bot->GetSession(), p->GetName());
+            LOG_INFO("playerbots", "WoV guild: {} invites {} to {} (asked in a whisper)", bot->GetName(), p->GetName(), g->GetName());
+        }
+    }
+}
+
 std::string WovGameFacts(Player* bot, Player* asker, std::string const& msg)
 {
     if (!bot || !asker || msg.empty())
@@ -6941,6 +6992,26 @@ std::string WovGameFacts(Player* bot, Player* asker, std::string const& msg)
                 sPlayerbotAIConfig.useFastGroundMountAtMinLevel, r40 / 10000, std::max<uint32>(1, m40 / 10000));
         });
         out += riding;
+    }
+    if (WovIsGuildInvAsk(msg))
+    {
+        if (asker->GetGuildId())
+            out += asker->GetName() + " is already in a guild. ";
+        else if (!bot->GetGuildId())
+            out += "You are not in a guild, so you can not invite anyone to one. ";
+        else if (Guild* g = sGuildMgr->GetGuildById(bot->GetGuildId()))
+        {
+            std::string gm;
+            sCharacterCache->GetCharacterNameByGuid(g->GetLeaderGUID(), gm);
+            if (WovCanGuildInvite(bot, asker))
+                out += "Your rank in " + g->GetName() + " may invite, and the game sends " + asker->GetName() +
+                       " the guild invite as you answer. ";
+            else if (bot->GetTeamId() != asker->GetTeamId())
+                out += asker->GetName() + " is from the other faction and can not join your guild. ";
+            else
+                out += "Your rank in " + g->GetName() + " can not invite: only the officers and the guild master" +
+                       (gm.empty() ? std::string() : " (" + gm + ")") + " can, so tell them to ask one of them. ";
+        }
     }
     if (out.empty())
         return "";
@@ -7275,6 +7346,7 @@ void RandomPlayerbotMgr::UpdateAIInternal(uint32 /*elapsed*/, bool /*minimal*/)
     WovRegearBracket_Tick(time(nullptr));  // wov: one fresh set per level bracket
     WovMarket_Tick(time(nullptr));  // wov: market
     WovTrain_Tick(time(nullptr));   // wov: trainer
+    WovGuildInv_Tick();             // wov: guild invites asked for in whispers
     WovCraft_Tick(time(nullptr));  // wov: crafting orders
 
     /*if (sPlayerbotAIConfig.enablePrototypePerformanceDiff)
