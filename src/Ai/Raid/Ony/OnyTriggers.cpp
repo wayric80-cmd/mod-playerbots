@@ -11,13 +11,37 @@
 #include "PlayerbotAI.h"
 #include "Playerbots.h"
 
+#include <mutex>
+#include <unordered_map>
+
+// wov: the flames of a Deep Breath sweep the room after the cast has ended, and bots went straight back to the
+// whelps in its path (31/10: tanks died 40-55 yd in front of her). The breath is remembered per instance and the
+// bots stay in the safe zone for kWovBreathHold seconds after the cast.
+namespace
+{
+std::mutex g_wovBreathMx;
+std::unordered_map<uint32, std::pair<uint32, time_t>> g_wovBreath;  // instance -> (breath spell, last seen casting)
+time_t const kWovBreathHold = 6;
+}
+
+uint32 WovOnyRecentBreath(Unit* boss)
+{
+    if (!boss || !boss->GetMap())
+        return 0;
+    std::lock_guard<std::mutex> lk(g_wovBreathMx);
+    auto it = g_wovBreath.find(boss->GetMap()->GetInstanceId());
+    return it != g_wovBreath.end() && time(nullptr) <= it->second.second + kWovBreathHold ? it->second.first : 0;
+}
+
 OnyxiaDeepBreathTrigger::OnyxiaDeepBreathTrigger(PlayerbotAI* botAI) : Trigger(botAI, "ony deep breath warning") {}
 
 bool OnyxiaDeepBreathTrigger::IsActive()
 {
     Unit* boss = AI_VALUE2(Unit*, "find target", "onyxia");
-    if (!boss || !boss->HasUnitState(UNIT_STATE_CASTING))
+    if (!boss)
         return false;
+    if (!boss->HasUnitState(UNIT_STATE_CASTING))
+        return WovOnyRecentBreath(boss) != 0;
 
     // Check if Onyxia is casting
     Spell* currentSpell = boss->GetCurrentSpell(CURRENT_GENERIC_SPELL);
@@ -37,6 +61,8 @@ bool OnyxiaDeepBreathTrigger::IsActive()
         spellId == 18617     // Northeast to Southwest
     )
     {
+        std::lock_guard<std::mutex> lk(g_wovBreathMx);
+        g_wovBreath[boss->GetMap()->GetInstanceId()] = {spellId, time(nullptr)};
         return true;
     }
 

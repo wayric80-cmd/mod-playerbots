@@ -46,14 +46,11 @@ bool ReviveFromCorpseAction::Execute(Event event)
     if (!corpse)
         return false;
 
-    // wov: in a raid the dead wait while the others still fight the boss (getting up at the body in the middle
-    // of it only meant dying again; on 28/10 that went on for hours). After the fight or the wipe they get up.
+    // wov: a raider never gets up at its body by itself (in the middle of the boss or the pack that killed it, on
+    // half health and mana: on 28/10 that went on for hours, on 31/10 it wiped raids again within minutes). The raid
+    // (wov: raid nights) brings the dead to the entrance or the main tank and raises them there.
     if (WovBotReserved(bot->GetGUID().GetCounter()) && bot->GetMap() && bot->GetMap()->IsRaid())
-        if (Group* g = bot->GetGroup())
-            for (GroupReference* ref = g->GetFirstMember(); ref; ref = ref->next())
-                if (Player* m = ref->GetSource())
-                    if (m != bot && m->IsInWorld() && m->IsAlive() && m->IsInCombat() && m->GetMap() == bot->GetMap())
-                        return false;
+        return false;
 
     // if (corpse->GetGhostTime() + bot->GetCorpseReclaimDelay(corpse->GetType() == CORPSE_RESURRECTABLE_PVP) >
     // time(nullptr))
@@ -91,6 +88,9 @@ bool ReviveFromCorpseAction::Execute(Event event)
 bool FindCorpseAction::Execute(Event /*event*/)
 {
     if (bot->InBattleground())
+        return false;
+    // wov: a raider's ghost inside the raid waits; the raid raises it (see ReviveFromCorpseAction)
+    if (WovBotReserved(bot->GetGUID().GetCounter()) && bot->GetMap() && bot->GetMap()->IsRaid())
         return false;
 
     Player* groupLeader = botAI->GetGroupLeader();

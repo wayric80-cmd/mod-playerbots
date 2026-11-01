@@ -68,17 +68,21 @@ bool RaidOnyxiaSpreadOutAction::Execute(Event /*event*/)
     return MoveFromGroup(9.0f);  // move 9 yards
 }
 
+uint32 WovOnyRecentBreath(Unit* boss);  // wov: OnyTriggers.cpp
+
 bool RaidOnyxiaMoveToSafeZoneAction::Execute(Event /*event*/)
 {
     Unit* boss = AI_VALUE2(Unit*, "find target", "onyxia");
     if (!boss)
         return false;
 
+    // wov: also right after the cast, while the flames still sweep the room
     Spell* currentSpell = boss->GetCurrentSpell(CURRENT_GENERIC_SPELL);
-    if (!currentSpell || !currentSpell->m_spellInfo)
+    uint32 spellId = currentSpell && currentSpell->m_spellInfo ? currentSpell->m_spellInfo->Id : 0;
+    if (uint32 recent = WovOnyRecentBreath(boss); recent && (!spellId || spellId == recent))
+        spellId = recent;
+    if (!spellId)
         return false;
-
-    uint32 spellId = currentSpell->m_spellInfo->Id;
 
     std::vector<SafeZone> safeZones = GetSafeZonesForBreath(spellId);
     if (safeZones.empty())
@@ -102,7 +106,14 @@ bool RaidOnyxiaMoveToSafeZoneAction::Execute(Event /*event*/)
         return false;
 
     if (bot->IsWithinDist2d(bestZone->pos.GetPositionX(), bestZone->pos.GetPositionY(), bestZone->radius))
+    {
+        if (WovOnyRecentBreath(boss))  // wov: hold here (no running back to the whelps) until the breath is over
+        {
+            bot->AttackStop();
+            return true;
+        }
         return false;  // Already safe
+    }
 
     // Stop channeling spell first
     bot->AttackStop();

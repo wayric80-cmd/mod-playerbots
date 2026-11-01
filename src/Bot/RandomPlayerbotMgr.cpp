@@ -3290,6 +3290,7 @@ struct WovRaid
     std::deque<time_t> deaths;        // raid deaths the last minutes: many of them is a wipe, even if a few live
     time_t onyT = 0;                  // wov: Onyxia probe, last status line
     bool onyFight = false;            // wov: Onyxia probe, she was in combat at the last look
+    time_t calmT = 0, buffT = 0;      // wov: after a wipe - nobody fighting since, buffing since
 };
 std::vector<WovRaid> g_wovRaids;
 std::unordered_map<uint32, time_t> g_wovRaidLast;  // guild -> last raid start
@@ -3309,6 +3310,8 @@ char const* const kWovRnSumAsk[] = {"sum pls", "can i get a sum?", "sum plz", "a
 char const* const kWovRnSumThx[] = {"ty for sum", "thx lock", "ty", "thanks for the sum"};
 char const* const kWovRnGo[] = {"ok everyone in, lets go", "zone in", "all here, buffs and go", "going in, follow the MT"};
 char const* const kWovRnWipe[] = {"wipe, run back", "run back pls", "ok again, focus", "rez up and lets go again"};
+char const* const kWovRnRebuff[] = {"everyone up? rebuff and drink", "buffs pls, pulling in a min", "drink up, rebuff, then we go",
+                                    "full mana then we go again"};
 char const* const kWovRnEnd[] = {"gg all, good raid tonight", "thanks all, same time next week", "gj everyone",
                                    "gg, see you next raid"};
 char const* const kWovRnCallIt[] = {"ok calling it for tonight, ty all", "thats it for tonight, gj everyone",
@@ -3525,6 +3528,10 @@ void WovRaidEnd(WovRaid& r, char const* why, bool guildBye, char const* const* l
     LOG_INFO("playerbots", "WoV raid #{} <{}> {}: {} ({} min, {} wipes)", r.id, r.gname, WovRaidTag(r), why, (time(nullptr) - r.start) / 60, r.wipes);
 }
 
+// wov: the run back. Nobody gets up where they died: on 31/10 bodies were raised in place, on half health and
+// mana, in the middle of the Firelords and Lava Spawns that had just killed them, pulled them again and wiped the
+// raid two more times within minutes. The body (or the ghost outside) is first brought to the entrance, then it
+// gets up there with full health and mana, as after a run back and a drink.
 void WovRaidRunBack(WovRaid const& r, Player* b)
 {
     WovDgSpot const& s = WovRaidSpot(r);
@@ -3535,8 +3542,16 @@ void WovRaidRunBack(WovRaid const& r, Player* b)
         b->TeleportTo(s.dmap, s.dx + frand(-2.0f, 2.0f), s.dy + frand(-2.0f, 2.0f), s.dz, s.dO);
         return;
     }
-    b->ResurrectPlayer(0.5f);
+    if (b->GetExactDist2d(s.dx, s.dy) > 30.0f)
+    {
+        b->CombatStop(true);
+        b->NearTeleportTo(s.dx + frand(-2.0f, 2.0f), s.dy + frand(-2.0f, 2.0f), s.dz, s.dO);
+        return;
+    }
+    b->ResurrectPlayer(1.0f);
     b->SpawnCorpseBones();
+    if (b->getPowerType() == POWER_MANA)
+        b->SetPower(POWER_MANA, b->GetMaxPower(POWER_MANA));
 }
 
 // ---- wov: raid loot rules ---------------------------------------------------------------------------------------
@@ -4106,6 +4121,11 @@ bool WovRaidStart(uint32 guild, time_t now, uint8 d)
     // raid pugs them even when the guild has the numbers.
     bool ony = D.map == 249;
     uint32 needTank = ony ? 3 : 2, needHeal = ony ? 8 : 0;
+    // wov: Onyxia also needs the numbers: 38 killed her on 31/10, 33 and 20-27 wiped. Pugs fill to 36, and she is
+    // not tried with fewer than 30 (the guild goes to MC instead)
+    uint32 const onyMin = 30;
+    if (ony)
+        pugTo = std::min<uint32>(cap, std::max<uint32>(pugTo, 36));
     bool roleShort = ony && (tanks.size() < needTank || heals.size() + hyb.size() < needHeal);
     if (have >= std::max<uint32>(5, g_wovRaidMin / 3) && (have < pugTo || roleShort) && !tanks.empty())  // a small guild pugs the rest
     {
@@ -4176,6 +4196,11 @@ bool WovRaidStart(uint32 guild, time_t now, uint8 d)
     {
         LOG_INFO("playerbots", "WoV raid <{}>: not enough tanks or healers for Ony tonight ({} tanks, {} healers, needs {} and {})", gname,
                  tanks.size(), heals.size() + hyb.size(), needTank, needHeal);
+        return false;
+    }
+    if (ony && total >= g_wovRaidMin && total < onyMin)
+    {
+        LOG_INFO("playerbots", "WoV raid <{}>: not enough people for Ony tonight ({} with the attunement, needs {})", gname, total, onyMin);
         return false;
     }
     if (total < g_wovRaidMin || tanks.size() < 2)
@@ -4659,29 +4684,75 @@ bool WovRaidStep(WovRaid& r, time_t now)
             for (Player* b : ps)
                 WovRaidRunBack(r, b);
             r.rezT = now;
+            r.calmT = r.buffT = 0;
+            mai->DoSpecificAction("dc pause", Event("wov", "pause", nullptr), true);  // the MT holds until all are up
             r.phaseT = now;
             WovRaidSay(r, WovPick(kWovRnWipe), false);
             LOG_INFO("playerbots", "WoV raid #{} <{}> {}: wipe {} (most of the raid died within 5 min), running back", r.id, r.gname, WovRaidTag(r), r.wipes);
             return true;
         }
-        if (r.rezT && now >= r.rezT + 30)  // back up after the run back: drink, buff, again
+        // wov: after a wipe everyone gathers at the entrance and gets up there. The raid goes again only when
+        // nobody has been in combat for 30 s (the pack that killed them has reset), at least 90 s after the wipe,
+        // everyone is up, and 45 s of drinking and buffing have passed. After 5 min it goes with whoever is up.
+        if (r.rezT)
         {
-            r.rezT = 0;
+            uint32 dead = 0, fighting = 0;
             for (Player* b : ps)
+            {
                 WovRaidRunBack(r, b);
-            for (Player* b : ps)
-                if (b->IsAlive())
-                {
-                    b->SetFullHealth();
-                    if (b->getPowerType() == POWER_MANA)
-                        b->SetPower(POWER_MANA, b->GetMaxPower(POWER_MANA));
-                }
-            mai->DoSpecificAction("dc on", Event("wov", "", nullptr), true);
-            r.moveT = 0;
+                if (!b->IsAlive())
+                    ++dead;
+                else if (b->GetMapId() == s.dmap && b->IsInCombat())
+                    ++fighting;
+                else if (b->GetMapId() == s.dmap && !b->IsBeingTeleported() && b->GetExactDist2d(s.dx, s.dy) > 40.0f)
+                    b->NearTeleportTo(s.dx + frand(-3.0f, 3.0f), s.dy + frand(-3.0f, 3.0f), s.dz, s.dO);  // got up somewhere else
+                else if (b->GetMapId() != s.dmap && !b->IsBeingTeleported() && !b->IsInCombat())
+                    b->TeleportTo(s.dmap, s.dx + frand(-3.0f, 3.0f), s.dy + frand(-3.0f, 3.0f), s.dz, s.dO);  // got up outside
+            }
+            if (fighting)
+                r.calmT = 0;
+            else if (!r.calmT)
+                r.calmT = now;
+            bool ready = !dead && r.calmT && now >= r.calmT + 30 && now >= r.rezT + 90;
+            bool late = now >= r.rezT + 5 * MINUTE && !fighting;
+            if ((ready || late) && !r.buffT)
+            {
+                r.buffT = now;
+                for (Player* b : ps)
+                    if (b->IsAlive())
+                    {
+                        b->SetFullHealth();
+                        if (b->getPowerType() == POWER_MANA)
+                            b->SetPower(POWER_MANA, b->GetMaxPower(POWER_MANA));
+                    }
+                WovRaidSay(r, WovPick(kWovRnRebuff), false);
+                LOG_INFO("playerbots", "WoV raid #{} <{}> {}: after wipe {} everyone at the entrance after {} s ({} still dead), buffing", r.id,
+                         r.gname, WovRaidTag(r), r.wipes, now - r.rezT, dead);
+            }
+            if (r.buffT && now >= r.buffT + 45 && !fighting)
+            {
+                for (Player* b : ps)
+                    if (b->IsAlive())
+                    {
+                        b->SetFullHealth();
+                        if (b->getPowerType() == POWER_MANA)
+                            b->SetPower(POWER_MANA, b->GetMaxPower(POWER_MANA));
+                    }
+                LOG_INFO("playerbots", "WoV raid #{} <{}> {}: going again after wipe {} ({} s after it, {}/{} up)", r.id, r.gname, WovRaidTag(r),
+                         r.wipes, now - r.rezT, ps.size() - dead, ps.size());
+                r.rezT = r.buffT = r.calmT = 0;
+                r.deaths.clear();
+                for (Player* b : ps)
+                    r.wasAlive[b->GetGUID().GetCounter()] = b->IsAlive();
+                mai->DoSpecificAction("dc on", Event("wov", "", nullptr), true);
+                r.moveT = 0;
+                r.phaseT = now;
+            }
+            return true;
         }
         if (!anyAlive)
         {
-            if (now > r.phaseT + 3 * MINUTE)
+            if (now > r.phaseT + 3 * MINUTE)  // (the run back above handles a raid that is getting up)
             {
                 r.deaths.clear();
                 if (++r.wipes > 2)
@@ -4692,6 +4763,8 @@ bool WovRaidStep(WovRaid& r, time_t now)
                 for (Player* b : ps)
                     WovRaidRunBack(r, b);
                 r.rezT = now;
+                r.calmT = r.buffT = 0;
+                mai->DoSpecificAction("dc pause", Event("wov", "pause", nullptr), true);
                 r.phaseT = now;
                 WovRaidSay(r, WovPick(kWovRnWipe), false);
                 LOG_INFO("playerbots", "WoV raid #{} <{}> {}: wipe {}, running back", r.id, r.gname, WovRaidTag(r), r.wipes);
