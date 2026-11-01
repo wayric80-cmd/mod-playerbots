@@ -1822,7 +1822,9 @@ void WovHandleChat(WovChatEvt const& e, time_t now)
     }
     else if (!p->GetGroup() && WovDgStartForPlayer(p, dg->name, now))
         LOG_INFO("playerbots", "WoV together: {} LFG {} -> a dungeon run takes them", p->GetName(), dg->name);
-    else if (!p->GetGroup())
+    // wov 1/11: no more hand-over groups (a bot gathers four and gives the real player the lead): inside, nobody led
+    // and the tank stood still. No run for the LFG = nobody answers, as on a quiet server.
+    else if (false && !p->GetGroup())
     {
         for (Player* bot : cands)
         {
@@ -2580,17 +2582,15 @@ bool WovDgStartForPlayer(Player* p, char const* dgName, time_t now)
             continue;
         if (sp.def->team >= 0 && int(p->GetTeamId()) != sp.def->team)
             continue;
-        bool taken = false;
-        for (WovDgRunState const& o : g_wovDgRuns)
-            taken = taken || o.spot == &sp;
-        if (!taken)
-        {
-            spot = &sp;
-            break;
-        }
+        spot = &sp;  // another party on its way to the same stone does not matter for a real player's group
+        break;
     }
     if (!spot || !WovDgFits(p, spot->def, p->GetLevel()))
+    {
+        LOG_INFO("playerbots", "WoV dungeon runs: no run for {}'s LFG {} ({})", p->GetName(), dgName,
+                 !spot ? "no entrance on this continent" : "level does not fit");
         return false;
+    }
     std::vector<std::pair<float, Player*>> cands;
     for (auto const& [g, b] : sRandomPlayerbotMgr.GetAllBots())
     {
