@@ -6838,6 +6838,116 @@ void WovTrain_Tick(time_t now)
 // ---- end wov: trainer -------------------------------------------------------------------------------------
 }  // namespace
 
+// wov 1/11: true answers from the game for questions the chat model got wrong (the operator, as a new undead rogue in
+// Deathknell, was sent to the "big ruins" and to Undercity for a trainer, and told a mount costs 100g at 40; the
+// knowledge base was not retrieved for either). Called from the chat thread for replies to real players: reads only
+// the trainer table loaded at start and static game data.
+std::string WovGameFacts(Player* bot, Player* asker, std::string const& msg)
+{
+    if (!bot || !asker || msg.empty())
+        return "";
+    std::string m = msg;
+    std::transform(m.begin(), m.end(), m.begin(), ::tolower);
+    auto has = [&](char const* w) { return m.find(w) != std::string::npos; };
+    std::string out;
+    auto placeOf = [&](uint32 map, float x, float y, float z) {
+        uint32 area = sMapMgr->GetAreaId(PHASEMASK_NORMAL, map, x, y, z);
+        uint32 zone = sMapMgr->GetZoneId(PHASEMASK_NORMAL, map, x, y, z);
+        AreaTableEntry const* a = sAreaTableStore.LookupEntry(area);
+        AreaTableEntry const* zz = sAreaTableStore.LookupEntry(zone);
+        std::string s = a ? a->area_name[0] : "";
+        if (zz && zz != a)
+            s += std::string(s.empty() ? "" : ", ") + zz->area_name[0];
+        return s;
+    };
+    if ((has("trainer") || has("train ")) && !g_wovTrainers.empty())
+    {
+        static std::pair<char const*, uint16> const profs[] = {
+            {"mining", SKILL_MINING}, {"herbalis", SKILL_HERBALISM}, {"skinning", SKILL_SKINNING}, {"tailor", SKILL_TAILORING},
+            {"leatherwork", SKILL_LEATHERWORKING}, {"blacksmith", SKILL_BLACKSMITHING}, {"alchem", SKILL_ALCHEMY},
+            {"enchant", SKILL_ENCHANTING}, {"engineer", SKILL_ENGINEERING}};
+        static std::pair<char const*, uint8> const classes[] = {
+            {"warrior", CLASS_WARRIOR}, {"paladin", CLASS_PALADIN}, {"hunter", CLASS_HUNTER}, {"rogue", CLASS_ROGUE},
+            {"priest", CLASS_PRIEST}, {"shaman", CLASS_SHAMAN}, {"mage", CLASS_MAGE}, {"warlock", CLASS_WARLOCK},
+            {"druid", CLASS_DRUID}};
+        std::vector<WovTrainerSpawn> const* list = nullptr;
+        std::string what;
+        for (auto const& [w, sk] : profs)
+            if (has(w))
+            {
+                auto it = g_wovProfTrainers.find(sk);
+                if (it != g_wovProfTrainers.end())
+                {
+                    list = &it->second;
+                    what = w;
+                    what = what == "herbalis" ? "herbalism" : what == "tailor" ? "tailoring" : what == "leatherwork" ? "leatherworking"
+                         : what == "blacksmith" ? "blacksmithing" : what == "alchem" ? "alchemy" : what == "enchant" ? "enchanting"
+                         : what == "engineer" ? "engineering" : what;
+                }
+                break;
+            }
+        if (has("riding") || has("mount"))
+        {
+            list = &g_wovRidingTrainers;
+            what = "riding";
+        }
+        if (!list)
+        {
+            uint8 cls = asker->getClass();
+            for (auto const& [w, c] : classes)
+                if (has(w))
+                    cls = c;
+            auto it = g_wovTrainers.find(cls);
+            if (it != g_wovTrainers.end())
+                list = &it->second;
+            for (auto const& [w, c] : classes)
+                if (c == cls)
+                    what = w;
+        }
+        float d = 0;
+        WovTrainerSpawn const* sp = list ? WovNearestTrainer(asker, *list, d) : nullptr;
+        if (sp)
+        {
+            CreatureTemplate const* ct = sObjectMgr->GetCreatureTemplate(sp->entry);
+            std::string where = placeOf(sp->map, sp->x, sp->y, sp->z);
+            out += Acore::StringFormat("The nearest {} trainer for {} is {}{}{}, about {:.0f} yards from {} (where {} is now: {}). ",
+                                       what, asker->GetName(), ct ? ct->Name : "a trainer", where.empty() ? "" : " in ", where, d,
+                                       asker->GetName(), asker->GetName(), placeOf(asker->GetMapId(), asker->GetPositionX(),
+                                                                                  asker->GetPositionY(), asker->GetPositionZ()));
+        }
+    }
+    if (has("mount") || has("riding") || has("ride"))
+    {
+        static std::string riding;
+        static std::once_flag once;
+        std::call_once(once, [] {
+            uint32 r20 = 40000, r40 = 500000, m20 = 10000, m40 = 100000;
+            if (QueryResult q = WorldDatabase.Query("SELECT SpellId, MAX(MoneyCost) FROM trainer_spell WHERE SpellId IN (33388, 33391) GROUP BY SpellId"))
+                do
+                {
+                    Field* f = q->Fetch();
+                    (f[0].Get<uint32>() == 33388 ? r20 : r40) = f[1].Get<uint32>();
+                } while (q->NextRow());
+            if (QueryResult q = WorldDatabase.Query("SELECT entry, BuyPrice FROM item_template WHERE entry IN (5656, 18796)"))
+                do
+                {
+                    Field* f = q->Fetch();
+                    (f[0].Get<uint32>() == 5656 ? m20 : m40) = f[1].Get<uint32>();
+                } while (q->NextRow());
+            riding = Acore::StringFormat(
+                "Riding on this server: at level {} you learn Apprentice Riding for {} gold at your race's riding trainer and buy a "
+                "normal mount next to it for about {} gold; at level {} Journeyman Riding costs {} gold and an epic mount about {} gold. ",
+                sPlayerbotAIConfig.useGroundMountAtMinLevel, r20 / 10000, std::max<uint32>(1, m20 / 10000),
+                sPlayerbotAIConfig.useFastGroundMountAtMinLevel, r40 / 10000, std::max<uint32>(1, m40 / 10000));
+        });
+        out += riding;
+    }
+    if (out.empty())
+        return "";
+    return "\nTrue facts from the game for this answer (use them in your own words, do not contradict them): " + out + "\n";
+}
+
+
 // Median buyout of one item in this faction's auction house right now (0 when nobody sells it).
 uint32 WovMarketPriceOf(uint32 entry, TeamId team)
 {
