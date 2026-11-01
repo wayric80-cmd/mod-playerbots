@@ -7012,8 +7012,15 @@ std::string WovGameFacts(Player* bot, Player* asker, std::string const& msg)
                     else
                         officers += (officers.empty() ? "" : ", ") + n;
                 } while (q->NextRow());
-            out += Acore::StringFormat("Your guild {}: the guild master is {}; officers: {}. Only they can invite people. ", g->GetName(),
-                                       gmName.empty() ? "unknown" : gmName, officers.empty() ? "none" : officers);
+            std::string inviters;  // which ranks may invite, as the guild master set it (Zugzug opened it to members 1/11)
+            if (QueryResult q = CharacterDatabase.Query("SELECT rname FROM guild_rank WHERE guildid = {} AND (rights & {}) = {} ORDER BY rid",
+                                                        g->GetId(), uint32(GR_RIGHT_INVITE), uint32(GR_RIGHT_INVITE)))
+                do
+                    inviters += (inviters.empty() ? "" : ", ") + q->Fetch()[0].Get<std::string>();
+                while (q->NextRow());
+            out += Acore::StringFormat("Your guild {}: the guild master is {}; officers: {}. Ranks that may invite people: {}. ", g->GetName(),
+                                       gmName.empty() ? "unknown" : gmName, officers.empty() ? "none" : officers,
+                                       inviters.empty() ? "none" : inviters);
         }
     if (WovIsGuildInvAsk(msg))
     {
@@ -7031,8 +7038,8 @@ std::string WovGameFacts(Player* bot, Player* asker, std::string const& msg)
             else if (bot->GetTeamId() != asker->GetTeamId())
                 out += asker->GetName() + " is from the other faction and can not join your guild. ";
             else
-                out += "Your rank in " + g->GetName() + " can not invite: only the officers and the guild master" +
-                       (gm.empty() ? std::string() : " (" + gm + ")") + " can, so tell them to ask one of them. ";
+                out += "Your rank in " + g->GetName() + " can not invite; the guild master" + (gm.empty() ? std::string() : " (" + gm + ")") +
+                       " and the ranks above yours can, so tell them to ask one of them. ";
         }
     }
     if (out.empty())
