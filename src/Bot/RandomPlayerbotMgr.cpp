@@ -6993,6 +6993,28 @@ std::string WovGameFacts(Player* bot, Player* asker, std::string const& msg)
         });
         out += riding;
     }
+    // wov 1/11: who runs the guild (Zarre asked guild chat who the guild master is and got no name, then "what?")
+    bool sameGuild = bot->GetGuildId() && bot->GetGuildId() == asker->GetGuildId();
+    if (bot->GetGuildId() && (has("guild master") || has("guildmaster") || has(" gm") || m.rfind("gm", 0) == 0 || has("officer") ||
+                              has("leader") || has("who runs") || (sameGuild && (has("name") || has("who is") || has("whos")))))
+        if (Guild* g = sGuildMgr->GetGuildById(bot->GetGuildId()))
+        {
+            std::string gmName, officers;
+            if (QueryResult q = CharacterDatabase.Query(
+                    "SELECT c.name, gm.rank, c.online FROM guild_member gm JOIN characters c ON c.guid = gm.guid "
+                    "WHERE gm.guildid = {} AND gm.rank <= 1 ORDER BY gm.rank, c.name LIMIT 6", g->GetId()))
+                do
+                {
+                    Field* f = q->Fetch();
+                    std::string n = f[0].Get<std::string>() + (f[2].Get<uint8>() ? " (online)" : " (offline)");
+                    if (f[1].Get<uint8>() == 0)
+                        gmName = n;
+                    else
+                        officers += (officers.empty() ? "" : ", ") + n;
+                } while (q->NextRow());
+            out += Acore::StringFormat("Your guild {}: the guild master is {}; officers: {}. Only they can invite people. ", g->GetName(),
+                                       gmName.empty() ? "unknown" : gmName, officers.empty() ? "none" : officers);
+        }
     if (WovIsGuildInvAsk(msg))
     {
         if (asker->GetGuildId())
