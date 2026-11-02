@@ -2497,6 +2497,22 @@ bool WovDgStart(time_t now)
         if (b && b->IsInWorld() && b->GetLevel() >= 13 && WovDgFree(b, b->GetTeamId(), now) && WovDgCanTank(b))
             tanks.push_back(b);
     std::shuffle(tanks.begin(), tanks.end(), std::mt19937(std::random_device{}()));
+    // wov 2/11: tanks in a zone where a real player without a group is around their level go first, so the LF1M they
+    // post is seen (General is per zone) - the operator saw very few LF1M
+    {
+        std::vector<std::tuple<uint32, uint32, uint8>> reals;  // zone, team, level
+        for (auto const& [id, sess] : sWorldSessionMgr->GetAllSessions())
+            if (Player* p = sess ? sess->GetPlayer() : nullptr)
+                if (p->IsInWorld() && WovIsReal(p) && !p->GetGroup())
+                    reals.emplace_back(p->GetZoneId(), uint32(p->GetTeamId()), p->GetLevel());
+        if (!reals.empty())
+            std::stable_partition(tanks.begin(), tanks.end(), [&](Player* t) {
+                for (auto const& [z, tm, lv] : reals)
+                    if (t->GetZoneId() == z && uint32(t->GetTeamId()) == tm && std::abs(int(t->GetLevel()) - int(lv)) <= 5)
+                        return true;
+                return false;
+            });
+    }
     uint32 nSpot = 0, nHeal = 0, nDps = 0;
     for (Player* t : tanks)
     {
@@ -2795,8 +2811,7 @@ void WovDgPostLfm(WovDgRunState& r, Player* tank, time_t now)
         if (!p || !WovIsReal(p) || !p->IsInWorld() || p->GetGroup() || p->GetTeamId() != tank->GetTeamId() ||
             p->GetZoneId() != tank->GetZoneId())
             continue;
-        if (p->GetLevel() < r.spot->def->minL || p->GetLevel() > r.spot->def->maxL ||
-            std::abs(int(p->GetLevel()) - int(tank->GetLevel())) > 5)
+        if (p->GetLevel() < r.spot->def->minL || p->GetLevel() > r.spot->def->maxL)  // wov 2/11: the dungeon fits them
             continue;
         any = true;
         break;
