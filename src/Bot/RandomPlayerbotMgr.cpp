@@ -2336,6 +2336,10 @@ void WovDgConfig(time_t now)
             do
                 g_wovDgFinal.insert(r->Fetch()[0].Get<uint32>());
             while (r->NextRow());
+        // wov 2/11: the dungeon finder ends Ragefire Chasm at Taragaman (11520), so a run stopped there and the group broke
+        // up with Jergosh and Bazzalan still alive. A Classic group clears to Bazzalan (11519).
+        g_wovDgFinal.erase(11520);
+        g_wovDgFinal.insert(11519);
         LOG_INFO("playerbots", "WoV dungeon runs: {} entrances, {} last bosses", g_wovDgSpots.size(), g_wovDgFinal.size());
     }
 }
