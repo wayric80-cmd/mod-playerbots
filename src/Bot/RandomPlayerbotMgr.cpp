@@ -646,7 +646,18 @@ uint32 WovRecruit(WovSkirmish& s, TeamId team, uint32 want)
         static std::map<std::pair<uint32, uint32>, uint8> guildSaid;
         if (guildSaid.size() > 2000)
             guildSaid.clear();
-        if (ai && bot->GetGuild())
+        // wov 2/11: and only when a guildmate who is a real player could join: online, within ten levels
+        auto realMateNear = [](Player* b) {
+            for (auto const& [id, sess] : sWorldSessionMgr->GetAllSessions())
+            {
+                Player* p = sess ? sess->GetPlayer() : nullptr;
+                if (p && p->IsInWorld() && !sRandomPlayerbotMgr.IsRandomBot(p) && p->GetGuildId() == b->GetGuildId() &&
+                    std::abs(int(p->GetLevel()) - int(b->GetLevel())) <= 10)
+                    return true;
+            }
+            return false;
+        };
+        if (ai && bot->GetGuild() && realMateNear(bot))
         {
             uint8& n = guildSaid[{s.id, bot->GetGuildId()}];
             if (n == 0)
@@ -655,7 +666,7 @@ uint32 WovRecruit(WovSkirmish& s, TeamId team, uint32 want)
                                                             : WovFill(WovPick(kWovInvite), s.place, 0, WovOther(team)));
                 ++n;
             }
-            else if (n < 3 && urand(0, 99) < 50)
+            else if (n < 2 && urand(0, 99) < 50)
             {
                 ai->SayToGuild(WovPick(kWovOmw));
                 ++n;
