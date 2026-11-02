@@ -641,9 +641,26 @@ uint32 WovRecruit(WovSkirmish& s, TeamId team, uint32 want)
         if (!firstRecruit)
             firstRecruit = bot;
         PlayerbotAI* ai = GET_PLAYERBOT_AI(bot);
-        if (ai && bot->GetGuild() && urand(0, 99) < 30)
-            ai->SayToGuild(s.raid && team == s.raidTeam && got == 1 ? WovFill(WovPick(kWovRaidCall), s.place, 0, WovOther(team))
-                                                                    : std::string(WovPick(kWovOmw)));
+        // wov 1/11: guild chat got thirty "omw" a morning with no call before them. Per fight and guild: the first
+        // one says where it is going and why, at most two others answer, everyone else just goes.
+        static std::map<std::pair<uint32, uint32>, uint8> guildSaid;
+        if (guildSaid.size() > 2000)
+            guildSaid.clear();
+        if (ai && bot->GetGuild())
+        {
+            uint8& n = guildSaid[{s.id, bot->GetGuildId()}];
+            if (n == 0)
+            {
+                ai->SayToGuild(s.raid && team == s.raidTeam ? WovFill(WovPick(kWovRaidCall), s.place, 0, WovOther(team))
+                                                            : WovFill(WovPick(kWovInvite), s.place, 0, WovOther(team)));
+                ++n;
+            }
+            else if (n < 3 && urand(0, 99) < 50)
+            {
+                ai->SayToGuild(WovPick(kWovOmw));
+                ++n;
+            }
+        }
     }
     if (firstRecruit)
     {
