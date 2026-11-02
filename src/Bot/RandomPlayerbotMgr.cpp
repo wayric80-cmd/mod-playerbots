@@ -2909,6 +2909,15 @@ bool WovDgStep(WovDgRunState& r, time_t now)
         {
             Player* b = ps[i];
             WovDgMember& mm = r.m[i];
+            // wov 2/11: already inside the dungeon (it followed the real player in, who went ahead to wait): there, not
+            // "left the continent" (run #5 RFC broke up that way and threw the player out of the group)
+            if (b->GetMapId() == r.spot->dmap && b->IsAlive())
+            {
+                mm.flew = true;
+                mm.lastProgress = now;
+                ++here;
+                continue;
+            }
             if (b->GetMapId() != r.spot->map || b->InBattleground() || b->InBattlegroundQueue())
             {
                 WovDgRelease(r, std::string(b->GetName() + (b->InBattlegroundQueue() || b->InBattleground() ? " queued for a battleground" : " left the continent")).c_str(), false);
@@ -3019,7 +3028,7 @@ bool WovDgStep(WovDgRunState& r, time_t now)
             realIn = false;
         }
         // the party forms at the stone as people arrive
-        if (!r.tankThere && tank->GetExactDist(r.spot->mx, r.spot->my, r.spot->mz) <= 40.0f)
+        if (!r.tankThere && (tank->GetMapId() == r.spot->dmap || tank->GetExactDist(r.spot->mx, r.spot->my, r.spot->mz) <= 40.0f))
             r.tankThere = now;
         if (real && !r.realInvited && !real->GetGroup() && tank->GetExactDist(r.spot->mx, r.spot->my, r.spot->mz) <= 60.0f &&
             (!tank->GetGroup() || (tank->GetGroup()->IsLeader(tank->GetGUID()) && !tank->GetGroup()->IsFull())))
