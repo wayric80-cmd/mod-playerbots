@@ -2868,9 +2868,17 @@ bool WovDgStep(WovDgRunState& r, time_t now)
         real = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(r.real));
         realIn = real && tank->GetGroup() && tank->GetGroup()->IsMember(real->GetGUID());
         bool pending = !r.realInvited && r.phase == DG_GATHER;  // promised an invite at the stone, not sent yet
+        if (real && !realIn && real->IsInWorld() && !real->GetGroup() && r.realInvited && r.phase == DG_GATHER &&
+            now >= r.realT + 40 && now < r.realT + 50 && tank->GetGroup() && tank->GetGroup()->IsLeader(tank->GetGUID()) &&
+            !tank->GetGroup()->IsFull())
+        {
+            tank->Whisper(urand(0, 1) ? "sent inv again" : "inv again, didnt go through?", LANG_UNIVERSAL, real);  // wov 2/11
+            WovInviteFrom(tank, real);
+            LOG_INFO("playerbots", "WoV dungeon run #{} {}: invites {} again", r.id, r.spot->def->name, real->GetName());
+        }
         if (real && !real->IsInWorld() && realIn)
             ;  // between maps: still with us
-        else if (!real || (!realIn && (real->GetGroup() || (!pending && (r.phase != DG_GATHER || now > r.realT + 2 * MINUTE)))))
+        else if (!real || (!realIn && (real->GetGroup() || (!pending && (r.phase != DG_GATHER || now > r.realT + 4 * MINUTE)))))
         {
             LOG_INFO("playerbots", "WoV dungeon run #{} {}: the real player is no longer with the run", r.id, r.spot->def->name);
             r.real = 0;
@@ -5135,8 +5143,8 @@ void WovDungeonRun_Tick(time_t now)
     for (auto const& [bl, pl] : joins)
         for (WovDgRunState& r : g_wovDgRuns)
         {
-            if (r.phase != DG_GATHER || r.real || !r.lfmT || now > r.lfmT + 10 * MINUTE || r.m.empty() || r.m[0].low != bl ||
-                r.m.size() < 5)
+            // wov 2/11: a run of four (one made for a player who then did not take the invite) takes the answer too
+            if (r.phase != DG_GATHER || r.real || !r.lfmT || now > r.lfmT + 10 * MINUTE || r.m.empty() || r.m[0].low != bl)
                 continue;
             Player* tank = ObjectAccessor::FindPlayerByLowGUID(bl);
             Player* p = ObjectAccessor::FindPlayerByLowGUID(pl);
@@ -5146,12 +5154,14 @@ void WovDungeonRun_Tick(time_t now)
             // wov 31/10: the group is full from the start now; the last dps makes room below
             if (tank->GetGroup() && !tank->GetGroup()->IsLeader(tank->GetGUID()))
                 break;
-            // the last dps steps aside before the group is made; it goes back to its own business
-            uint32 drop = r.m.back().low;
-            r.m.pop_back();
+            // the last dps steps aside before the group is made; it goes back to its own business (a run of four
+            // already has the room)
+            uint32 drop = r.m.size() >= 5 ? r.m.back().low : 0;
+            if (drop)
+                r.m.pop_back();
             g_wovBusyBot.erase(drop);
             g_wovDgDropped[drop] = now + 20 * MINUTE;
-            if (Player* d = ObjectAccessor::FindPlayerByLowGUID(drop))
+            if (Player* d = drop ? ObjectAccessor::FindPlayerByLowGUID(drop) : nullptr)
                 if (PlayerbotAI* dai = GET_PLAYERBOT_AI(d))
                 {
                     if (Group* tg = tank->GetGroup())
