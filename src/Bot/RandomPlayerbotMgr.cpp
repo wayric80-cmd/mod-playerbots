@@ -2863,10 +2863,14 @@ bool WovDgStep(WovDgRunState& r, time_t now)
     bool realIn = false;  // in the tank's group
     if (r.real)
     {
-        real = ObjectAccessor::FindPlayerByLowGUID(r.real);
+        // wov 2/11: connected, in the world or not - a person on a loading screen (walking into the instance to wait)
+        // was taken for gone, and then kicked from the group as a stranger
+        real = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(r.real));
         realIn = real && tank->GetGroup() && tank->GetGroup()->IsMember(real->GetGUID());
         bool pending = !r.realInvited && r.phase == DG_GATHER;  // promised an invite at the stone, not sent yet
-        if (!real || (!realIn && (real->GetGroup() || (!pending && (r.phase != DG_GATHER || now > r.realT + 2 * MINUTE)))))
+        if (real && !real->IsInWorld() && realIn)
+            ;  // between maps: still with us
+        else if (!real || (!realIn && (real->GetGroup() || (!pending && (r.phase != DG_GATHER || now > r.realT + 2 * MINUTE)))))
         {
             LOG_INFO("playerbots", "WoV dungeon run #{} {}: the real player is no longer with the run", r.id, r.spot->def->name);
             r.real = 0;
@@ -2987,8 +2991,9 @@ bool WovDgStep(WovDgRunState& r, time_t now)
             LOG_INFO("playerbots", "WoV dungeon run #{} {} gathering:{}", r.id, r.spot->def->name, st);
         }
         WovDgPostLfm(r, tank, now);
-        if (real && realIn && real->IsInWorld() && real->IsAlive() && real->GetMapId() == r.spot->map &&
-            real->GetExactDist(r.spot->mx, r.spot->my, r.spot->mz) <= 60.0f)
+        if (real && realIn && real->IsInWorld() && real->IsAlive() &&
+            ((real->GetMapId() == r.spot->map && real->GetExactDist(r.spot->mx, r.spot->my, r.spot->mz) <= 60.0f) ||
+             real->GetMapId() == r.spot->dmap))  // wov 2/11: or already inside, waiting for the rest
             ++here;
         else if (real && r.tankThere && now > std::max(r.tankThere, r.realT) + 12 * MINUTE)
         {
