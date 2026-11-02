@@ -2549,7 +2549,7 @@ bool WovDgStart(time_t now)
                 !WovDgFree(b, t->GetTeamId(), now))
                 continue;
             float d = b->GetExactDist(best->x, best->y, best->z);
-            if (d > g_wovDgMemberRange)
+            if (d > g_wovDgMemberRange * 2.5f)
                 continue;
             if (b->GetGuildId() && b->GetGuildId() == t->GetGuildId())
                 d *= 0.5f;  // guildmates answer first
@@ -2641,8 +2641,9 @@ bool WovDgStartForPlayer(Player* p, char const* dgName, time_t now)
         if (!b || !b->IsInWorld() || b->GetMapId() != spot->map || !WovDgFits(b, spot->def, p->GetLevel()) ||
             !WovDgFree(b, p->GetTeamId(), now))
             continue;
+        // wov 2/11: for a real player's LFG the group may come from further away (same continent): they travel there
         float d = b->GetExactDist(spot->x, spot->y, spot->z);
-        if (d <= g_wovDgTankRange)
+        if (d <= g_wovDgTankRange * 2.5f)
             cands.push_back({d, b});
     }
     std::sort(cands.begin(), cands.end(), [](auto const& a, auto const& b) { return a.first < b.first; });
@@ -2654,7 +2655,7 @@ bool WovDgStartForPlayer(Player* p, char const* dgName, time_t now)
             tank = b;
     for (auto const& [d, b] : cands)
     {
-        if (b == tank || d > g_wovDgMemberRange || PlayerbotAI::IsTank(b, true))
+        if (b == tank || d > g_wovDgMemberRange * 2.5f || PlayerbotAI::IsTank(b, true))
             continue;
         if (!heal && WovDgCanHeal(b))
             heal = b;
@@ -2665,7 +2666,7 @@ bool WovDgStartForPlayer(Player* p, char const* dgName, time_t now)
         for (auto const& [d, b] : cands)
         {
             uint8 c = b->getClass();
-            if (b != tank && d <= g_wovDgMemberRange && (c == CLASS_PALADIN || c == CLASS_SHAMAN || c == CLASS_DRUID) &&
+            if (b != tank && d <= g_wovDgMemberRange * 2.5f && (c == CLASS_PALADIN || c == CLASS_SHAMAN || c == CLASS_DRUID) &&
                 std::find(dps.begin(), dps.end(), b) == dps.end() && !PlayerbotAI::IsTank(b, true))
             {
                 heal = b;

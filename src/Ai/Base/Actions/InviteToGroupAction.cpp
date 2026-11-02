@@ -297,6 +297,10 @@ bool JoinGroupAction::Execute(Event event)
 
 bool LfgAction::Execute(Event event)
 {
+    // wov 2/11: a real player's LFG is answered by a dungeon run (WovDgStartForPlayer), where the tank leads; this
+    // older answer (a random bot inviting them into its own group) made a second, leaderless path
+    if (sRandomPlayerbotMgr.IsRandomBot(bot))
+        return false;
     Player* requester = event.getOwner() ? event.getOwner() : GetMaster();
 
     if (bot->InBattleground())
