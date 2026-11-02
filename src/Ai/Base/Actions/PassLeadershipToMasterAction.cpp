@@ -9,6 +9,8 @@
 #include "PlayerbotOperations.h"
 #include "PlayerbotWorldThreadProcessor.h"
 
+bool WovBotReserved(uint32 low);  // wov: RandomPlayerbotMgr.cpp (dungeon runs, raid nights)
+
 bool PassLeadershipToMasterAction::Execute(Event /*event*/)
 {
     if (Player* master = GetMaster())
@@ -39,6 +41,10 @@ bool PassLeadershipToMasterAction::isUseful()
 
 bool GiveLeaderAction::isUseful()
 {
+    // wov 2/11: in a dungeon run or raid the bot tank leads and keeps the lead (it handed it to the real player after
+    // every pull - "give leader in dungeon" - and reset its own strategies each time)
+    if (WovBotReserved(bot->GetGUID().GetCounter()))
+        return false;
     return (IsRealPlayer(botAI->GetMaster()) || IsSelfBot(botAI->GetMaster())) && bot->GetGroup() &&
            bot->GetGroup()->IsLeader(bot->GetGUID());
 }
