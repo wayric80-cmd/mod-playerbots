@@ -63,6 +63,19 @@ bool SummonAction::Execute(Event /*event*/)
     if (!master)
         return false;
 
+    // wov 3/11: a random bot is not summoned across the world on a word ("summon"). It may still be pulled in
+    // when it stands at the entrance of the dungeon its leader went into, which is walking through the portal.
+    if (sRandomPlayerbotMgr.IsRandomBot(bot))
+    {
+        // the way out of the dungeon leads to its entrance outside: the bot has to stand near it
+        AreaTriggerTeleport const* out = master->GetMap() && master->GetMap()->IsDungeon()
+                                             ? sObjectMgr->GetGoBackTrigger(master->GetMapId())
+                                             : nullptr;
+        if (!out || bot->GetMapId() != out->target_mapId ||
+            bot->GetExactDist(out->target_X, out->target_Y, out->target_Z) > 100.0f)
+            return false;
+    }
+
     if (bot->GetPet())
         botAI->PetFollow();
 

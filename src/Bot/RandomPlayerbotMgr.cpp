@@ -8951,7 +8951,9 @@ bool RandomPlayerbotMgr::ProcessBot(Player* bot)
         {
             LOG_DEBUG("playerbots", "Bot #{} <{}>: teleport for level and refresh", botId, bot->GetName());
             Refresh(bot);
-            RandomTeleportForLevel(bot);
+            // wov 3/11: no jump to a new spot every 1-5 hours; a person walks, rides or flies to the next zone
+            if (!sConfigMgr->GetOption<bool>("AiPlayerbot.WoV.NoRandomTeleport", true))
+                RandomTeleportForLevel(bot);
             uint32 time = urand(sPlayerbotAIConfig.minRandomBotTeleportInterval,
                                 sPlayerbotAIConfig.maxRandomBotTeleportInterval);
             ScheduleTeleport(botId, time);
@@ -10575,7 +10577,8 @@ void RandomPlayerbotMgr::ChangeStrategyOnce(Player* player)
     if (frand(0.f, 100.f) > sPlayerbotAIConfig.randomBotRpgChance)  // select grind / pvp
     {
         LOG_INFO("playerbots", "Bot #{} <{}>: sent to grind spot", bot, player->GetName().c_str());
-        RandomTeleportForLevel(player);
+        if (!sConfigMgr->GetOption<bool>("AiPlayerbot.WoV.NoRandomTeleport", true))  // wov 3/11
+            RandomTeleportForLevel(player);
         Refresh(player);
     }
     else
