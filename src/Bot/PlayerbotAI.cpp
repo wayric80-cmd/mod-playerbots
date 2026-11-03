@@ -415,6 +415,8 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
     YieldThread(bot, GetReactDelay());
 }
 
+bool WovBotReserved(uint32 low);  // wov: RandomPlayerbotMgr.cpp (dungeon runs, raid nights)
+
 // Helper function for UpdateAI to check group membership and handle removal if necessary
 void PlayerbotAI::UpdateAIGroupMaster()
 {
@@ -447,6 +449,17 @@ void PlayerbotAI::UpdateAIGroupMaster()
     PlayerbotAI* masterBotAI = nullptr;
     if (master)
         masterBotAI = GET_PLAYERBOT_AI(master);
+
+    // wov 3/11: a run's bots do not take a real player as master (see FindNewMaster); the tank has none
+    if (master && !masterBotAI && sRandomPlayerbotMgr.IsRandomBot(bot) && !bot->InBattleground() &&
+        WovBotReserved(bot->GetGUID().GetCounter()))
+    {
+        Player* runLeader = FindNewMaster();
+        SetMaster(runLeader);
+        if (!runLeader)
+            ChangeStrategy("-follow", BOT_STATE_NON_COMBAT);
+        return;
+    }
 
     // Local patch (custom-wow, plans/31 §15 H1): re-searching for a bot whose master is already its own
     // group leader can only return that same leader, so it is pure waste on every tick.
@@ -4457,6 +4470,14 @@ bool IsAlliance(uint8 race)
 
 Player* PlayerbotAI::FindNewMaster()
 {
+    // wov 3/11: in a dungeon run or raid the bot tank leads and the others follow it, also with a real player in
+    // the group (who otherwise became everyone's master: the tank stood still until the player moved or attacked)
+    if (WovBotReserved(bot->GetGUID().GetCounter()) && !bot->InBattleground() && bot->GetGroup())
+    {
+        Player* leader = GetGroupLeader();
+        return (leader && leader != bot && GET_PLAYERBOT_AI(leader)) ? leader : nullptr;
+    }
+
     // Ideally we want to have the leader as master.
     Group* group = bot->GetGroup();
     // Only allow real players as masters unless in battleground.
