@@ -2330,6 +2330,15 @@ void WovDgConfig(time_t now)
             s.mx = s.x;
             s.my = s.y;
             s.mz = s.z;
+            // wov 3/11: the Wailing Caverns portal lies deep in the cave under the hill; the bots tried to reach it
+            // from the hill top and ran about up there. People meet at the cave mouth.
+            if (d.trigger == 228)
+            {
+                s.mx = -735.0f;
+                s.my = -2216.0f;
+                s.mz = 17.0f;
+                s.meetSet = true;
+            }
             g_wovDgSpots.push_back(s);
         }
         if (QueryResult r = WorldDatabase.Query("SELECT creditEntry FROM instance_encounters WHERE creditType=0 AND lastEncounterDungeon>0"))
