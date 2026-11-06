@@ -3446,9 +3446,6 @@ char const* const kWovRnPrepBoss[] = {"gg. loot, then buffs and drink if low, rc
 char const* const kWovRnMana[] = {"waiting on mana", "drink up, waiting on mana", "wait for mana pls"};
 char const* const kWovRnRc[] = {"ready check", "rc", "ready check pls", "ready check, answer pls"};
 char const* const kWovRnRcAgain[] = {"ok again, ready check", "rc again", "ready check again pls"};
-char const* const kWovRnRcYes[] = {"r", "rdy", "ready", "y", "yep", "r"};
-char const* const kWovRnRcWait[] = {"1 sec", "one sec", "gimme a sec", "1 min"};
-char const* const kWovRnRcNo[] = {"oom, need a min", "not rdy, drinking", "afk 1 min", "wait, lag", "give me a min"};
 char const* const kWovRnRcOk[] = {"np {n}, take your time", "ok {n}, tell me when ready", "ok waiting on {n}"};
 char const* const kWovRnRcAsk[] = {"{n} ready?", "{n}?", "waiting for {n}", "{n}, rdy?"};
 char const* const kWovRnRcGo[] = {"all ready, ok", "everyone ready", "ok all set"};
@@ -3826,6 +3823,11 @@ void WovRaidRcStart(WovRaid& r, std::vector<Player*> const& ps, Player* mt, time
     r.rcAns.clear();
     r.rcPlan.clear();
     r.rcAcked.clear();
+    if (Group* rg = mt->GetGroup())  // results go to the leader and assistants only: a real player gets to see them
+        for (GroupReference* ref = rg->GetFirstMember(); ref; ref = ref->next())
+            if (Player* m = ref->GetSource())
+                if (WovIsReal(m) && !rg->IsAssistant(m->GetGUID()))
+                    rg->SetGroupMemberFlag(m->GetGUID(), true, MEMBER_FLAG_ASSISTANT);
     WorldPacket req(MSG_RAID_READY_CHECK);
     mt->GetSession()->HandleRaidReadyCheckOpcode(req);  // the real ready check: a player sees the popup
     for (size_t i = 1; i < ps.size(); ++i)
@@ -3898,7 +3900,6 @@ void WovRaidPrepStep(WovRaid& r, std::vector<Player*> const& ps, Player* mt, Pla
             if (it == r.rcPlan.end() || now < it->second.at)
                 continue;
             WovRcPlan& p = it->second;
-            PlayerbotAI* ai = GET_PLAYERBOT_AI(b);
             auto answer = [&](uint8 state) {
                 WorldPacket a(MSG_RAID_READY_CHECK);
                 a << state;
@@ -3907,25 +3908,19 @@ void WovRaidPrepStep(WovRaid& r, std::vector<Player*> const& ps, Player* mt, Pla
             };
             if (p.kind == 0)
             {
-                answer(1);
-                if (ai && urand(0, 99) < 45)
-                    ai->SayToRaid(WovPick(kWovRnRcYes));
+                answer(1);  // the real ready check answer, no chat
                 r.rcPlan.erase(it);
             }
             else if (p.stage == 0)
             {
                 if (p.kind == 2)
-                    answer(0);
-                if (ai)
-                    ai->SayToRaid(p.kind == 1 ? WovPick(kWovRnRcWait) : WovPick(kWovRnRcNo));
+                    answer(0);  // a red cross: the leader asks about it in /raid
                 p.stage = 1;
                 p.at = now + (p.kind == 1 ? urand(10, 22) : urand(20, 40));
             }
             else
             {
                 answer(1);
-                if (ai)
-                    ai->SayToRaid(p.kind == 1 ? "r" : "ok r");
                 r.rcPlan.erase(it);
             }
         }
