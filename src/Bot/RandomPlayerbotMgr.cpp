@@ -5,6 +5,7 @@
  */
 
 #include "RandomPlayerbotMgr.h"
+#include "Chat.h"
 #include "PlayerbotsDatabase.h"
 #include "AiFactory.h"
 #include "Battleground.h"
@@ -5033,10 +5034,65 @@ void WovOnyAttune_Tick(time_t now)
     }
 }
 
+// wov: a real guild member calls a raid on demand by typing "!raid", "!raid mc" or "!raid ony" in guild chat (a macro on an
+// action bar does it: /g !raid mc). The chat hook only queues the call; it is carried out here, on the world thread.
+struct WovRaidCall
+{
+    uint32 player, guild;
+    uint8 def;
+};
+std::mutex g_wovRaidCallMutex;
+std::vector<WovRaidCall> g_wovRaidCalls;
+
+void WovRaidCallRun(WovRaidCall const& c, time_t now)
+{
+    Player* p = ObjectAccessor::FindPlayerByLowGUID(c.player);
+    if (!p || !p->IsInWorld() || !p->GetSession())
+        return;
+    ChatHandler ch(p->GetSession());
+    char const* tag = kWovRaidDefs[c.def].tag;
+    if (!g_wovRaidEnable || !g_wovRaidSpotOk[c.def])
+    {
+        ch.SendSysMessage("Raid call: raids are not available right now.");
+        return;
+    }
+    for (WovRaid const& r : g_wovRaids)
+        if (r.guild == c.guild)
+        {
+            ch.SendSysMessage("Raid call: your guild already has a raid going.");
+            return;
+        }
+    if (g_wovRaids.size() >= g_wovRaidMaxActive)
+    {
+        ch.SendSysMessage("Raid call: the maximum number of raids is already running. Try again in a while.");
+        return;
+    }
+    time_t last = g_wovRaidLast.count(c.guild) ? g_wovRaidLast[c.guild] : 0;
+    if (now < last + 10 * MINUTE)
+    {
+        ch.SendSysMessage("Raid call: a raid was called less than 10 minutes ago.");
+        return;
+    }
+    LOG_INFO("playerbots", "WoV raid call: {} asks for {} in guild {}", p->GetName(), tag, c.guild);
+    if (WovRaidStart(c.guild, now, c.def))
+        ch.PSendSysMessage("Raid call: {} raid called. The raid leader whispers you when the group is ready; meet at Lothos Riftwaker in Blackrock Mountain.", tag);
+    else
+        ch.PSendSysMessage("Raid call: not enough level 60 guildies free for {} right now (minimum {}, at least 2 tanks). Details in the server log.", tag, g_wovRaidMin);
+}
+
 void WovRaid_Tick(time_t now)
 {
     WovRaidConfig(now);
     WovOnyAttune_Tick(now);
+    {
+        std::vector<WovRaidCall> calls;
+        {
+            std::lock_guard<std::mutex> lock(g_wovRaidCallMutex);
+            calls.swap(g_wovRaidCalls);
+        }
+        for (WovRaidCall const& c : calls)
+            WovRaidCallRun(c, now);
+    }
     for (size_t i = 0; i < g_wovRaids.size();)
     {
         if (WovRaidStep(g_wovRaids[i], now))
@@ -5120,6 +5176,26 @@ bool WovRaidNightFor(uint32 guid)
                 } while (r->NextRow());
     }
     return night.count(guid) != 0;
+}
+
+// wov: guild chat from a real player, called from the chat hook (Script/Playerbots.cpp): "!raid", "!raid mc", "!raid ony"
+void WovRaid_OnGuildChat(Player* player, std::string const& msg)
+{
+    if (!player || !player->GetGuildId() || player->GetLevel() < 55 || !WovIsReal(player))
+        return;
+    std::string m = msg;
+    std::transform(m.begin(), m.end(), m.begin(), ::tolower);
+    while (!m.empty() && m.back() == ' ')
+        m.pop_back();
+    uint8 d;
+    if (m == "!raid" || m == "!raid mc" || m == "!raid molten core")
+        d = 0;
+    else if (m == "!raid ony" || m == "!raid onyxia")
+        d = 1;
+    else
+        return;
+    std::lock_guard<std::mutex> lock(g_wovRaidCallMutex);
+    g_wovRaidCalls.push_back({player->GetGUID().GetCounter(), player->GetGuildId(), d});
 }
 // ---- end wov: raid nights -------------------------------------------------------------------------------
 

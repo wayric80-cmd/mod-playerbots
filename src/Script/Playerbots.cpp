@@ -136,6 +136,7 @@ public:
 };
 
 void WovInit_OnWhisper(Player* from, Player* to);  // wov (RandomPlayerbotMgr.cpp)
+void WovRaid_OnGuildChat(Player* player, std::string const& msg);  // wov: !raid in guild chat (RandomPlayerbotMgr.cpp)
 void WovGuild_OnWhisper(Player* from, Player* to, std::string const& msg);  // wov (RandomPlayerbotMgr.cpp)
 void WovDungeonRun_OnWhisper(Player* from, Player* to);  // wov (RandomPlayerbotMgr.cpp)
 void WovTogether_OnChannel(Player* player, std::string const& msg);  // wov
@@ -448,6 +449,8 @@ public:
     {
         if (type != CHAT_MSG_GUILD)
             return true;
+
+        WovRaid_OnGuildChat(player, msg);  // wov: a raid called on demand
 
         PlayerbotMgr* playerbotMgr = PlayerbotsMgr::instance().GetPlayerbotMgr(player);
 
