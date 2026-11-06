@@ -5034,8 +5034,8 @@ void WovOnyAttune_Tick(time_t now)
     }
 }
 
-// wov: a real guild member calls a raid on demand by typing "!raid", "!raid mc" or "!raid ony" in guild chat (a macro on an
-// action bar does it: /g !raid mc). The chat hook only queues the call; it is carried out here, on the world thread.
+// wov: a real guild member calls a raid on demand by typing "#raid", "#raid mc" or "#raid ony" in guild chat (a macro on an
+// action bar does it: /g #raid mc). The chat hook only queues the call; it is carried out here, on the world thread.
 struct WovRaidCall
 {
     uint32 player, guild;
@@ -5178,7 +5178,7 @@ bool WovRaidNightFor(uint32 guid)
     return night.count(guid) != 0;
 }
 
-// wov: guild chat from a real player, called from the chat hook (Script/Playerbots.cpp): "!raid", "!raid mc", "!raid ony"
+// wov: guild chat from a real player, called from the chat hook (Script/Playerbots.cpp): "#raid", "#raid mc", "#raid ony"
 void WovRaid_OnGuildChat(Player* player, std::string const& msg)
 {
     if (!player || !player->GetGuildId() || player->GetLevel() < 55 || !WovIsReal(player))
@@ -5188,9 +5188,10 @@ void WovRaid_OnGuildChat(Player* player, std::string const& msg)
     while (!m.empty() && m.back() == ' ')
         m.pop_back();
     uint8 d;
-    if (m == "!raid" || m == "!raid mc" || m == "!raid molten core")
+    // "#raid", not "!raid": the server reads a leading '!' or '.' as a GM command and the line never reaches chat
+    if (m == "#raid" || m == "#raid mc" || m == "#raid molten core")
         d = 0;
-    else if (m == "!raid ony" || m == "!raid onyxia")
+    else if (m == "#raid ony" || m == "#raid onyxia")
         d = 1;
     else
         return;
