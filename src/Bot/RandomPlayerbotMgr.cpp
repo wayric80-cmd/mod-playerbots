@@ -964,6 +964,15 @@ void WovWar_Tick(time_t now)
         {
             for (auto it = s.members[t].begin(); it != s.members[t].end();)
             {
+                if (WovBotReserved(*it))
+                {
+                    // wov: a dungeon run or a raid took this bot after it was recruited: it leaves the skirmish. Without
+                    // this the war kept sending it back to the fight (a raid member summoned to the window vanished again)
+                    g_wovBotSk.erase(*it);
+                    s.joined.erase(*it);
+                    it = s.members[t].erase(it);
+                    continue;
+                }
                 Player* p = ObjectAccessor::FindPlayerByLowGUID(*it);
                 if (!p || !p->IsInWorld())
                 {
@@ -3362,6 +3371,7 @@ struct WovRaid
     // does it, riding = the second leg (Kargath -> Lothos) has begun, rideT = when.
     bool ride = false, riding = false;
     time_t rideT = 0;
+    std::map<uint32, time_t> backAt;  // wov: after a wipe, when each dead member is back at the entrance (the run back takes time)
     std::set<uint32> doused;
     // loot rules
     uint8 rule = 0;  // 0 roll (main spec before off spec), 1 DKP, 2 loot council
@@ -3670,6 +3680,23 @@ void WovRaidRunBack(WovRaid const& r, Player* b)
     b->SpawnCorpseBones();
     if (b->getPowerType() == POWER_MANA)
         b->SetPower(POWER_MANA, b->GetMaxPower(POWER_MANA));
+}
+
+// wov: not everyone gets up at the entrance on the same second. A dead member is back after a run of its own (40-130 s:
+// release, the ghost run from the graveyard, the walk in), so they turn up one by one like a real raid after a wipe.
+void WovRaidRunBackLater(WovRaid& r, Player* b, time_t now)
+{
+    uint32 low = b->GetGUID().GetCounter();
+    if (b->IsAlive())
+    {
+        r.backAt.erase(low);
+        return;
+    }
+    time_t& at = r.backAt[low];
+    if (!at)
+        at = now + urand(40, 130);
+    if (now >= at)
+        WovRaidRunBack(r, b);
 }
 
 // ---- wov: raid loot rules ---------------------------------------------------------------------------------------
@@ -4834,8 +4861,9 @@ bool WovRaidStep(WovRaid& r, time_t now)
                     b->CombatStop(true);
                     b->NearTeleportTo(s.dx + frand(-2.0f, 2.0f), s.dy + frand(-2.0f, 2.0f), s.dz, s.dO);
                 }
+            r.backAt.clear();
             for (Player* b : ps)
-                WovRaidRunBack(r, b);
+                WovRaidRunBackLater(r, b, now);
             r.rezT = now;
             r.calmT = r.buffT = 0;
             mai->DoSpecificAction("dc pause", Event("wov", "pause", nullptr), true);  // the MT holds until all are up
@@ -4852,7 +4880,7 @@ bool WovRaidStep(WovRaid& r, time_t now)
             uint32 dead = 0, fighting = 0;
             for (Player* b : ps)
             {
-                WovRaidRunBack(r, b);
+                WovRaidRunBackLater(r, b, now);
                 if (!b->IsAlive())
                     ++dead;
                 else if (b->GetMapId() == s.dmap && b->IsInCombat())
@@ -4913,8 +4941,9 @@ bool WovRaidStep(WovRaid& r, time_t now)
                     WovRaidEnd(r, "called it after three wipes", true, kWovRnCallIt, 3);
                     return false;
                 }
+                r.backAt.clear();
                 for (Player* b : ps)
-                    WovRaidRunBack(r, b);
+                    WovRaidRunBackLater(r, b, now);
                 r.rezT = now;
                 r.calmT = r.buffT = 0;
                 mai->DoSpecificAction("dc pause", Event("wov", "pause", nullptr), true);
