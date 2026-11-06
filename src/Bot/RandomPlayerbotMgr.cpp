@@ -3358,6 +3358,13 @@ struct WovRaidLoot
     std::vector<std::pair<uint32, uint32>> rolls;  // (player, /roll)
 };
 
+// wov: a short line a raid member says later (after a boss, after a wipe)
+struct WovRcChat
+{
+    time_t at;
+    uint32 low;
+    std::string text;
+};
 // wov: how a bot answers the leader's ready check: 0 ready, 1 "one sec" then ready, 2 "not ready" then ready
 struct WovRcPlan
 {
@@ -3394,6 +3401,7 @@ struct WovRaid
     std::set<uint32> bossesDown, rcAcked;
     std::map<uint32, WovRcPlan> rcPlan;  // bot member -> how and when it answers
     std::map<uint32, uint8> rcAns;       // member -> 1 ready, 0 not ready
+    std::vector<WovRcChat> chatQ;        // wov: short canned reactions, said when due
     std::set<uint32> doused;
     // loot rules
     uint8 rule = 0;  // 0 roll (main spec before off spec), 1 DKP, 2 loot council
@@ -3450,6 +3458,9 @@ char const* const kWovRnRcOk[] = {"np {n}, take your time", "ok {n}, tell me whe
 char const* const kWovRnRcAsk[] = {"{n} ready?", "{n}?", "waiting for {n}", "{n}, rdy?"};
 char const* const kWovRnRcGo[] = {"all ready, ok", "everyone ready", "ok all set"};
 char const* const kWovRnRcSkip[] = {"going without {n}, catch up", "{n} not answering, going"};
+char const* const kWovRnBossDown[] = {"gg", "nice, gg", "boss down, gg", "gj everyone", "and thats one"};
+char const* const kWovRnGg[] = {"gg", "gj", "nice", "wp", "ty all", "gz", "nice one"};
+char const* const kWovRnWipeBots[] = {"rip", "ugh", "sry", "my bad", "wow", "welp", "gg"};
 struct WovBossTactic
 {
     uint32 entry;
@@ -3777,7 +3788,7 @@ void WovRcDrain(WovRaid& r, Player* mt)
             ++it;
 }
 
-void WovRaidBossScan(WovRaid& r, Player* mt, time_t now)
+void WovRaidBossScan(WovRaid& r, std::vector<Player*> const& ps, Player* mt, time_t now)
 {
     if (now < r.bossScanT + 5)
         return;
@@ -3785,8 +3796,16 @@ void WovRaidBossScan(WovRaid& r, Player* mt, time_t now)
     std::list<Creature*> found;
     mt->GetCreatureListWithEntryInGrid(found, kWovRaidDefs[r.def].bosses, 250.0f);
     for (Creature* c : found)
-        if (c && !c->IsAlive())
-            r.bossesDown.insert(c->GetEntry());
+        if (c && !c->IsAlive() && r.bossesDown.insert(c->GetEntry()).second)
+        {
+            LOG_INFO("playerbots", "WoV raid #{} <{}> {}: {} is down ({} min in, {} of {} bosses, {} wipes)", r.id, r.gname, WovRaidTag(r),
+                     c->GetName(), (now - r.start) / 60, r.bossesDown.size(), kWovRaidDefs[r.def].bosses.size(), r.wipes);
+            if (c->GetEntry() == kWovRaidDefs[r.def].finalBoss)
+                continue;  // the end of the raid has its own lines
+            WovRaidSay(r, WovPick(kWovRnBossDown), false);
+            for (int k = 0; k < 2 && ps.size() > 2; ++k)
+                r.chatQ.push_back({now + time_t(urand(2, 14)), ps[urand(1, ps.size() - 1)]->GetGUID().GetCounter(), WovPick(kWovRnGg)});
+        }
 }
 
 void WovRaidPrepStart(WovRaid& r, uint8 why, Player* mt, PlayerbotAI* mai, time_t now)
@@ -4644,12 +4663,35 @@ bool WovRaidStart(uint32 guild, time_t now, uint8 d)
         hyb.erase(it);
     }
     // main tank first: a tank by spec, then the warrior with the most health
-    std::sort(tanks.begin(), tanks.end(), [bind, &D](Player* a, Player* b) {
+    // wov: where the raid gathers, so that the main tank is one who can get there: a tank who stood 9 km away and died on the
+    // way (14:16, raid #1) held the raid up for 15 minutes
+    uint32 gmap = g_wovRaidSpot[d].map;
+    float gx = g_wovRaidSpot[d].mx, gy = g_wovRaidSpot[d].my, gz = g_wovRaidSpot[d].mz;
+    if (d == 0 && !tanks.empty() && tanks[0]->GetTeamId() == TEAM_HORDE)
+        if (TaxiNodesEntry const* kn = sTaxiNodesStore.LookupEntry(kWovKargathNode))
+        {
+            gmap = kn->map_id;
+            gx = kn->x;
+            gy = kn->y;
+            gz = kn->z;
+        }
+    auto nearBucket = [&](Player* p) {
+        if (!p->IsAlive() || p->GetMapId() != gmap)
+            return 2;
+        float dd = p->GetExactDist(gx, gy, gz);
+        return dd < 1500.0f ? 0 : (dd < 4000.0f ? 1 : 2);
+    };
+    std::sort(tanks.begin(), tanks.end(), [&, bind](Player* a, Player* b) {
         bool la = WovRaidBind(a, D.map) == bind, lb = WovRaidBind(b, D.map) == bind;  // the main tank carries the raid's lockout
         if (la != lb)
             return la;
         bool ta = PlayerbotAI::IsTank(a, true) || a->getClass() == CLASS_WARRIOR, tb = PlayerbotAI::IsTank(b, true) || b->getClass() == CLASS_WARRIOR;
-        return ta != tb ? ta : a->GetMaxHealth() > b->GetMaxHealth();
+        if (ta != tb)
+            return ta;
+        int na = nearBucket(a), nb = nearBucket(b);
+        if (na != nb)
+            return na < nb;
+        return a->GetMaxHealth() > b->GetMaxHealth();
     });
     uint32 total = tanks.size() + heals.size() + dps.size() + hyb.size();
     if (ony && total >= g_wovRaidMin && (tanks.size() < needTank || heals.size() + hyb.size() < needHeal))
@@ -4865,7 +4907,7 @@ bool WovRaidStep(WovRaid& r, time_t now)
         // the main tank is not there after a quarter of an hour (held up, stuck in a fight): a tank who is there
         // takes over and leads
         bool mtHere = mt->IsAlive() && mt->GetMapId() == s.map && mt->GetExactDist(s.x, s.y, s.z) <= 60.0f;
-        if (!mtHere && now > t0 + 15 * MINUTE && (!mt->GetGroup() || !mt->GetGroup()->isRaidGroup()))
+        if (!mtHere && now > t0 + (r.riding ? 8 : 5) * MINUTE && (!mt->GetGroup() || !mt->GetGroup()->isRaidGroup()))
             for (size_t i = 1; i < ps.size(); ++i)
                 if (r.role[i] == 0 && ps[i]->IsAlive() && ps[i]->GetMapId() == s.map && ps[i]->GetExactDist(s.x, s.y, s.z) <= 60.0f &&
                     !ps[i]->GetGroup())
@@ -5053,7 +5095,20 @@ bool WovRaidStep(WovRaid& r, time_t now)
             WovRaidLootStep(r, mt, now);
         if (mt->GetMapId() == s.dmap && !r.finalKilled)
         {
-            WovRaidBossScan(r, mt, now);
+            WovRaidBossScan(r, ps, mt, now);
+            for (size_t qi = 0; qi < r.chatQ.size();)  // the short canned lines that are due
+            {
+                if (now < r.chatQ[qi].at)
+                {
+                    ++qi;
+                    continue;
+                }
+                if (Player* cb = ObjectAccessor::FindPlayerByLowGUID(r.chatQ[qi].low))
+                    if (PlayerbotAI* cai = GET_PLAYERBOT_AI(cb))
+                        if (cb->GetGroup())
+                            cai->SayToRaid(r.chatQ[qi].text);
+                r.chatQ.erase(r.chatQ.begin() + qi);
+            }
             if (!r.prep && !r.rezT && !r.bossesDown.count(D.finalBoss) && r.bossesDown.size() > r.bossesPrepped)
             {
                 r.bossesPrepped = r.bossesDown.size();
@@ -5205,6 +5260,8 @@ bool WovRaidStep(WovRaid& r, time_t now)
             mai->DoSpecificAction("dc pause", Event("wov", "pause", nullptr), true);  // the MT holds until all are up
             r.phaseT = now;
             WovRaidSay(r, WovPick(kWovRnWipe), false);
+            for (int k = 0; k < 2 && ps.size() > 2; ++k)
+                r.chatQ.push_back({now + time_t(urand(3, 18)), ps[urand(1, ps.size() - 1)]->GetGUID().GetCounter(), WovPick(kWovRnWipeBots)});
             LOG_INFO("playerbots", "WoV raid #{} <{}> {}: wipe {} (most of the raid died within 5 min), running back", r.id, r.gname, WovRaidTag(r), r.wipes);
             return true;
         }
