@@ -3352,6 +3352,10 @@ struct WovRaid
     bool finalKilled = false;
     std::vector<uint32> reals;  // real players of the guild who were asked along
     time_t realInvT = 0, runeT = 0;
+    // wov: Horde Molten Core gathers in Kargath, forms the raid there and rides to Lothos together. ride = this raid
+    // does it, riding = the second leg (Kargath -> Lothos) has begun, rideT = when.
+    bool ride = false, riding = false;
+    time_t rideT = 0;
     std::set<uint32> doused;
     // loot rules
     uint8 rule = 0;  // 0 roll (main spec before off spec), 1 DKP, 2 loot council
@@ -3385,6 +3389,7 @@ uint32 g_wovRaidMin = 20, g_wovRaidMax = 40, g_wovRaidMaxActive = 2, g_wovRaidHo
 time_t g_wovRaidCfgT = 0, g_wovRaidRealT = 0;
 WovDgDef const kWovMcDef = {"MC", 3528, 60, 60, -1};
 uint32 const kWovRagnaros = 11502;
+uint32 const kWovKargathNode = 21;  // TaxiNodes: Kargath, Badlands (Horde): where Molten Core raids meet
 
 char const* const kWovRnCall[] = {"MC tonight! invites going out, come to the window in BRM",
                                      "raid time, MC. head to blackrock mountain, sums at the window",
@@ -3403,6 +3408,15 @@ char const* const kWovRnCallIt[] = {"ok calling it for tonight, ty all", "thats 
 char const* const kWovRnAskMc[] = {"MC tonight, u coming? meet at the window in BRM, ill inv",
                                    "raiding MC now, want in? come to blackrock mountain, lothos",
                                    "hey we're doing MC, come to the BRM window and ill invite u"};
+char const* const kWovRnCallK[] = {"MC tonight! meet in Kargath, we ride out together",
+                                   "raid time, MC. everyone to Kargath, we ride to BRM from there",
+                                   "MC inv now, be in Kargath. we go together",
+                                   "raid starting, MC. bring pots, meet at Kargath"};
+char const* const kWovRnAskMcK[] = {"MC tonight, u coming? meet in Kargath and we ride together. sent u an inv",
+                                    "raiding MC now, want in? come to Kargath, inv sent",
+                                    "hey we're doing MC, meet us in Kargath and we ride out together. inv sent"};
+char const* const kWovRnRide[] = {"everyone here? ok lets ride, follow me to BRM", "all in Kargath, mount up and ride",
+                                  "good, riding out to Lothos now", "lets go, to Lothos"};
 char const* const kWovRnCallOny[] = {"ony tonight! invites going out, meet at the stone by her lair in wyrmbog",
                                      "onyxia tonight, everyone to dustwallow, sums at the meeting stone",
                                      "ony time, come to the stone outside the lair. bring the amulet",
@@ -4344,15 +4358,19 @@ bool WovRaidStart(uint32 guild, time_t now, uint8 d)
             add(p, 1);
     g_wovRaidLast[guild] = now;
     WovRaidLootLoad(r);
-    WovRaidSay(r, D.call[urand(0, 3)], true);
-    // real players in the guild are asked along (a whisper from the raid leader); they are invited at the window
+    r.ride = d == 0 && tanks[0]->GetTeamId() == TEAM_HORDE && sTaxiNodesStore.LookupEntry(kWovKargathNode) != nullptr;
+    WovRaidSay(r, (r.ride ? kWovRnCallK : D.call)[urand(0, 3)], true);
+    // real players in the guild are asked along (a whisper from the raid leader); a Kargath raid invites them at once,
+    // the others at the window
     for (auto const& [id, session] : sWorldSessionMgr->GetAllSessions())
     {
         Player* p = session ? session->GetPlayer() : nullptr;
         if (!p || !WovIsReal(p) || !p->IsInWorld() || p->GetGuildId() != guild || p->GetLevel() < 55)
             continue;
         r.reals.push_back(p->GetGUID().GetCounter());
-        tanks[0]->Whisper(D.ask[urand(0, 2)], LANG_UNIVERSAL, p);
+        tanks[0]->Whisper((r.ride ? kWovRnAskMcK : D.ask)[urand(0, 2)], LANG_UNIVERSAL, p);
+        if (r.ride && !p->GetGroup())
+            WovInviteFrom(tanks[0], p);
     }
     LOG_INFO("playerbots", "WoV raid #{} <{}> {}: {} going ({} tanks, {} healers), main tank {}", r.id, gname, D.tag, r.m.size(), wantTank, h,
              tanks[0]->GetName());
@@ -4408,6 +4426,18 @@ bool WovRaidStep(WovRaid& r, time_t now)
     }
     if (r.phase == DG_GATHER)
     {
+        // wov: the first leg of a Kargath raid gathers in Kargath; the second (riding) at the window like any other
+        WovDgSpot gatherSpot = WovRaidSpot(r);
+        if (r.ride && !r.riding)
+            if (TaxiNodesEntry const* kn = sTaxiNodesStore.LookupEntry(kWovKargathNode))
+            {
+                gatherSpot.map = kn->map_id;
+                gatherSpot.x = gatherSpot.mx = kn->x;
+                gatherSpot.y = gatherSpot.my = kn->y;
+                gatherSpot.z = gatherSpot.mz = kn->z;
+            }
+        WovDgSpot const& s = gatherSpot;
+        time_t const t0 = r.riding ? r.rideT : r.start;
         uint32 here = 0;
         Player* lock = nullptr;
         std::vector<size_t> away;
@@ -4439,7 +4469,7 @@ bool WovRaidStep(WovRaid& r, time_t now)
                 else if (now >= mm.closerT)
                 {
                     bool horde = b->GetTeamId() == TEAM_HORDE;
-                    if (TaxiNodesEntry const* tn = sTaxiNodesStore.LookupEntry(horde ? D.taxiH : D.taxiA))
+                    if (TaxiNodesEntry const* tn = sTaxiNodesStore.LookupEntry((r.ride && !r.riding) ? kWovKargathNode : (horde ? D.taxiH : D.taxiA)))
                     {
                         b->TeleportTo(tn->map_id, tn->x + frand(-2.0f, 2.0f), tn->y + frand(-2.0f, 2.0f), tn->z + 0.5f, frand(0.0f, 6.28f));
                         LOG_INFO("playerbots", "WoV raid #{} <{}> {}: {} flies in to {}", r.id, r.gname, D.tag, b->GetName(), tn->name[0]);
@@ -4478,7 +4508,7 @@ bool WovRaidStep(WovRaid& r, time_t now)
         // the main tank is not there after a quarter of an hour (held up, stuck in a fight): a tank who is there
         // takes over and leads
         bool mtHere = mt->IsAlive() && mt->GetMapId() == s.map && mt->GetExactDist(s.x, s.y, s.z) <= 60.0f;
-        if (!mtHere && now > r.start + 15 * MINUTE && !mt->GetGroup())
+        if (!mtHere && now > t0 + 15 * MINUTE && (!mt->GetGroup() || !mt->GetGroup()->isRaidGroup()))
             for (size_t i = 1; i < ps.size(); ++i)
                 if (r.role[i] == 0 && ps[i]->IsAlive() && ps[i]->GetMapId() == s.map && ps[i]->GetExactDist(s.x, s.y, s.z) <= 60.0f &&
                     !ps[i]->GetGroup())
@@ -4541,7 +4571,7 @@ bool WovRaidStep(WovRaid& r, time_t now)
         uint32 ready = 0;
         for (Player* b : ps)
             ready += (g && b->GetGroup() == g && b->IsAlive() && b->GetMapId() == s.map && b->GetExactDist(s.x, s.y, s.z) <= 60.0f) ? 1 : 0;
-        bool timeUp = now > r.start + 30 * MINUTE;
+        bool timeUp = now > t0 + 30 * MINUTE;
         if (g && g->isRaidGroup() && (ready == ps.size() || (timeUp && ready >= g_wovRaidMin)))
         {
             for (size_t i = ps.size(); i-- > 1;)  // the ones who did not make it are not waited for
@@ -4549,6 +4579,23 @@ bool WovRaidStep(WovRaid& r, time_t now)
                       ps[i]->GetExactDist(s.x, s.y, s.z) <= 60.0f))
                     WovRaidDrop(r, i, "not at the window in time");
             g->SetGroupMemberFlag(mt->GetGUID(), true, MEMBER_FLAG_MAINTANK);
+            if (r.ride && !r.riding)
+            {
+                // wov: everyone who made it is in Kargath and in the raid: ride to Lothos together, then in as usual
+                r.riding = true;
+                r.rideT = now;
+                r.phaseT = now;
+                r.sumT = now;
+                for (WovDgMember& mm : r.m)
+                {
+                    mm.closerT = 0;
+                    mm.sumN = 0;
+                    mm.flew = false;
+                }
+                WovRaidSay(r, WovPick(kWovRnRide), false);
+                LOG_INFO("playerbots", "WoV raid #{} <{}> {}: all {} in Kargath, riding to Lothos", r.id, r.gname, WovRaidTag(r), r.m.size());
+                return true;
+            }
             r.phase = DG_ENTER;
             r.phaseT = now;
             WovRaidSay(r, WovPick(kWovRnGo), false);
@@ -4560,7 +4607,7 @@ bool WovRaidStep(WovRaid& r, time_t now)
             WovRaidLootSay(r, mt, rules[r.rule][urand(0, 1)]);
             return true;
         }
-        if (now > r.start + 45 * MINUTE)
+        if (now > t0 + 45 * MINUTE)
         {
             WovRaidEnd(r, "not enough people showed up", true, kWovRnCallIt, 3);
             return false;
@@ -5075,7 +5122,12 @@ void WovRaidCallRun(WovRaidCall const& c, time_t now)
     }
     LOG_INFO("playerbots", "WoV raid call: {} asks for {} in guild {}", p->GetName(), tag, c.guild);
     if (WovRaidStart(c.guild, now, c.def))
-        ch.PSendSysMessage("Raid call: {} raid called. The raid leader whispers you when the group is ready; meet at Lothos Riftwaker in Blackrock Mountain.", tag);
+    {
+        if (!g_wovRaids.empty() && g_wovRaids.back().ride)
+            ch.PSendSysMessage("Raid call: {} raid called. The raid leader has invited you. Meet in Kargath; the raid rides to Lothos Riftwaker together.", tag);
+        else
+            ch.PSendSysMessage("Raid call: {} raid called. The raid leader whispers you when the group is ready; meet at Lothos Riftwaker in Blackrock Mountain.", tag);
+    }
     else
         ch.PSendSysMessage("Raid call: not enough level 60 guildies free for {} right now (minimum {}, at least 2 tanks). Details in the server log.", tag, g_wovRaidMin);
 }
