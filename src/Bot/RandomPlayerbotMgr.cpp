@@ -3372,6 +3372,7 @@ struct WovRaid
     bool ride = false, riding = false;
     time_t rideT = 0;
     std::map<uint32, time_t> backAt;  // wov: after a wipe, when each dead member is back at the entrance (the run back takes time)
+    bool stop = false;                // wov: a real guild member typed "#raid stop": call it for tonight (the lockout stays)
     std::set<uint32> doused;
     // loot rules
     uint8 rule = 0;  // 0 roll (main spec before off spec), 1 DKP, 2 loot council
@@ -4452,6 +4453,11 @@ bool WovRaidStep(WovRaid& r, time_t now)
     }
     Player* mt = ps[0];
     PlayerbotAI* mai = GET_PLAYERBOT_AI(mt);
+    if (r.stop)
+    {
+        WovRaidEnd(r, "called off by a guild member", true, kWovRnCallIt, 3);
+        return false;
+    }
     if (now > r.start + 4 * HOUR)
     {
         WovRaidEnd(r, "out of time", true, kWovRnCallIt, 3);
@@ -5134,6 +5140,19 @@ void WovRaidCallRun(WovRaidCall const& c, time_t now)
     if (!p || !p->IsInWorld() || !p->GetSession())
         return;
     ChatHandler ch(p->GetSession());
+    if (c.def == 255)
+    {
+        for (WovRaid& r : g_wovRaids)
+            if (r.guild == c.guild)
+            {
+                r.stop = true;
+                ch.SendSysMessage("Raid call: the raid is being called off. The lockout stays; call it again later with #raid mc to carry on.");
+                LOG_INFO("playerbots", "WoV raid call: {} calls off raid #{} of guild {}", p->GetName(), r.id, c.guild);
+                return;
+            }
+        ch.SendSysMessage("Raid call: your guild has no raid going.");
+        return;
+    }
     char const* tag = kWovRaidDefs[c.def].tag;
     if (!g_wovRaidEnable || !g_wovRaidSpotOk[c.def])
     {
@@ -5282,6 +5301,8 @@ void WovRaid_OnGuildChat(Player* player, std::string const& msg)
         d = 0;
     else if (m == "#raid ony" || m == "#raid onyxia")
         d = 1;
+    else if (m == "#raid stop" || m == "#raid end" || m == "#raid off")
+        d = 255;
     else
         return;
     std::lock_guard<std::mutex> lock(g_wovRaidCallMutex);
