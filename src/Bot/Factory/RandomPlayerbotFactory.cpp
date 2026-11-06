@@ -5,6 +5,9 @@
  */
 
 #include "RandomPlayerbotFactory.h"
+#include <algorithm>
+#include <mutex>
+#include <unordered_set>
 #include "PlayerbotsDatabase.h"
 #include "AccountMgr.h"
 #include "ArenaTeamMgr.h"
@@ -184,7 +187,7 @@ Player* RandomPlayerbotFactory::CreateRandomBot(WorldSession* session, uint8 cls
 std::string const RandomPlayerbotFactory::CreateRandomBotName(NameRaceAndGender raceAndGender)
 {
     std::string botName = "";
-    int tries = 3;
+    int tries = 12;  // wov: was 3; names already given out in this run are skipped below
     while (--tries)
     {
         QueryResult result = CharacterDatabase.Query(
@@ -208,6 +211,18 @@ std::string const RandomPlayerbotFactory::CreateRandomBotName(NameRaceAndGender 
 
             if (PreparedQueryResult result = CharacterDatabase.Query(stmt))
                 continue;
+
+            // wov: a big batch is not in the characters table yet, so the checks above cannot see the names handed out
+            // earlier in this run: remember them here (69 names ended up on two or three characters)
+            {
+                static std::mutex wovNamesMutex;
+                static std::unordered_set<std::string> wovNamesUsed;
+                std::string low = botName;
+                std::transform(low.begin(), low.end(), low.begin(), ::tolower);
+                std::lock_guard<std::mutex> lock(wovNamesMutex);
+                if (!wovNamesUsed.insert(low).second)
+                    continue;
+            }
 
             return botName;
         }

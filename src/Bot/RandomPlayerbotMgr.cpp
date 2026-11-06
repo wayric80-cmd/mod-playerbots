@@ -1869,6 +1869,12 @@ void WovHandleChat(WovChatEvt const& e, time_t now)
 
 void WovInviteFrom(Player* inviter, Player* who)
 {
+    // wov: the invite goes by name; if another character shares it the server would pick the wrong one
+    if (ObjectAccessor::FindPlayerByName(who->GetName()) != who)
+    {
+        LOG_INFO("playerbots", "WoV invite: the name {} is shared by another character, invite skipped (run wov/dedupe_names.py)", who->GetName());
+        return;
+    }
     WorldPacket pk;
     pk << who->GetName();
     pk << uint32(0);
@@ -4572,7 +4578,9 @@ bool WovRaidStep(WovRaid& r, time_t now)
         for (Player* b : ps)
             ready += (g && b->GetGroup() == g && b->IsAlive() && b->GetMapId() == s.map && b->GetExactDist(s.x, s.y, s.z) <= 60.0f) ? 1 : 0;
         bool timeUp = now > t0 + 30 * MINUTE;
-        if (g && g->isRaidGroup() && (ready == ps.size() || (timeUp && ready >= g_wovRaidMin)))
+        // wov: nearly everyone there for a while is enough; the last stragglers (stuck, in a fight far away) are not waited for
+        bool nearly = now > t0 + 12 * MINUTE && ready >= std::max<uint32>(g_wovRaidMin, uint32(ps.size() * 85 / 100));
+        if (g && g->isRaidGroup() && (ready == ps.size() || nearly || (timeUp && ready >= g_wovRaidMin)))
         {
             for (size_t i = ps.size(); i-- > 1;)  // the ones who did not make it are not waited for
                 if (!(ps[i]->GetGroup() == g && ps[i]->IsAlive() && ps[i]->GetMapId() == s.map &&
