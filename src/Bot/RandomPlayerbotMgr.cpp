@@ -3374,6 +3374,10 @@ struct WovRaid
 std::vector<WovRaid> g_wovRaids;
 std::unordered_map<uint32, time_t> g_wovRaidLast;  // guild -> last raid start
 std::unordered_set<uint32> g_wovRaidRealGuilds;    // guilds led by a real player: they plan their own raids
+// wov: guilds led by a real player whose raid nights the bots organise anyway (the real members are asked along and
+// invited at the window like in any other guild). AiPlayerbot.WoV.Raids.RealGuildsAllowed = "4,7" (guild ids).
+std::unordered_set<uint32> g_wovRaidAllowReal;
+inline bool WovRaidRealSkip(uint32 g) { return g_wovRaidRealGuilds.count(g) && !g_wovRaidAllowReal.count(g); }
 bool g_wovRaidEnable = false;
 uint32 g_wovRaidPug = 30;  // a guild short of people fills up to this with level 60s from outside ("LF5M MC")
 uint32 g_wovRaidMin = 20, g_wovRaidMax = 40, g_wovRaidMaxActive = 2, g_wovRaidHour = 20, g_wovRaidTest = 0, g_wovRaidNextId = 1;
@@ -3490,6 +3494,20 @@ void WovRaidConfig(time_t now)
     g_wovRaidTestRaid = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.Raids.TestRaid", 0) % kWovRaidDefs.size();
     g_wovRaidTestAttune = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.Raids.TestAttuneGuild", 0);
     g_wovOnyAttuneEvery = std::max<uint32>(1, sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.Raids.OnyAttuneEvery", 150));
+    g_wovRaidAllowReal.clear();
+    {
+        std::string const list = sConfigMgr->GetOption<std::string>("AiPlayerbot.WoV.Raids.RealGuildsAllowed", "");
+        size_t pos = 0;
+        while (pos < list.size())
+        {
+            size_t comma = list.find(',', pos);
+            if (comma == std::string::npos)
+                comma = list.size();
+            if (uint32 id = uint32(atoi(list.substr(pos, comma - pos).c_str())))
+                g_wovRaidAllowReal.insert(id);
+            pos = comma + 1;
+        }
+    }
     for (size_t d = 0; d < kWovRaidDefs.size(); ++d)
     {
         WovRaidDef const& D = kWovRaidDefs[d];
@@ -5040,7 +5058,7 @@ void WovRaid_Tick(time_t now)
     {
         if (g_wovRaids.size() >= g_wovRaidMaxActive)
             break;
-        if (g_wovRaidRealGuilds.count(guild))
+        if (WovRaidRealSkip(guild))
             continue;
         bool running = false;
         for (WovRaid const& r : g_wovRaids)
@@ -5094,7 +5112,7 @@ bool WovRaidNightFor(uint32 guid)
                 do
                 {
                     uint32 g = r->Fetch()[0].Get<uint32>();
-                    if (g_wovRaidRealGuilds.count(g))
+                    if (WovRaidRealSkip(g))
                         continue;
                     time_t at = WovRaidStartToday(g, now);
                     if (at && now >= at - 30 * MINUTE && now <= at + 210 * MINUTE)
