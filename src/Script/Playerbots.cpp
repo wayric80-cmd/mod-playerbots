@@ -136,6 +136,7 @@ public:
 };
 
 void WovInit_OnWhisper(Player* from, Player* to);  // wov (RandomPlayerbotMgr.cpp)
+void WovRaid_OnReadyConfirm(Player* leader, ObjectGuid who, uint8 state);  // wov: ready check answers (RandomPlayerbotMgr.cpp)
 void WovRaid_OnGuildChat(Player* player, std::string const& msg);  // wov: !raid in guild chat (RandomPlayerbotMgr.cpp)
 void WovGuild_OnWhisper(Player* from, Player* to, std::string const& msg);  // wov (RandomPlayerbotMgr.cpp)
 void WovDungeonRun_OnWhisper(Player* from, Player* to);  // wov (RandomPlayerbotMgr.cpp)
@@ -674,6 +675,16 @@ public:
             RandomBotLevelMgr::instance().ObserveMeetingTradePacket(player, *packet);
 
         PlayerbotAI* botAI = PlayerbotsMgr::instance().GetPlayerbotAI(player);
+
+        if (botAI != nullptr && packet && packet->GetOpcode() == MSG_RAID_READY_CHECK_CONFIRM)  // wov: answers to a bot leader's ready check
+        {
+            WorldPacket rc(*packet);
+            rc.rpos(0);
+            ObjectGuid who;
+            uint8 state = 0;
+            rc >> who >> state;
+            WovRaid_OnReadyConfirm(player, who, state);
+        }
 
         if (botAI != nullptr)
             botAI->HandleBotOutgoingPacket(*packet);

@@ -6,6 +6,7 @@
 
 #include "RandomPlayerbotMgr.h"
 #include "Chat.h"
+#include <array>
 #include "PlayerbotsDatabase.h"
 #include "AiFactory.h"
 #include "Battleground.h"
@@ -1623,8 +1624,12 @@ void WovInit_OnWhisper(Player* from, Player* to)
 }
 
 // For mod-ollama-chat's prompts: what this bot has said it is doing in the channels, so its talk stays consistent.
+std::string WovRaidIntentOf(uint32 low);  // wov: raid members (below)
 std::string WovIntentOf(uint32 low)
 {
+    std::string raidIntent = WovRaidIntentOf(low);  // wov: in a raid: talk about the raid, not an old LFG post
+    if (!raidIntent.empty())
+        return raidIntent;
     std::string run = WovRunIntentOf(low);  // wov: a dungeon run says what the group is doing
     if (!run.empty())
         return run;
@@ -3353,6 +3358,12 @@ struct WovRaidLoot
     std::vector<std::pair<uint32, uint32>> rolls;  // (player, /roll)
 };
 
+// wov: how a bot answers the leader's ready check: 0 ready, 1 "one sec" then ready, 2 "not ready" then ready
+struct WovRcPlan
+{
+    time_t at = 0;
+    uint8 kind = 0, stage = 0;
+};
 struct WovRaid
 {
     uint32 id = 0, guild = 0;
@@ -3373,6 +3384,16 @@ struct WovRaid
     time_t rideT = 0;
     std::map<uint32, time_t> backAt;  // wov: after a wipe, when each dead member is back at the entrance (the run back takes time)
     bool stop = false;                // wov: a real guild member typed "#raid stop": call it for tonight (the lockout stays)
+    // wov: the leader's pull routine (buffs, ready check, tactic, countdown) before the first pull, after a wipe and
+    // after each boss. prep: 0 off, 1 waiting (loot, buffs, mana), 2 ready check out, 3 countdown.
+    uint8 prep = 0, prepWhy = 0, rcRound = 0;
+    time_t prepT = 0, rcT = 0, rcT0 = 0, nudgeT = 0, cdT = 0, bossScanT = 0;
+    int8 cdN = 0;
+    bool manaSaid = false;
+    uint32 bossesPrepped = 0;
+    std::set<uint32> bossesDown, rcAcked;
+    std::map<uint32, WovRcPlan> rcPlan;  // bot member -> how and when it answers
+    std::map<uint32, uint8> rcAns;       // member -> 1 ready, 0 not ready
     std::set<uint32> doused;
     // loot rules
     uint8 rule = 0;  // 0 roll (main spec before off spec), 1 DKP, 2 loot council
@@ -3418,6 +3439,36 @@ char const* const kWovRnGo[] = {"ok everyone in, lets go", "zone in", "all here,
 char const* const kWovRnWipe[] = {"wipe, run back", "run back pls", "ok again, focus", "rez up and lets go again"};
 char const* const kWovRnRebuff[] = {"everyone up? rebuff and drink", "buffs pls, pulling in a min", "drink up, rebuff, then we go",
                                     "full mana then we go again"};
+char const* const kWovRnPrepStart[] = {"ok buff up and drink if you need, ready check in a bit", "buffs and drinks, rc soon",
+                                       "get your buffs on, ready check in 20"};
+char const* const kWovRnPrepBoss[] = {"gg. loot, then buffs and drink if low, rc after", "nice. rebuff and drink, ready check in a minute",
+                                      "ok rebuff and drink, rc soon"};
+char const* const kWovRnMana[] = {"waiting on mana", "drink up, waiting on mana", "wait for mana pls"};
+char const* const kWovRnRc[] = {"ready check", "rc", "ready check pls", "ready check, answer pls"};
+char const* const kWovRnRcAgain[] = {"ok again, ready check", "rc again", "ready check again pls"};
+char const* const kWovRnRcYes[] = {"r", "rdy", "ready", "y", "yep", "r"};
+char const* const kWovRnRcWait[] = {"1 sec", "one sec", "gimme a sec", "1 min"};
+char const* const kWovRnRcNo[] = {"oom, need a min", "not rdy, drinking", "afk 1 min", "wait, lag", "give me a min"};
+char const* const kWovRnRcOk[] = {"np {n}, take your time", "ok {n}, tell me when ready", "ok waiting on {n}"};
+char const* const kWovRnRcAsk[] = {"{n} ready?", "{n}?", "waiting for {n}", "{n}, rdy?"};
+char const* const kWovRnRcGo[] = {"all ready, ok", "everyone ready", "ok all set"};
+char const* const kWovRnRcSkip[] = {"going without {n}, catch up", "{n} not answering, going"};
+struct WovBossTactic
+{
+    uint32 entry;
+    char const* text;
+};
+WovBossTactic const kWovBossTactic[] = {
+    {12118, "lucifron: tanks pick up the 2 adds and kill them first. dispel impending doom, decurse"},
+    {11982, "magmadar: tank him in a corner away from the raid, fear ward on the tank, hunters tranq. move out of the fire"},
+    {12259, "gehennas: kill the 2 adds first, dont stand in rain of fire, decurse"},
+    {12057, "garr: warlocks banish the adds, tank garr alone and burn him. keep the adds banished"},
+    {12264, "shazzrah: he blinks and resets threat, tank grab him again. melee out for arcane explosion, dispel his shield, decurse"},
+    {12056, "geddon: living bomb, if its you run out of the raid. everyone out when he casts inferno"},
+    {11988, "golemagg: 1 tank on him, 2 on the core ragers. kill golemagg, healers on the tanks"},
+    {12098, "sulfuron: kill the priests first and interrupt their heals, then sulfuron"},
+    {11502, "rag: tanks in melee, everyone else out of melee range. kill the sons when he submerges"},
+    {10184, "ony: tanks on her, everyone else behind or beside her. spread for the fireballs, kill the whelps in phase 2"}};
 char const* const kWovRnEnd[] = {"gg all, good raid tonight", "thanks all, same time next week", "gj everyone",
                                    "gg, see you next raid"};
 char const* const kWovRnCallIt[] = {"ok calling it for tonight, ty all", "thats it for tonight, gj everyone",
@@ -3698,6 +3749,274 @@ void WovRaidRunBackLater(WovRaid& r, Player* b, time_t now)
         at = now + urand(40, 130);
     if (now >= at)
         WovRaidRunBack(r, b);
+}
+
+// ---- wov: the raid leader's pull routine ---------------------------------------------------------------------
+// Before the first pull, after a wipe and after each boss the leader holds the raid (the tank waits), asks for buffs,
+// waits for mana, calls a real ready check (a real player gets the popup), asks whoever has not answered or said no,
+// gives the tactic for the next boss and counts down before the pull. Everything goes to /raid.
+std::mutex g_wovRcMutex;
+std::vector<std::array<uint32, 3>> g_wovRcIn;  // answers the leader was sent: (leader, member, state)
+
+std::string WovSubst(char const* text, std::string const& name)
+{
+    std::string s = text;
+    size_t p = s.find("{n}");
+    if (p != std::string::npos)
+        s.replace(p, 3, name);
+    return s;
+}
+
+void WovRcDrain(WovRaid& r, Player* mt)
+{
+    std::lock_guard<std::mutex> lock(g_wovRcMutex);
+    for (auto it = g_wovRcIn.begin(); it != g_wovRcIn.end();)
+        if ((*it)[0] == mt->GetGUID().GetCounter())
+        {
+            r.rcAns[(*it)[1]] = (*it)[2] ? 1 : 0;
+            it = g_wovRcIn.erase(it);
+        }
+        else
+            ++it;
+}
+
+void WovRaidBossScan(WovRaid& r, Player* mt, time_t now)
+{
+    if (now < r.bossScanT + 5)
+        return;
+    r.bossScanT = now;
+    std::list<Creature*> found;
+    mt->GetCreatureListWithEntryInGrid(found, kWovRaidDefs[r.def].bosses, 250.0f);
+    for (Creature* c : found)
+        if (c && !c->IsAlive())
+            r.bossesDown.insert(c->GetEntry());
+}
+
+void WovRaidPrepStart(WovRaid& r, uint8 why, Player* mt, PlayerbotAI* mai, time_t now)
+{
+    r.prep = 1;
+    r.prepWhy = why;
+    r.prepT = now;
+    r.rcRound = 0;
+    r.manaSaid = false;
+    r.rcAns.clear();
+    r.rcPlan.clear();
+    r.rcAcked.clear();
+    if (why == 2)
+    {
+        mai->DoSpecificAction("dc pause", Event("wov", "pause", nullptr), true);  // the tank holds
+        WovRaidSay(r, WovPick(kWovRnPrepBoss), false);
+    }
+    else if (why == 0)
+        WovRaidSay(r, WovPick(kWovRnPrepStart), false);
+    // after a wipe the leader has already told everyone to rebuff
+}
+
+void WovRaidRcStart(WovRaid& r, std::vector<Player*> const& ps, Player* mt, time_t now)
+{
+    ++r.rcRound;
+    if (r.rcRound == 1)
+        r.rcT0 = now;
+    if (r.rcRound == 1)
+        WovRaidSay(r, WovPick(kWovRnRc), false);
+    else
+        WovRaidSay(r, WovPick(kWovRnRcAgain), false);
+    r.rcT = now;
+    r.nudgeT = now + 25;
+    r.rcAns.clear();
+    r.rcPlan.clear();
+    r.rcAcked.clear();
+    WorldPacket req(MSG_RAID_READY_CHECK);
+    mt->GetSession()->HandleRaidReadyCheckOpcode(req);  // the real ready check: a player sees the popup
+    for (size_t i = 1; i < ps.size(); ++i)
+    {
+        if (!ps[i]->IsAlive())
+            continue;
+        uint32 roll = r.rcRound > 1 ? 0 : urand(0, 99);
+        WovRcPlan p;
+        p.kind = roll < 90 ? 0 : (roll < 96 ? 1 : 2);
+        p.at = now + (p.kind == 0 ? urand(1, 9) : urand(2, 6));
+        r.rcPlan[ps[i]->GetGUID().GetCounter()] = p;
+    }
+}
+
+void WovRaidPrepStep(WovRaid& r, std::vector<Player*> const& ps, Player* mt, PlayerbotAI* mai, time_t now)
+{
+    if (!r.prep)
+        return;
+    WovRcDrain(r, mt);
+    Group* g = mt->GetGroup();
+    if (!g || now > r.prepT + 8 * MINUTE)  // the group is gone, or this has gone on far too long: do not hold the raid
+    {
+        r.prep = 0;
+        mai->DoSpecificAction("dc on", Event("wov", "", nullptr), true);
+        return;
+    }
+    if (r.prep == 1)
+    {
+        time_t minWait = r.prepWhy == 0 ? 15 : (r.prepWhy == 2 ? 20 : 3);
+        if (now < r.prepT + minWait)
+            return;
+        if (r.prepWhy == 2 && !r.loot.empty() && now < r.prepT + 150)  // the loot is handed out first
+            return;
+        bool fighting = false;
+        uint32 lowMana = 0, dead = 0;
+        for (Player* b : ps)
+        {
+            if (!b->IsAlive())
+            {
+                ++dead;
+                continue;
+            }
+            fighting = fighting || b->IsInCombat();
+            if (b->getPowerType() == POWER_MANA && 100.0f * b->GetPower(POWER_MANA) / std::max<uint32>(1, b->GetMaxPower(POWER_MANA)) < 70.0f)
+                ++lowMana;
+        }
+        if ((fighting || dead) && now < r.prepT + minWait + 90)
+            return;
+        if (lowMana && now < r.prepT + minWait + 60)
+        {
+            if (!r.manaSaid)
+            {
+                r.manaSaid = true;
+                WovRaidSay(r, WovPick(kWovRnMana), false);
+            }
+            return;
+        }
+        WovRaidRcStart(r, ps, mt, now);
+        r.prep = 2;
+        return;
+    }
+    if (r.prep == 2)
+    {
+        // the bots answer
+        for (size_t i = 1; i < ps.size(); ++i)
+        {
+            Player* b = ps[i];
+            uint32 low = b->GetGUID().GetCounter();
+            auto it = r.rcPlan.find(low);
+            if (it == r.rcPlan.end() || now < it->second.at)
+                continue;
+            WovRcPlan& p = it->second;
+            PlayerbotAI* ai = GET_PLAYERBOT_AI(b);
+            auto answer = [&](uint8 state) {
+                WorldPacket a(MSG_RAID_READY_CHECK);
+                a << state;
+                b->GetSession()->HandleRaidReadyCheckOpcode(a);
+                r.rcAns[low] = state;
+            };
+            if (p.kind == 0)
+            {
+                answer(1);
+                if (ai && urand(0, 99) < 45)
+                    ai->SayToRaid(WovPick(kWovRnRcYes));
+                r.rcPlan.erase(it);
+            }
+            else if (p.stage == 0)
+            {
+                if (p.kind == 2)
+                    answer(0);
+                if (ai)
+                    ai->SayToRaid(p.kind == 1 ? WovPick(kWovRnRcWait) : WovPick(kWovRnRcNo));
+                p.stage = 1;
+                p.at = now + (p.kind == 1 ? urand(10, 22) : urand(20, 40));
+            }
+            else
+            {
+                answer(1);
+                if (ai)
+                    ai->SayToRaid(p.kind == 1 ? "r" : "ok r");
+                r.rcPlan.erase(it);
+            }
+        }
+        // who is still missing: the bots in the raid and the real players in the group
+        std::vector<Player*> waiting;
+        std::vector<Player*> saidNo;
+        auto check = [&](Player* m) {
+            uint32 low = m->GetGUID().GetCounter();
+            auto a = r.rcAns.find(low);
+            if (a != r.rcAns.end() && a->second == 1)
+                return;
+            waiting.push_back(m);
+            if (a != r.rcAns.end() && a->second == 0)
+                saidNo.push_back(m);
+        };
+        for (size_t i = 1; i < ps.size(); ++i)
+            if (ps[i]->IsAlive())
+                check(ps[i]);
+        bool realWaiting = false;
+        for (GroupReference* ref = g->GetFirstMember(); ref; ref = ref->next())
+            if (Player* m = ref->GetSource())
+                if (WovIsReal(m))
+                {
+                    size_t before = waiting.size();
+                    check(m);
+                    realWaiting = realWaiting || waiting.size() > before;
+                }
+        for (Player* m : saidNo)  // someone said no: acknowledge it once
+            if (r.rcAcked.insert(m->GetGUID().GetCounter()).second)
+                WovRaidSay(r, WovSubst(WovPick(kWovRnRcOk), m->GetName()).c_str(), false);
+        bool timeUp = now > r.rcT0 + 150;
+        if (waiting.empty() || timeUp)
+        {
+            if (timeUp && !waiting.empty())
+                WovRaidSay(r, WovSubst(WovPick(kWovRnRcSkip), waiting[0]->GetName()).c_str(), false);
+            else
+                WovRaidSay(r, WovPick(kWovRnRcGo), false);
+            // the tactic for the next boss, then the countdown
+            char const* tactic = nullptr;
+            for (uint32 e : kWovRaidDefs[r.def].bosses)
+                if (!r.bossesDown.count(e))
+                {
+                    for (WovBossTactic const& bt : kWovBossTactic)
+                        if (bt.entry == e)
+                            tactic = bt.text;
+                    break;
+                }
+            if (tactic)
+                WovRaidSay(r, tactic, false);
+            r.prep = 3;
+            r.cdN = 5;
+            r.cdT = now + (tactic ? 6 : 2);
+            return;
+        }
+        // asking whoever has not answered (real players; the bots answer on their own), and a new check for those who said no
+        if (now >= r.nudgeT)
+        {
+            r.nudgeT = now + 25;
+            bool anyPlan = !r.rcPlan.empty();
+            if (!saidNo.empty() && !anyPlan && r.rcRound < 3)
+            {
+                WovRaidRcStart(r, ps, mt, now);
+                return;
+            }
+            if (realWaiting)
+                for (Player* m : waiting)
+                    if (WovIsReal(m) && !r.rcAns.count(m->GetGUID().GetCounter()))
+                    {
+                        WovRaidSay(r, WovSubst(WovPick(kWovRnRcAsk), m->GetName()).c_str(), false);
+                        break;
+                    }
+        }
+        return;
+    }
+    if (r.prep == 3)
+    {
+        if (now < r.cdT)
+            return;
+        if (r.cdN > 0)
+        {
+            std::string say = r.cdN == 5 ? "pulling in 5" : std::to_string(int(r.cdN));
+            WovRaidSay(r, say.c_str(), false);
+            --r.cdN;
+            r.cdT = now + 1;
+            return;
+        }
+        WovRaidSay(r, "pull", false);
+        r.prep = 0;
+        mai->DoSpecificAction("dc on", Event("wov", "", nullptr), true);
+        r.moveT = 0;
+    }
 }
 
 // ---- wov: raid loot rules ---------------------------------------------------------------------------------------
@@ -4368,6 +4687,10 @@ bool WovRaidStart(uint32 guild, time_t now, uint8 d)
         r.m.push_back({p->GetGUID().GetCounter(), 1e9f, now, false, p->GetPositionX(), p->GetPositionY(), now});
         r.role.push_back(role);
         g_wovBusyBot[p->GetGUID().GetCounter()] = uint32(now + 5 * HOUR);
+        {
+            std::lock_guard<std::mutex> lk(g_wovInitMutex);  // wov: an old LFG/LFM post no longer applies
+            g_wovLfx.erase(p->GetGUID().GetCounter());
+        }
         if (p->InBattlegroundQueue())
             WovLeaveBgQueues(p);
     };
@@ -4694,7 +5017,7 @@ bool WovRaidStep(WovRaid& r, time_t now)
                 WovRaidRole(ps[i], r.role[i]);
             if (Group* g = mt->GetGroup())
                 g->SetGroupMemberFlag(mt->GetGUID(), true, MEMBER_FLAG_MAINTANK);
-            mai->DoSpecificAction("dc on", Event("wov", "", nullptr), true);
+            WovRaidPrepStart(r, 0, mt, mai, now);  // wov: buffs, ready check, tactic and a countdown, then "dc on"
             r.phase = DG_RUN;
             r.phaseT = r.roleT = now;
             WovRaidDkpAll(r, mt, 5);  // on time
@@ -4733,6 +5056,16 @@ bool WovRaidStep(WovRaid& r, time_t now)
         }
         if (mt->GetMapId() == s.dmap)
             WovRaidLootStep(r, mt, now);
+        if (mt->GetMapId() == s.dmap && !r.finalKilled)
+        {
+            WovRaidBossScan(r, mt, now);
+            if (!r.prep && !r.rezT && !r.bossesDown.count(D.finalBoss) && r.bossesDown.size() > r.bossesPrepped)
+            {
+                r.bossesPrepped = r.bossesDown.size();
+                WovRaidPrepStart(r, 2, mt, mai, now);
+            }
+            WovRaidPrepStep(r, ps, mt, mai, now);
+        }
         if (r.finalKilled)
         {
             if (!r.endT)
@@ -4868,6 +5201,8 @@ bool WovRaidStep(WovRaid& r, time_t now)
                     b->NearTeleportTo(s.dx + frand(-2.0f, 2.0f), s.dy + frand(-2.0f, 2.0f), s.dz, s.dO);
                 }
             r.backAt.clear();
+            r.prep = 0;
+            r.rcPlan.clear();
             for (Player* b : ps)
                 WovRaidRunBackLater(r, b, now);
             r.rezT = now;
@@ -4931,7 +5266,7 @@ bool WovRaidStep(WovRaid& r, time_t now)
                 r.deaths.clear();
                 for (Player* b : ps)
                     r.wasAlive[b->GetGUID().GetCounter()] = b->IsAlive();
-                mai->DoSpecificAction("dc on", Event("wov", "", nullptr), true);
+                WovRaidPrepStart(r, 1, mt, mai, now);  // wov: ready check and countdown before going again
                 r.moveT = 0;
                 r.phaseT = now;
             }
@@ -4948,6 +5283,8 @@ bool WovRaidStep(WovRaid& r, time_t now)
                     return false;
                 }
                 r.backAt.clear();
+                r.prep = 0;
+                r.rcPlan.clear();
                 for (Player* b : ps)
                     WovRaidRunBackLater(r, b, now);
                 r.rezT = now;
@@ -5284,6 +5621,29 @@ bool WovRaidNightFor(uint32 guid)
                 } while (r->NextRow());
     }
     return night.count(guid) != 0;
+}
+
+// wov: what a bot in a raid says it is doing (for the chat prompt); empty when it is in none
+std::string WovRaidIntentOf(uint32 low)
+{
+    for (WovRaid const& r : g_wovRaids)
+        for (WovDgMember const& m : r.m)
+            if (m.low == low)
+                return std::string("Right now you are in a raid with your guild: ") + (r.def == 1 ? "Onyxia's Lair" : "Molten Core") +
+                       ". Talk is about the raid (buffs, who is missing, the ready check, the next boss, loot, waiting). Do not "
+                       "look for other groups, dungeons or quest partners.";
+    return "";
+}
+
+// wov: an answer to a ready check was sent to a leader (Script/Playerbots.cpp, packet hook)
+void WovRaid_OnReadyConfirm(Player* leader, ObjectGuid who, uint8 state)
+{
+    if (!leader)
+        return;
+    std::lock_guard<std::mutex> lock(g_wovRcMutex);
+    if (g_wovRcIn.size() > 256)
+        g_wovRcIn.erase(g_wovRcIn.begin(), g_wovRcIn.begin() + 128);
+    g_wovRcIn.push_back({leader->GetGUID().GetCounter(), who.GetCounter(), uint32(state)});
 }
 
 // wov: guild chat from a real player, called from the chat hook (Script/Playerbots.cpp): "#raid", "#raid mc", "#raid ony"
