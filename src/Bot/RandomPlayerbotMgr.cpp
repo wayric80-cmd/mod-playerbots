@@ -4600,20 +4600,35 @@ void WovRaidLootStep(WovRaid& r, Player* mt, time_t now)
 // ---- end wov: raid loot rules -----------------------------------------------------------------------------------
 
 // free for raid night: in the world, not busy elsewhere; a group of bots is left for the raid, one with a real player is not
-bool WovRaidAvail(Player* b, time_t now)
+// wov: why a bot cannot join a raid right now (nullptr = it can). The reasons are counted when a raid is called, so "only 25
+// of the guild's 58" can be explained.
+char const* WovRaidWhyNot(Player* b, time_t now)
 {
-    if (!b->IsInWorld() || !b->IsAlive() || b->IsInFlight() || b->InBattleground())  // a battleground queue is left for the raid
-        return false;
-    if (!b->GetMap() || b->GetMap()->Instanceable() || WovOnMarketTrip(b->GetGUID().GetCounter()) || WovDgBusy(b->GetGUID().GetCounter()))
-        return false;
+    if (!b->IsInWorld())
+        return "not in the world";
+    if (!b->IsAlive())
+        return "dead";
+    if (b->IsInFlight())
+        return "on a flight";
+    if (b->InBattleground())  // a battleground queue is left for the raid
+        return "in a battleground";
+    if (!b->GetMap() || b->GetMap()->Instanceable())
+        return "in an instance";
+    if (WovOnMarketTrip(b->GetGUID().GetCounter()))
+        return "on an auction trip";
+    if (WovDgBusy(b->GetGUID().GetCounter()))
+        return "on a dungeon run";
     if (b->GetGroup() && WovRealIn(b->GetGroup()))
-        return false;
+        return "in a group with a real player";
     auto it = g_wovBusyBot.find(b->GetGUID().GetCounter());
     if (it != g_wovBusyBot.end() && now < time_t(it->second))
-        return false;
+        return "reserved for something else";
     PlayerbotAI* ai = GET_PLAYERBOT_AI(b);
-    return ai && !ai->GetMaster();
+    if (!ai || ai->GetMaster())
+        return "has a master";
+    return nullptr;
 }
+bool WovRaidAvail(Player* b, time_t now) { return WovRaidWhyNot(b, now) == nullptr; }
 
 // the lockout a character has this week for a raid (0 = none). A raid can only take people with no lockout or the
 // same one as its main tank, as for real players.
@@ -4640,10 +4655,19 @@ bool WovRaidStart(uint32 guild, time_t now, uint8 d)
     WovRaidDef const& D = kWovRaidDefs[d];
     std::vector<Player*> tanks, heals, dps, hyb;
     std::string gname;
+    uint32 gOnline60 = 0;
+    std::map<std::string, uint32> whyNot;
     for (auto const& [g, b] : sRandomPlayerbotMgr.GetAllBots())
     {
-        if (!b || !b->IsInWorld() || b->GetGuildId() != guild || b->GetLevel() < 60 || !WovRaidAvail(b, now) ||
-            (D.attune && !b->HasItemCount(D.attune, 1, true)))
+        if (!b || !b->IsInWorld() || b->GetGuildId() != guild || b->GetLevel() < 60)
+            continue;
+        ++gOnline60;
+        if (char const* why = WovRaidWhyNot(b, now))
+        {
+            ++whyNot[why];
+            continue;
+        }
+        if (D.attune && !b->HasItemCount(D.attune, 1, true))
             continue;
         if (gname.empty())
             if (Guild* gg = sGuildMgr->GetGuildById(guild))
@@ -4657,6 +4681,14 @@ bool WovRaidStart(uint32 guild, time_t now, uint8 d)
             hyb.push_back(b);
         else
             dps.push_back(b);
+    }
+    if (!whyNot.empty())
+    {
+        std::string why;
+        for (auto const& [w, n] : whyNot)
+            why += (why.empty() ? "" : ", ") + w + " " + std::to_string(n);
+        LOG_INFO("playerbots", "WoV raid <{}> {}: {} level 60 members online, {} free; the others are {}", gname, D.tag, gOnline60,
+                 tanks.size() + heals.size() + dps.size() + hyb.size(), why);
     }
     // this week's lockout: the raid goes to the instance most of the guild is saved to (if a tank is saved there too),
     // and only takes people who are saved there or nowhere
@@ -5790,6 +5822,17 @@ void WovRaidCallRun(WovRaidCall const& c, time_t now)
     LOG_INFO("playerbots", "WoV raid call: {} asks for {} in guild {}", p->GetName(), tag, c.guild);
     if (WovRaidStart(c.guild, now, c.def))
     {
+        if (!g_wovRaids.empty())
+        {
+            uint32 online60 = 0;
+            for (auto const& [gg, bb] : sRandomPlayerbotMgr.GetAllBots())
+                if (bb && bb->IsInWorld() && bb->GetGuildId() == c.guild && bb->GetLevel() >= 60)
+                    ++online60;
+            uint32 n = g_wovRaids.back().m.size();
+            if (n + 8 < online60)
+                ch.PSendSysMessage("Raid call: {} going, but only {} of the guild's {} level 60s online are free right now (the rest are busy). "
+                                   "For a fuller raid: #raid stop, wait a minute and call again.", n, n, online60);
+        }
         if (!g_wovRaids.empty() && g_wovRaids.back().ride)
             ch.PSendSysMessage("Raid call: {} raid called. The raid leader has invited you. Meet in Kargath; the raid rides to Lothos Riftwaker together.", tag);
         else
