@@ -2270,6 +2270,7 @@ struct WovDgMember
     time_t deadT = 0;    // dead since (on the way)
     time_t outT = 0;     // alive but outside the instance since (revived at the graveyard or at the portal)
     uint8 sumN = 0;      // wov raids: summons tried; after three it travels on its own (no endless summon loop)
+    time_t millT = 0;    // wov raids: when a member waiting at the meeting place picks its next spot to mill about at
 };
 struct WovDgRunState
 {
@@ -3776,6 +3777,20 @@ void WovRaidRunBackLater(WovRaid& r, Player* b, time_t now)
         WovRaidRunBack(r, b);
 }
 
+// wov: waiting at the meeting place. A raid used to stand in one pile on the exact spot; people wait scattered around it,
+// walk a few steps, stop, wander. Each member picks a place within about 22 yd and a new one every 25-75 s.
+void WovRaidMill(Player* b, PlayerbotAI* ai, WovDgSpot const& s, WovDgMember& mm, time_t now)
+{
+    if (b->IsInCombat() || b->IsInFlight() || b->IsBeingTeleported())
+        return;
+    if (mm.millT && now < mm.millT)
+        return;
+    float rx = 0, ry = 0, rz = 0;
+    b->GetRandomPoint(Position(s.mx, s.my, s.mz), 5.0f + float(urand(0, 17)), rx, ry, rz);
+    ai->rpgInfo.ChangeToGoCamp(WorldPosition(s.map, rx, ry, rz));
+    mm.millT = now + time_t(urand(25, 75));
+}
+
 // ---- wov: the raid leader's pull routine ---------------------------------------------------------------------
 // Before the first pull, after a wipe and after each boss the leader holds the raid (the tank waits), asks for buffs,
 // waits for mana, calls a real ready check (a real player gets the popup), asks whoever has not answered or said no,
@@ -4920,7 +4935,12 @@ bool WovRaidStep(WovRaid& r, time_t now)
                     b->TeleportTo(s.map, s.x + frand(-3.0f, 3.0f), s.y + frand(-3.0f, 3.0f), s.z + 0.5f, frand(0.0f, 6.28f));
             }
             if (onMap && d <= 2500.0f)
-                WovDgGoTo(b, ai, &s, mm, now);  // close enough to walk (Searing Gorge, Burning Steppes)
+            {
+                if (r.ride && !r.riding && d <= 30.0f && ai)
+                    WovRaidMill(b, ai, s, mm, now);  // wov: at the meeting place: mill about, not one pile
+                else
+                    WovDgGoTo(b, ai, &s, mm, now);  // close enough to walk (Searing Gorge, Burning Steppes)
+            }
             else if (!b->IsInFlight() && !b->GetMap()->Instanceable())
             {
                 // further away: it takes the flight path (and the boat or zeppelin) to Thorium Point and walks from
