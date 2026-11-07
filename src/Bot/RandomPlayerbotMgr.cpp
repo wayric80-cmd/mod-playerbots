@@ -3404,6 +3404,7 @@ struct WovRaid
     std::vector<WovRcChat> chatQ;        // wov: short canned reactions, said when due
     std::map<uint32, time_t> invAt;      // wov: when a member was last invited (a Kargath raid invites everyone at once)
     time_t realSumT = 0;                 // wov: when the warlock last summoned a real player
+    std::map<uint32, std::pair<time_t, float>> prog;  // wov: the ride: when a member's distance to the spot was last checked, and what it was
     std::set<uint32> doused;
     // loot rules
     uint8 rule = 0;  // 0 roll (main spec before off spec), 1 DKP, 2 loot council
@@ -4876,12 +4877,48 @@ bool WovRaidStep(WovRaid& r, time_t now)
             }
             else if (b->IsAlive() && !b->IsInCombat() && !b->IsInFlight() && !b->InBattleground() && mm.sumN < 3)
                 away.push_back(i);
+            // wov: the ride passes low-level mobs (Badlands, Searing Gorge). Mounted raiders stopped, dismounted and fought them
+            // one by one (7/11). Mobs 8+ levels below the rider that attack it are removed, so the raid keeps riding.
+            if (r.ride && i > 0 && b->IsAlive() && b->IsInCombat() && onMap && !b->InBattleground())
+            {
+                std::vector<Unit*> att(b->getAttackers().begin(), b->getAttackers().end());
+                bool allWeak = !att.empty();
+                for (Unit* u : att)
+                {
+                    Creature* c = u->ToCreature();
+                    if (!c || c->IsPet() || c->IsTotem() || c->isWorldBoss() || c->GetLevel() + 8 > b->GetLevel())
+                    {
+                        allWeak = false;
+                        break;
+                    }
+                }
+                if (allWeak)
+                {
+                    for (Unit* u : att)
+                        u->KillSelf(false);
+                    b->CombatStop(true);
+                }
+            }
             if (!b->IsAlive() || b->IsInCombat())
                 continue;
             // wov: a Kargath raid invites everyone first; a member starts for Kargath once it is in the group (or after a
             // minute, if the invite never took)
             if (r.ride && !r.riding && i > 0 && now < t0 + 60 && (!mt->GetGroup() || b->GetGroup() != mt->GetGroup()))
                 continue;
+            // wov: the ride's last stretch is the inside of Blackrock Mountain, where the walk went through a wall (7/11): from
+            // 350 yd out, or when a member has made no progress in 30 s, it takes the rest of the way in one step, like a summon
+            if (r.ride && r.riding && onMap && i > 0 && d > 60.0f && !b->IsBeingTeleported() && !b->IsInFlight())
+            {
+                auto& pr = r.prog[b->GetGUID().GetCounter()];
+                bool stuck = false;
+                if (!pr.first || now >= pr.first + 30)
+                {
+                    stuck = pr.first && d > pr.second - 20.0f;
+                    pr = {now, d};
+                }
+                if (d <= 350.0f || stuck)
+                    b->TeleportTo(s.map, s.x + frand(-3.0f, 3.0f), s.y + frand(-3.0f, 3.0f), s.z + 0.5f, frand(0.0f, 6.28f));
+            }
             if (onMap && d <= 2500.0f)
                 WovDgGoTo(b, ai, &s, mm, now);  // close enough to walk (Searing Gorge, Burning Steppes)
             else if (!b->IsInFlight() && !b->GetMap()->Instanceable())
