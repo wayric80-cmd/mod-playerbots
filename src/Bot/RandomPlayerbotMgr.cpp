@@ -3399,6 +3399,7 @@ struct WovRaid
     int8 cdN = 0;
     bool manaSaid = false;
     uint32 bossesPrepped = 0;
+    uint32 bossGate = 0;    // wov: the boss the leader has already given the tactic and countdown for
     bool bossInit = false;  // wov: the bosses the instance already had down (this week's lockout) are read in at the start
     std::set<uint32> bossesDown, rcAcked;
     std::map<uint32, WovRcPlan> rcPlan;  // bot member -> how and when it answers
@@ -3857,6 +3858,44 @@ void WovRaidBossScan(WovRaid& r, std::vector<Player*> const& ps, Player* mt, tim
         }
 }
 
+// wov: where a boss stands (its spawn in the world database), so the leader can give the tactic when the raid gets close to it
+bool WovBossPos(uint32 entry, uint32 map, float& x, float& y, float& z)
+{
+    static std::map<uint32, std::array<float, 3>> cache;
+    static std::set<uint32> missing;
+    auto it = cache.find(entry);
+    if (it == cache.end())
+    {
+        if (missing.count(entry))
+            return false;
+        QueryResult res = WorldDatabase.Query("SELECT position_x, position_y, position_z FROM creature WHERE id1 = {} AND map = {} LIMIT 1", entry, map);
+        if (!res)
+        {
+            missing.insert(entry);
+            return false;
+        }
+        Field* f = res->Fetch();
+        it = cache.emplace(entry, std::array<float, 3>{f[0].Get<float>(), f[1].Get<float>(), f[2].Get<float>()}).first;
+    }
+    x = it->second[0];
+    y = it->second[1];
+    z = it->second[2];
+    return true;
+}
+
+char const* WovRaidNextTactic(WovRaid const& r)
+{
+    for (uint32 e : kWovRaidDefs[r.def].bosses)
+        if (!r.bossesDown.count(e))
+        {
+            for (WovBossTactic const& bt : kWovBossTactic)
+                if (bt.entry == e)
+                    return bt.text;
+            return nullptr;
+        }
+    return nullptr;
+}
+
 void WovRaidPrepStart(WovRaid& r, uint8 why, Player* mt, PlayerbotAI* mai, time_t now)
 {
     r.prep = 1;
@@ -3867,13 +3906,20 @@ void WovRaidPrepStart(WovRaid& r, uint8 why, Player* mt, PlayerbotAI* mai, time_
     r.rcAns.clear();
     r.rcPlan.clear();
     r.rcAcked.clear();
-    if (why == 2)
-    {
+    // why: 0 at the entrance (buffs, ready check, go), 1 after a wipe (ready check, go), 2 after a boss (loot, buffs, go; no
+    // ready check), 3 close to the next boss (the tactic, buffs, ready check, countdown, pull)
+    if (why == 2 || why == 3)
         mai->DoSpecificAction("dc pause", Event("wov", "pause", nullptr), true);  // the tank holds
+    if (why == 2)
         WovRaidSay(r, WovPick(kWovRnPrepBoss), false);
-    }
     else if (why == 0)
         WovRaidSay(r, WovPick(kWovRnPrepStart), false);
+    else if (why == 3)
+    {
+        if (char const* tactic = WovRaidNextTactic(r))  // the tactic is said here, at the boss, not at the entrance
+            WovRaidSay(r, tactic, false);
+        WovRaidSay(r, WovPick(kWovRnPrepStart), false);
+    }
     // after a wipe the leader has already told everyone to rebuff
 }
 
@@ -3924,7 +3970,7 @@ void WovRaidPrepStep(WovRaid& r, std::vector<Player*> const& ps, Player* mt, Pla
     }
     if (r.prep == 1)
     {
-        time_t minWait = r.prepWhy == 0 ? 15 : (r.prepWhy == 2 ? 20 : 3);
+        time_t minWait = r.prepWhy == 0 ? 15 : (r.prepWhy == 2 ? 20 : (r.prepWhy == 3 ? 12 : 3));
         if (now < r.prepT + minWait)
             return;
         if (r.prepWhy == 2 && !r.loot.empty() && now < r.prepT + 150)  // the loot is handed out first
@@ -3951,6 +3997,13 @@ void WovRaidPrepStep(WovRaid& r, std::vector<Player*> const& ps, Player* mt, Pla
                 r.manaSaid = true;
                 WovRaidSay(r, WovPick(kWovRnMana), false);
             }
+            return;
+        }
+        if (r.prepWhy == 2)  // after a boss: loot done, buffs and mana up: no ready check, the clear carries on
+        {
+            r.prep = 0;
+            mai->DoSpecificAction("dc on", Event("wov", "", nullptr), true);
+            r.moveT = 0;
             return;
         }
         WovRaidRcStart(r, ps, mt, now);
@@ -4026,21 +4079,17 @@ void WovRaidPrepStep(WovRaid& r, std::vector<Player*> const& ps, Player* mt, Pla
                 WovRaidSay(r, WovSubst(WovPick(kWovRnRcSkip), waiting[0]->GetName()).c_str(), false);
             else
                 WovRaidSay(r, WovPick(kWovRnRcGo), false);
-            // the tactic for the next boss, then the countdown
-            char const* tactic = nullptr;
-            for (uint32 e : kWovRaidDefs[r.def].bosses)
-                if (!r.bossesDown.count(e))
-                {
-                    for (WovBossTactic const& bt : kWovBossTactic)
-                        if (bt.entry == e)
-                            tactic = bt.text;
-                    break;
-                }
-            if (tactic)
-                WovRaidSay(r, tactic, false);
-            r.prep = 3;
-            r.cdN = 5;
-            r.cdT = now + (tactic ? 6 : 2);
+            if (r.prepWhy == 3)  // at a boss: the countdown (the tactic was said when the raid got here)
+            {
+                r.prep = 3;
+                r.cdN = 5;
+                r.cdT = now + 2;
+                return;
+            }
+            // at the entrance and after a wipe: no tactic and no countdown, the first pull is trash. Just go.
+            r.prep = 0;
+            mai->DoSpecificAction("dc on", Event("wov", "", nullptr), true);
+            r.moveT = 0;
             return;
         }
         // asking whoever has not answered (real players; the bots answer on their own), and a new check for those who said no
@@ -5256,6 +5305,22 @@ bool WovRaidStep(WovRaid& r, time_t now)
             {
                 r.bossesPrepped = r.bossesDown.size();
                 WovRaidPrepStart(r, 2, mt, mai, now);
+            }
+            if (!r.prep && !r.rezT && mt->IsAlive() && !mt->IsInCombat())
+            {
+                uint32 next = 0;
+                for (uint32 e : D.bosses)
+                    if (!r.bossesDown.count(e))
+                    {
+                        next = e;
+                        break;
+                    }
+                float bx, by, bz;
+                if (next && next != r.bossGate && WovBossPos(next, s.dmap, bx, by, bz) && mt->GetExactDist(bx, by, bz) <= 110.0f)
+                {
+                    r.bossGate = next;
+                    WovRaidPrepStart(r, 3, mt, mai, now);  // wov: close to the boss: tactic, ready check, countdown
+                }
             }
             WovRaidPrepStep(r, ps, mt, mai, now);
         }
