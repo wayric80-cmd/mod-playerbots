@@ -3399,6 +3399,7 @@ struct WovRaid
     int8 cdN = 0;
     bool manaSaid = false;
     uint32 bossesPrepped = 0;
+    bool bossInit = false;  // wov: the bosses the instance already had down (this week's lockout) are read in at the start
     std::set<uint32> bossesDown, rcAcked;
     std::map<uint32, WovRcPlan> rcPlan;  // bot member -> how and when it answers
     std::map<uint32, uint8> rcAns;       // member -> 1 ready, 0 not ready
@@ -3825,6 +3826,22 @@ void WovRaidBossScan(WovRaid& r, std::vector<Player*> const& ps, Player* mt, tim
     if (now < r.bossScanT + 5)
         return;
     r.bossScanT = now;
+    if (!r.bossInit)
+    {
+        // wov: bosses killed in an earlier raid this week (the guild's lockout) are not news: no "gg", no ready check for them.
+        // The instance's own data says which: MC bosses 0-7 in the order of the list, Ragnaros is 9 (Majordomo 8).
+        r.bossInit = true;
+        if (InstanceScript* is = mt->GetInstanceScript())
+        {
+            std::vector<uint32> const& bl = kWovRaidDefs[r.def].bosses;
+            for (size_t k = 0; k < bl.size(); ++k)
+                if (is->GetBossState((r.def == 0 && k == 8) ? 9u : uint32(k)) == DONE)
+                    r.bossesDown.insert(bl[k]);
+            r.bossesPrepped = r.bossesDown.size();
+            LOG_INFO("playerbots", "WoV raid #{} <{}> {}: {} of {} bosses were already down in this instance (the lockout)", r.id, r.gname,
+                     WovRaidTag(r), r.bossesDown.size(), bl.size());
+        }
+    }
     std::list<Creature*> found;
     mt->GetCreatureListWithEntryInGrid(found, kWovRaidDefs[r.def].bosses, 250.0f);
     for (Creature* c : found)
