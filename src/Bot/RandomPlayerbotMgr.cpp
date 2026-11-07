@@ -3431,6 +3431,9 @@ std::unordered_set<uint32> g_wovRaidRealGuilds;    // guilds led by a real playe
 // invited at the window like in any other guild). AiPlayerbot.WoV.Raids.RealGuildsAllowed = "4,7" (guild ids).
 std::unordered_set<uint32> g_wovRaidAllowReal;
 inline bool WovRaidRealSkip(uint32 g) { return g_wovRaidRealGuilds.count(g) && !g_wovRaidAllowReal.count(g); }
+// wov: characters of the guilds in AiPlayerbot.WoV.LoginFirstGuilds ("4" = Horde Hub) log in before everyone else
+std::unordered_set<uint32> g_wovLoginFirst;
+inline bool WovLoginFirst(uint32 guid) { return g_wovLoginFirst.count(guid) != 0; }
 bool g_wovRaidEnable = false;
 uint32 g_wovRaidPug = 30;  // a guild short of people fills up to this with level 60s from outside ("LF5M MC")
 uint32 g_wovRaidMin = 20, g_wovRaidMax = 40, g_wovRaidMaxActive = 2, g_wovRaidHour = 20, g_wovRaidTest = 0, g_wovRaidNextId = 1;
@@ -3588,6 +3591,16 @@ void WovRaidConfig(time_t now)
     g_wovRaidTestRaid = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.Raids.TestRaid", 0) % kWovRaidDefs.size();
     g_wovRaidTestAttune = sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.Raids.TestAttuneGuild", 0);
     g_wovOnyAttuneEvery = std::max<uint32>(1, sConfigMgr->GetOption<uint32>("AiPlayerbot.WoV.Raids.OnyAttuneEvery", 150));
+    g_wovLoginFirst.clear();
+    {
+        std::string list = sConfigMgr->GetOption<std::string>("AiPlayerbot.WoV.LoginFirstGuilds", "");
+        list.erase(std::remove_if(list.begin(), list.end(), [](char c) { return !(std::isdigit(static_cast<unsigned char>(c)) || c == ','); }), list.end());
+        if (!list.empty())
+            if (QueryResult res = CharacterDatabase.Query("SELECT guid FROM guild_member WHERE guildid IN ({})", list))
+                do
+                    g_wovLoginFirst.insert((*res)[0].Get<uint32>());
+                while (res->NextRow());
+    }
     g_wovRaidAllowReal.clear();
     {
         std::string const list = sConfigMgr->GetOption<std::string>("AiPlayerbot.WoV.Raids.RealGuildsAllowed", "");
@@ -5335,6 +5348,20 @@ bool WovRaidStep(WovRaid& r, time_t now)
             else if (!r.calmT)
                 r.calmT = now;
             bool ready = !dead && r.calmT && now >= r.calmT + 30 && now >= r.rezT + 90;
+            // wov: someone stuck in a fight that never ends (a mob it cannot reach, a pet) held a raid still for 8+ minutes
+            // (7/11, raid #1): after 5 minutes it counts as over, after 8 the combat of whoever is still in it is dropped
+            bool stuckFight = fighting && now >= r.rezT + 8 * MINUTE;
+            if (stuckFight)
+            {
+                for (Player* b : ps)
+                    if (b->IsAlive() && b->GetMapId() == s.dmap && b->IsInCombat())
+                    {
+                        LOG_INFO("playerbots", "WoV raid #{} <{}> {}: {} is stuck in combat after the wipe, combat dropped", r.id, r.gname,
+                                 WovRaidTag(r), b->GetName());
+                        b->CombatStop(true);
+                    }
+                fighting = 0;
+            }
             bool late = now >= r.rezT + 5 * MINUTE && !fighting;
             if ((ready || late) && !r.buffT)
             {
@@ -5350,7 +5377,7 @@ bool WovRaidStep(WovRaid& r, time_t now)
                 LOG_INFO("playerbots", "WoV raid #{} <{}> {}: after wipe {} everyone at the entrance after {} s ({} still dead), buffing", r.id,
                          r.gname, WovRaidTag(r), r.wipes, now - r.rezT, dead);
             }
-            if (r.buffT && now >= r.buffT + 45 && !fighting)
+            if (r.buffT && now >= r.buffT + 45 && (!fighting || now >= r.buffT + 180))
             {
                 for (Player* b : ps)
                     if (b->IsAlive())
@@ -8614,6 +8641,10 @@ uint32 RandomPlayerbotMgr::AddRandomBots()
         // wov: raid night: the guild's raiders log in first
         std::stable_partition(allCharacters.begin(), allCharacters.end(),
                               [](CharacterInfo const& ci) { return WovRaidNightFor(ci.guid); });
+        // wov: and the guilds in LoginFirstGuilds before those (so after a restart Horde Hub is online first)
+        WovRaidConfig(time(nullptr));
+        std::stable_partition(allCharacters.begin(), allCharacters.end(),
+                              [](CharacterInfo const& ci) { return WovLoginFirst(ci.guid); });
 
         // Separate characters by faction for phased login
         std::vector<CharacterInfo> allianceChars;
