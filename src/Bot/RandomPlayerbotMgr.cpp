@@ -3402,6 +3402,8 @@ struct WovRaid
     std::map<uint32, WovRcPlan> rcPlan;  // bot member -> how and when it answers
     std::map<uint32, uint8> rcAns;       // member -> 1 ready, 0 not ready
     std::vector<WovRcChat> chatQ;        // wov: short canned reactions, said when due
+    std::map<uint32, time_t> invAt;      // wov: when a member was last invited (a Kargath raid invites everyone at once)
+    time_t realSumT = 0;                 // wov: when the warlock last summoned a real player
     std::set<uint32> doused;
     // loot rules
     uint8 rule = 0;  // 0 roll (main spec before off spec), 1 DKP, 2 loot council
@@ -3461,6 +3463,7 @@ char const* const kWovRnRcSkip[] = {"going without {n}, catch up", "{n} not answ
 char const* const kWovRnBossDown[] = {"gg", "nice, gg", "boss down, gg", "gj everyone", "and thats one"};
 char const* const kWovRnGg[] = {"gg", "gj", "nice", "wp", "ty all", "gz", "nice one"};
 char const* const kWovRnWipeBots[] = {"rip", "ugh", "sry", "my bad", "wow", "welp", "gg"};
+char const* const kWovRnSumSay[] = {"summoning {n}", "summon on {n}, accept pls", "{n} click the portal", "summoning {n}, hold on"};
 struct WovBossTactic
 {
     uint32 entry;
@@ -4857,6 +4860,10 @@ bool WovRaidStep(WovRaid& r, time_t now)
                 away.push_back(i);
             if (!b->IsAlive() || b->IsInCombat())
                 continue;
+            // wov: a Kargath raid invites everyone first; a member starts for Kargath once it is in the group (or after a
+            // minute, if the invite never took)
+            if (r.ride && !r.riding && i > 0 && now < t0 + 60 && (!mt->GetGroup() || b->GetGroup() != mt->GetGroup()))
+                continue;
             if (onMap && d <= 2500.0f)
                 WovDgGoTo(b, ai, &s, mm, now);  // close enough to walk (Searing Gorge, Burning Steppes)
             else if (!b->IsInFlight() && !b->GetMap()->Instanceable())
@@ -4864,7 +4871,9 @@ bool WovRaidStep(WovRaid& r, time_t now)
                 // further away: it takes the flight path (and the boat or zeppelin) to Thorium Point and walks from
                 // there, unless a summon comes first. The flight itself is not simulated, only how long it takes.
                 if (!mm.closerT)
-                    mm.closerT = now + (onMap ? std::max<time_t>(60, time_t(d / 30.0f)) : 420);
+                    mm.closerT = now + (r.ride && !r.riding && b->getClass() == CLASS_WARLOCK
+                                            ? time_t(urand(15, 45))  // the warlocks are there first: they summon the rest
+                                            : (onMap ? std::max<time_t>(60, time_t(d / 30.0f)) : 420));
                 else if (now >= mm.closerT)
                 {
                     bool horde = b->GetTeamId() == TEAM_HORDE;
@@ -4883,7 +4892,7 @@ bool WovRaidStep(WovRaid& r, time_t now)
         // the summoning: a warlock (or the meeting stone in Blackrock Mountain) and two more at the window bring the
         // others, one at a time
         Player* helper = lock;
-        if (!helper)
+        if (!helper && !(r.ride && !r.riding))  // Kargath has no meeting stone: only a warlock summons there
             for (size_t i = 0; i < ps.size() && !helper; ++i)
                 if (ps[i]->IsAlive() && ps[i]->GetMapId() == s.map && ps[i]->GetExactDist(s.x, s.y, s.z) <= 60.0f)
                     helper = ps[i];
@@ -4896,6 +4905,9 @@ bool WovRaidStep(WovRaid& r, time_t now)
                 LOG_INFO("playerbots", "WoV raid #{} <{}> {}: last summon for {} (map {} zone {}, {:.0f} yd away), it travels on its own after this",
                          r.id, r.gname, WovRaidTag(r), b->GetName(), b->GetMapId(), b->GetZoneId(),
                          b->GetMapId() == s.map ? b->GetExactDist(s.x, s.y, s.z) : -1.0f);
+            if (lock && urand(0, 99) < 60)
+                if (PlayerbotAI* lai = GET_PLAYERBOT_AI(lock))
+                    lai->SayToRaid(WovSubst(WovPick(kWovRnSumSay), b->GetName()).c_str());
             if (urand(0, 99) < 40)
                 b->Whisper(WovPick(kWovRnSumAsk), LANG_UNIVERSAL, helper);
             b->TeleportTo(s.map, s.x + frand(-1.5f, 1.5f), s.y + frand(-1.5f, 1.5f), s.z + 0.5f, frand(0.0f, 6.28f));
@@ -4903,6 +4915,26 @@ bool WovRaidStep(WovRaid& r, time_t now)
                 b->Whisper(WovPick(kWovRnSumThx), LANG_UNIVERSAL, helper);
             LOG_INFO("playerbots", "WoV raid #{} <{}> {}: {} summons {}", r.id, r.gname, WovRaidTag(r), lock ? lock->GetName() : "the meeting stone",
                      b->GetName());
+        }
+        // wov: a real player in the group who is not in Kargath yet is summoned too (the real summon request, a popup)
+        if (helper && r.ride && !r.riding && lock && here >= 2 && now > t0 + 60 && now >= r.realSumT + 45)
+        {
+            r.realSumT = now;
+            for (uint32 rl : r.reals)
+                if (Player* p = ObjectAccessor::FindPlayerByLowGUID(rl))
+                    if (p->IsInWorld() && p->IsAlive() && !p->IsInCombat() && p->GetGroup() && p->GetGroup() == mt->GetGroup() &&
+                        !p->GetMap()->Instanceable() && !p->InBattleground() &&
+                        (p->GetMapId() != s.map || p->GetExactDist(s.x, s.y, s.z) > 150.0f))
+                    {
+                        p->SetSummonPoint(s.map, s.x, s.y, s.z);
+                        WorldPacket data(SMSG_SUMMON_REQUEST, 8 + 4 + 4);
+                        data << lock->GetGUID();
+                        data << uint32(lock->GetZoneId());
+                        data << uint32(MAX_PLAYER_SUMMON_DELAY * IN_MILLISECONDS);
+                        p->SendDirectMessage(&data);
+                        if (PlayerbotAI* lai = GET_PLAYERBOT_AI(lock))
+                            lai->SayToRaid(WovSubst(WovPick(kWovRnSumSay), p->GetName()).c_str());
+                    }
         }
         // the main tank is not there after a quarter of an hour (held up, stuck in a fight): a tank who is there
         // takes over and leads
@@ -4921,7 +4953,9 @@ bool WovRaidStep(WovRaid& r, time_t now)
                     break;
                 }
         // the raid forms at the window: the main tank invites, and makes it a raid
-        if (mt->IsAlive() && mt->GetMapId() == s.map && mt->GetExactDist(s.x, s.y, s.z) <= 60.0f)
+        // wov: a Kargath raid (first leg) invites everyone at once, wherever they are; the others form at the window
+        bool formEarly = r.ride && !r.riding;
+        if (formEarly || (mt->IsAlive() && mt->GetMapId() == s.map && mt->GetExactDist(s.x, s.y, s.z) <= 60.0f))
         {
             Group* g = mt->GetGroup();
             if (g && g->IsLeader(mt->GetGUID()) && !g->isRaidGroup() && g->GetMembersCount() >= 2)
@@ -4929,13 +4963,26 @@ bool WovRaidStep(WovRaid& r, time_t now)
             g = mt->GetGroup();
             if (g && g->isRaidGroup() && g->IsLeader(mt->GetGUID()) && !r.lootSet)
                 WovRaidLootSetup(r, g, mt);
+            uint32 sent = 0;
             for (size_t i = 1; i < ps.size(); ++i)
             {
                 Player* b = ps[i];
-                if (b->GetGroup() || !b->IsAlive() || b->GetMapId() != s.map || b->GetExactDist(s.x, s.y, s.z) > 60.0f)
+                if (b->GetGroup() || !b->IsAlive())
                     continue;
+                if (!formEarly && (b->GetMapId() != s.map || b->GetExactDist(s.x, s.y, s.z) > 60.0f))
+                    continue;
+                g = mt->GetGroup();
                 if (g && (!g->IsLeader(mt->GetGUID()) || g->IsFull() || (!g->isRaidGroup() && g->GetMembersCount() >= 5)))
                     break;
+                if (formEarly)
+                {
+                    time_t& at = r.invAt[b->GetGUID().GetCounter()];
+                    if (now < at + 15)
+                        continue;
+                    at = now;
+                    if (!(g && g->isRaidGroup()) && ++sent > 3)  // a party takes a few; the rest once it is a raid
+                        break;
+                }
                 WovInviteFrom(mt, b);
             }
         }
@@ -4963,7 +5010,7 @@ bool WovRaidStep(WovRaid& r, time_t now)
                 st += " " + b->GetName() + ":" + (onMap ? std::to_string(int(b->GetExactDist(s.x, s.y, s.z))) : "m" + std::to_string(b->GetMapId())) +
                       (b->IsAlive() ? "" : "d") + (b->IsInCombat() ? "c" : "") + "/" + std::to_string(uint32(GET_PLAYERBOT_AI(b)->rpgInfo.GetStatus()));
             }
-            LOG_INFO("playerbots", "WoV raid #{} <{}> {} gathering: {} of {} at the window, {} in the raid, warlock there: {} |{}", r.id,
+            LOG_INFO("playerbots", "WoV raid #{} <{}> {} gathering: {} of {} at the meeting spot, {} in the raid, warlock there: {} |{}", r.id,
                      r.gname, WovRaidTag(r), here, ps.size(), grouped, lock ? "yes" : "no", st);
         }
         Group* g = mt->GetGroup();
