@@ -4861,6 +4861,11 @@ bool WovRaidStep(WovRaid& r, time_t now)
             Player* b = ps[i];
             WovDgMember& mm = r.m[i];
             PlayerbotAI* ai = GET_PLAYERBOT_AI(b);
+            // wov: a bot in a group follows its leader. The leader of a Kargath raid can be across the continent, so follow
+            // stays off while the raid gathers and rides: it walked the members that had flown in away from Kargath
+            // (7/11, raid #4). It goes back on when the raid zones in.
+            if (r.ride && i > 0 && ai && ai->HasStrategy("follow", BOT_STATE_NON_COMBAT))
+                ai->ChangeStrategy("-follow", BOT_STATE_NON_COMBAT);
             bool onMap = b->GetMapId() == s.map && !b->GetMap()->Instanceable();
             float d = onMap ? b->GetExactDist(s.x, s.y, s.z) : 1e9f;
             if (b->IsAlive() && onMap && d <= 60.0f)
@@ -5057,6 +5062,10 @@ bool WovRaidStep(WovRaid& r, time_t now)
                 LOG_INFO("playerbots", "WoV raid #{} <{}> {}: all {} in Kargath, riding to Lothos", r.id, r.gname, WovRaidTag(r), r.m.size());
                 return true;
             }
+            for (size_t fi = 1; fi < ps.size(); ++fi)  // wov: the raid follows the main tank in again
+                if (PlayerbotAI* fai = GET_PLAYERBOT_AI(ps[fi]))
+                    if (!fai->HasStrategy("follow", BOT_STATE_NON_COMBAT))
+                        fai->ChangeStrategy("+follow", BOT_STATE_NON_COMBAT);
             r.phase = DG_ENTER;
             r.phaseT = now;
             WovRaidSay(r, WovPick(kWovRnGo), false);
