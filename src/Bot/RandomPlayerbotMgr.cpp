@@ -4980,6 +4980,11 @@ bool WovRaidStep(WovRaid& r, time_t now)
             // (7/11, raid #4). It goes back on when the raid zones in.
             if (r.ride && i > 0 && ai && ai->HasStrategy("follow", BOT_STATE_NON_COMBAT))
                 ai->ChangeStrategy("-follow", BOT_STATE_NON_COMBAT);
+            // wov: AiFactory gives "new rpg" only to bots that are alone or lead their group (a grouped member gets none), so a
+            // member of the raid could not walk, go to the spot or mill about: only the leader moved (8/11, "everyone in one
+            // pile"). The members get it for the gather and the ride, and lose it again when the raid zones in.
+            if (r.ride && i > 0 && ai && b->IsAlive() && !ai->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
+                ai->ChangeStrategy("+new rpg", BOT_STATE_NON_COMBAT);
             bool onMap = b->GetMapId() == s.map && !b->GetMap()->Instanceable();
             float d = onMap ? b->GetExactDist(s.x, s.y, s.z) : 1e9f;
             if (b->IsAlive() && onMap && d <= 60.0f)
@@ -5219,8 +5224,12 @@ bool WovRaidStep(WovRaid& r, time_t now)
             }
             for (size_t fi = 1; fi < ps.size(); ++fi)  // wov: the raid follows the main tank in again
                 if (PlayerbotAI* fai = GET_PLAYERBOT_AI(ps[fi]))
+                {
+                    if (fai->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
+                        fai->ChangeStrategy("-new rpg", BOT_STATE_NON_COMBAT);
                     if (!fai->HasStrategy("follow", BOT_STATE_NON_COMBAT))
                         fai->ChangeStrategy("+follow", BOT_STATE_NON_COMBAT);
+                }
             r.phase = DG_ENTER;
             r.phaseT = now;
             WovRaidSay(r, WovPick(kWovRnGo), false);
