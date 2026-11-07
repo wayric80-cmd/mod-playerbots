@@ -5920,6 +5920,56 @@ void WovRaid_OnReadyConfirm(Player* leader, ObjectGuid who, uint8 state)
     g_wovRcIn.push_back({leader->GetGUID().GetCounter(), who.GetCounter(), uint32(state)});
 }
 
+// wov: the raid leader's routine (ready check, countdown) and the short canned lines run on the world clock, not on the bot
+// update (every 20 s: "pulling in 5 ... 1" took two minutes, and a ready check answered in 20 s steps). Called from
+// PlayerbotsWorldScript::OnUpdate in Script/Playerbots.cpp.
+void WovRaid_FastTick()
+{
+    static uint32 lastMs = 0;
+    uint32 ms = getMSTime();
+    if (getMSTimeDiff(lastMs, ms) < 250)
+        return;
+    lastMs = ms;
+    if (g_wovRaids.empty())
+        return;
+    time_t now = time(nullptr);
+    for (WovRaid& r : g_wovRaids)
+    {
+        if (!r.prep && r.chatQ.empty())
+            continue;
+        std::vector<Player*> ps;
+        bool ok = !r.m.empty();
+        for (WovDgMember const& m : r.m)
+        {
+            Player* p = ObjectAccessor::FindPlayerByLowGUID(m.low);
+            if (!p || !p->IsInWorld())
+            {
+                ok = false;
+                break;
+            }
+            ps.push_back(p);
+        }
+        if (!ok)
+            continue;
+        for (size_t qi = 0; qi < r.chatQ.size();)
+        {
+            if (now < r.chatQ[qi].at)
+            {
+                ++qi;
+                continue;
+            }
+            if (Player* cb = ObjectAccessor::FindPlayerByLowGUID(r.chatQ[qi].low))
+                if (PlayerbotAI* cai = GET_PLAYERBOT_AI(cb))
+                    if (cb->GetGroup())
+                        cai->SayToRaid(r.chatQ[qi].text);
+            r.chatQ.erase(r.chatQ.begin() + qi);
+        }
+        if (r.prep)
+            if (PlayerbotAI* mai = GET_PLAYERBOT_AI(ps[0]))
+                WovRaidPrepStep(r, ps, ps[0], mai, now);
+    }
+}
+
 // wov: guild chat from a real player, called from the chat hook (Script/Playerbots.cpp): "#raid", "#raid mc", "#raid ony"
 void WovRaid_OnGuildChat(Player* player, std::string const& msg)
 {

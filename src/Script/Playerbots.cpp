@@ -137,6 +137,7 @@ public:
 
 void WovInit_OnWhisper(Player* from, Player* to);  // wov (RandomPlayerbotMgr.cpp)
 void WovRaid_OnReadyConfirm(Player* leader, ObjectGuid who, uint8 state);  // wov: ready check answers (RandomPlayerbotMgr.cpp)
+void WovRaid_FastTick();  // wov: the raid leader routine on the world clock (RandomPlayerbotMgr.cpp)
 void WovRaid_OnGuildChat(Player* player, std::string const& msg);  // wov: !raid in guild chat (RandomPlayerbotMgr.cpp)
 void WovGuild_OnWhisper(Player* from, Player* to, std::string const& msg);  // wov (RandomPlayerbotMgr.cpp)
 void WovDungeonRun_OnWhisper(Player* from, Player* to);  // wov (RandomPlayerbotMgr.cpp)
@@ -615,6 +616,7 @@ public:
     {
         PlayerbotWorldThreadProcessor::instance().Update(diff);
         sRandomPlayerbotMgr.UpdateAI(diff);  // World thread only
+        WovRaid_FastTick();                  // wov: ready check and countdown in real time
     }
 };
 
