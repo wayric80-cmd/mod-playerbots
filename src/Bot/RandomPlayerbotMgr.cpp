@@ -4769,8 +4769,9 @@ bool WovRaidStart(uint32 guild, time_t now, uint8 d)
                     ++it;
         };
         uint32 locks = count(CLASS_WARLOCK);
-        if (locks < 3)
-            take([](Player* p) { return p->getClass() == CLASS_WARLOCK; }, dps, dps.size() + (3 - locks));
+        uint32 wantLocks = D.map == 409 ? 6 : 3;  // wov: Garr has eight Firesworn: six banishes (7/11: 5 warlocks, 2 banishes, 36 dead in 95 s)
+        if (locks < wantLocks)
+            take([](Player* p) { return p->getClass() == CLASS_WARLOCK; }, dps, dps.size() + (wantLocks - locks));
         if (ony && heals.size() + hyb.size() < needHeal)  // Onyxia: the healers and tanks she needs, past the pug cap if needed
             take([](Player* p) { return p->getClass() == CLASS_PRIEST || PlayerbotAI::IsHeal(p, true); }, heals,
                  needHeal - std::min<uint32>(needHeal, hyb.size()), true);
@@ -5503,6 +5504,7 @@ bool WovRaidStep(WovRaid& r, time_t now)
                 }
             r.backAt.clear();
             r.prep = 0;
+            r.bossGate = 0;  // wov: the second attempt gets the tactic and the countdown too
             r.rcPlan.clear();
             for (Player* b : ps)
                 WovRaidRunBackLater(r, b, now);
@@ -5601,6 +5603,7 @@ bool WovRaidStep(WovRaid& r, time_t now)
                 }
                 r.backAt.clear();
                 r.prep = 0;
+                r.bossGate = 0;
                 r.rcPlan.clear();
                 for (Player* b : ps)
                     WovRaidRunBackLater(r, b, now);
@@ -5974,6 +5977,38 @@ void WovRaid_OnReadyConfirm(Player* leader, ObjectGuid who, uint8 state)
     g_wovRcIn.push_back({leader->GetGUID().GetCounter(), who.GetCounter(), uint32(state)});
 }
 
+// wov: Garr's Firesworn. Every warlock keeps one banished. This used to run in the raid step (every 20 s): the warlocks were dead
+// before the first tick (pull 02:27:23, first death 02:27:38, two banishes in 92 s). Now it runs from the fast tick.
+void WovRaidGarrBanish(WovRaid& r, std::vector<Player*> const& ps, Player* mt)
+{
+    WovRaidDef const& D = kWovRaidDefs[r.def];
+    if (D.map != 409 || !mt || !mt->IsInCombat())
+        return;
+    Creature* garr = mt->FindNearestCreature(12057, 120.0f);
+    if (!garr || !garr->IsAlive() || !garr->IsInCombat())
+        return;
+    std::list<Creature*> adds;
+    mt->GetCreatureListWithEntryInGrid(adds, 12099, 120.0f);
+    auto banished = [](Creature* c) { return c->HasAura(710) || c->HasAura(18647); };
+    for (Player* b : ps)
+    {
+        if (b->getClass() != CLASS_WARLOCK || !b->IsAlive() || b->GetMapId() != D.map || b->IsNonMeleeSpellCast(false))
+            continue;
+        bool mine = false;
+        for (Creature* c : adds)
+            mine = mine || (c->IsAlive() && (c->HasAura(710, b->GetGUID()) || c->HasAura(18647, b->GetGUID())));
+        if (mine)
+            continue;
+        Creature* pick = nullptr;
+        for (Creature* c : adds)
+            if (c->IsAlive() && !banished(c) && b->GetExactDist(c) <= 30.0f && b->IsWithinLOSInMap(c) &&
+                (!pick || b->GetExactDist(c) < b->GetExactDist(pick)))
+                pick = c;
+        if (pick && GET_PLAYERBOT_AI(b)->CastSpell("banish", pick))
+            LOG_INFO("playerbots", "WoV raid #{} <{}> {}: {} banishes a Firesworn", r.id, r.gname, WovRaidTag(r), b->GetName());
+    }
+}
+
 // wov: the raid leader's routine (ready check, countdown) and the short canned lines run on the world clock, not on the bot
 // update (every 20 s: "pulling in 5 ... 1" took two minutes, and a ready check answered in 20 s steps). Called from
 // PlayerbotsWorldScript::OnUpdate in Script/Playerbots.cpp.
@@ -5989,7 +6024,8 @@ void WovRaid_FastTick()
     time_t now = time(nullptr);
     for (WovRaid& r : g_wovRaids)
     {
-        if (!r.prep && r.chatQ.empty())
+        bool garrWatch = r.def == 0 && r.phase == DG_RUN && !r.m.empty();
+        if (!r.prep && r.chatQ.empty() && !garrWatch)
             continue;
         std::vector<Player*> ps;
         bool ok = !r.m.empty();
@@ -6021,6 +6057,8 @@ void WovRaid_FastTick()
         if (r.prep)
             if (PlayerbotAI* mai = GET_PLAYERBOT_AI(ps[0]))
                 WovRaidPrepStep(r, ps, ps[0], mai, now);
+        if (garrWatch)
+            WovRaidGarrBanish(r, ps, ps[0]);
     }
 }
 
