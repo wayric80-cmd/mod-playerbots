@@ -5372,7 +5372,14 @@ bool WovRaidStep(WovRaid& r, time_t now)
         {
             if (!r.endT)
                 r.endT = now;
-            if ((r.loot.empty() && now > r.endT + 20) || now > r.endT + 6 * MINUTE)
+            // wov: the raid used to end 20 s after the last boss and the bots left, which broke up the group while the real
+            // player still had loot rolls open (8/11, Ragnaros: "thrown out of the group before the roll was done"). With a
+            // real player in the raid it now waits 3 minutes, and as long as any roll is open (at most 10 minutes).
+            Group* eg = mt->GetGroup();
+            bool real = eg && WovRealIn(eg);
+            bool rolling = eg && !eg->GetRolls().empty();
+            time_t grace = real ? 180 : 20;
+            if ((r.loot.empty() && !rolling && now > r.endT + grace) || now > r.endT + (real ? 10 : 6) * MINUTE)
             {
                 WovRaidEnd(r, D.done, true, kWovRnEnd, 4);
                 return false;
