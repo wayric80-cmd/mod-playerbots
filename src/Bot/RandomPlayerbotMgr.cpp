@@ -3868,7 +3868,8 @@ bool WovBossPos(uint32 entry, uint32 map, float& x, float& y, float& z)
     {
         if (missing.count(entry))
             return false;
-        QueryResult res = WorldDatabase.Query("SELECT position_x, position_y, position_z FROM creature WHERE id1 = {} AND map = {} LIMIT 1", entry, map);
+        QueryResult res = // the column is "id" in this world database (a wrong column name is a fatal database error: it shut the server down, 8/11 01:09)
+        WorldDatabase.Query("SELECT position_x, position_y, position_z FROM creature WHERE id = {} AND map = {} LIMIT 1", entry, map);
         if (!res)
         {
             missing.insert(entry);
