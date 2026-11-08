@@ -4994,7 +4994,8 @@ bool WovRaidStep(WovRaid& r, time_t now)
                 if (b->getClass() == CLASS_WARLOCK)
                     lock = b;
             }
-            else if (b->IsAlive() && !b->IsInCombat() && !b->IsInFlight() && !b->InBattleground() && mm.sumN < 3)
+            else if (b->IsAlive() && !b->IsInCombat() && !b->IsInFlight() && !b->InBattleground() && mm.sumN < 3 &&
+                     !(r.ride && r.riding && i == 0))  // wov: the leader rides, he is not summoned
                 away.push_back(i);
             // wov: the ride passes low-level mobs (Badlands, Searing Gorge). Mounted raiders stopped, dismounted and fought them
             // one by one (7/11). Mobs 8+ levels below the rider that attack it are removed, so the raid keeps riding.
@@ -5030,7 +5031,7 @@ bool WovRaidStep(WovRaid& r, time_t now)
             {
                 auto& pr = r.prog[b->GetGUID().GetCounter()];
                 bool stuck = false;
-                if (!pr.first || now >= pr.first + 30)
+                if (!pr.first || now >= pr.first + 45)
                 {
                     stuck = pr.first && d > pr.second - 20.0f;
                     pr = {now, d};
@@ -5075,7 +5076,7 @@ bool WovRaidStep(WovRaid& r, time_t now)
             for (size_t i = 0; i < ps.size() && !helper; ++i)
                 if (ps[i]->IsAlive() && ps[i]->GetMapId() == s.map && ps[i]->GetExactDist(s.x, s.y, s.z) <= 60.0f)
                     helper = ps[i];
-        if (helper && here >= 2 && !away.empty() && now >= r.sumT + 12)
+        if (helper && here >= 2 && !away.empty() && now >= r.sumT + 12 && (!(r.ride && r.riding) || now >= r.rideT + 150))
         {
             r.sumT = now;
             size_t i = away[urand(0, away.size() - 1)];
